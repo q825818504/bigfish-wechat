@@ -77,7 +77,7 @@ gate RVA   0x0B3959D8
 | 群聊真实 @ 测试 | 没有真实 @ 数据 |
 | 锁屏场景 | UIA 需要可见桌面，无解 |
 | 记忆写回 | 微信对话还没写进 DSH 记忆库 |
-| 会话/工作区绑定 | **按用户要求不做** —— 微信端不跟 DSH 工作区绑 |
+| 会话/工作区绑定 | **按用户要求不做** —— 且已确认 EXE 不读 DSH 会话库 |
 
 ---
 
@@ -101,6 +101,7 @@ gate RVA   0x0B3959D8
 | `tools/smoke_vault_live.py` | 39 项真实数据读写 | 39/39 |
 | `tools/selftest_write_e2e.py` | 23 项界面→Slot→磁盘 | 23/23 |
 | `tools/test_persona_parity.py` | 18 项两侧人格逐字节一致 | 18/18 |
+| `tools/test_no_leak.py` | 20 项越界访问（不碰 DSH 会话库） | 20/20 |
 | `tools/selftest_engine.py` | 启停流程 6 组 | 全过 |
 | `tools/test_loop_guard.py` | 回环防护 14 项 | 全过 |
 | `tools/test_updater.py` | 更新逻辑 20 项 | 全过 |

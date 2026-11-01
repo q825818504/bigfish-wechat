@@ -1207,66 +1207,47 @@ class Backend(QObject):
 
     @Slot(result=str)
     def get_scope_candidates(self) -> str:
-        """扫 DSH 里现有的工作区与会话，给「范围」页做下拉。
+        """列出数据根下真实存在的「份」，供「数据目录」页选择。
 
-        只读 DSH 的 storages/workspace.json 和 sessions/ 目录 —— 不改任何东西。
+        ⚠ 这里**不读 DSH 的会话库**。
+
+        以前这个函数会去扫 `<DSH_HOME>/storages/workspace.json` 和
+        `<DSH_HOME>/sessions/`，把 DSH 里的工作区标题和会话 id 全列出来 ——
+        那既越界（EXE 是独立程序，不该看见宿主的所有对话），
+        也自相矛盾（微信端本来就不跟工作区绑，列出来干什么）。
+
+        现在只做一件事：**看数据根里有哪些范围目录，各里住了谁**。
+        判据是目录里那个 soul-*.json 的 identity.name ——
+        她自己叫什么，比 DSH 给工作区起的标题有用得多。
         """
         try:
             from bigfish import vault
 
-            home = vault.dsh_home()
-            workspaces = []
-            sessions = []
+            root = vault.resolve_data_root()
+            scopes = vault.list_scopes(root)
+            current = vault.current_scope_key(root)
 
-            wpath = os.path.join(home, "storages", "workspace.json")
-            try:
-                with open(wpath, "r", encoding="utf-8") as f:
-                    w = json.load(f)
-                table = ((w or {}).get("tables") or {}).get("workspaces") or {}
-                for uuid, v in table.items():
-                    workspaces.append({
-                        "id": str(uuid),
-                        "title": str((v or {}).get("title") or ""),
-                        "path": str((v or {}).get("path") or ""),
-                    })
-            except Exception:
-                pass
-
-            sess_root = os.path.join(home, "sessions")
-            try:
-                for ws in sorted(os.listdir(sess_root)):
-                    wsdir = os.path.join(sess_root, ws)
-                    if not os.path.isdir(wsdir):
-                        continue
-                    for sid in sorted(os.listdir(wsdir)):
-                        # 裸 UUID 形状的是中间层目录，不是会话
-                        if len(sid) >= 8 and sid[8] == "-":
-                            continue
-                        if not os.path.isfile(os.path.join(
-                                wsdir, sid, "session.v4.jsonl.zstd")):
-                            continue
-                        sessions.append({"id": sid, "workspace": ws})
-            except Exception:
-                pass
-
-            # 给工作区补上「有灵魂/记忆」的标记，用户能直接看出哪个是活的
-            scopes = vault.list_scopes()
-            live_dirs = {}
+            out = []
             for s in scopes:
-                live_dirs[s["key"]] = s
+                out.append({
+                    "key": s["key"],
+                    "name": s["name"] or "",       # 灵魂里的名字（空 = 还没写人格）
+                    "hasSoul": s["has_soul"],
+                    "hasMood": s["has_mood"],
+                    "hasMemory": s["has_memory"],
+                    "mtime": s["mtime"],
+                    "current": s["key"] == current,
+                })
 
             return json.dumps({
                 "ok": True,
-                "workspaces": workspaces,
-                "sessions": sessions[:500],
-                "liveScopes": {k: {
-                    "hasSoul": v["has_soul"],
-                    "hasMemory": v["has_memory"],
-                    "name": v["name"],
-                } for k, v in live_dirs.items()},
+                "root": root,
+                "currentKey": current,
+                "scopes": out,
             }, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+            return json.dumps({"ok": False, "scopes": [], "error": str(exc)},
+                              ensure_ascii=False)
 
 
     def _tmp_copy(self, src: str) -> str:

@@ -1053,21 +1053,16 @@ async function loadDataRoot() {
       hint.className = 'hint-line';
     }
 
-    // 范围表单
-    const sc = d.scope || {};
-    $('#scopeMode').value = sc.mode || 'workspace';
-    $('#scopeSessions').value = (sc.sessionIds || []).join(', ');
-
+    // 范围：只从数据根里真实存在的份里挑，不去问 DSH
     renderScopeList(d.scopes || [], d.currentKey);
-    await loadScopeCandidates(sc.workspaceId || '');
-    updateScopeFormState();
+    await loadScopeCandidates(d.currentKey || '');
   } catch (e) { toast('读取数据目录失败'); }
 }
 
 function renderScopeList(scopes, currentKey) {
   const box = $('#scopeList');
   if (!scopes.length) {
-    box.innerHTML = '<div class="empty" style="padding:12px 0"><p>这个数据根下还没有任何范围目录。</p></div>';
+    box.innerHTML = '<div class="empty" style="padding:12px 0"><p>这个数据根下还没有任何份。</p></div>';
     return;
   }
   box.innerHTML = scopes.map((s) => {
@@ -1077,87 +1072,94 @@ function renderScopeList(scopes, currentKey) {
     if (s.has_memory) badges.push('<span class="tag">记忆</span>');
     return `<div class="session-row${s.key === currentKey ? ' is-current' : ''}"
                  data-key="${esc(s.key)}" style="cursor:pointer">
-      <span class="session-name" title="${esc(s.dir)}">${esc(s.key)}</span>
+      <span class="session-name" title="${esc(s.dir || s.key)}">${esc(s.key)}</span>
       ${s.name ? `<span class="session-meta">${esc(s.name)}</span>` : ''}
       ${badges.join('') || '<span class="tag">空</span>'}
       ${s.key === currentKey ? '<span class="tag ok">当前</span>' : ''}
     </div>`;
   }).join('');
 
-  // 点一行 → 把那行的范围填进表单
+  // 点一行 → 选中它（不立刻切，让用户看清楚再点「用这一份」）
   $$('#scopeList .session-row[data-key]').forEach((row) => {
     row.addEventListener('click', () => {
-      const key = row.dataset.key;
-      if (key.startsWith('ws-')) {
-        $('#scopeMode').value = 'workspace';
-        const ws = $('#scopeWorkspace');
-        const hit = Array.from(ws.options).find((o) => o.value === key.slice(3));
-        if (hit) ws.value = hit.value;
-        else {
-          // 工作区列表里没有（比如那个工作区已经删了）→ 直接塞进会话框让用户看清
-          toast('这个范围对应的工区不在 workspace.json 里，只能手动指定');
-        }
-      } else if (key.startsWith('ss-')) {
-        $('#scopeMode').value = 'session';
-        $('#scopeSessions').value = key.slice(3);
-      }
-      updateScopeFormState();
+      const sel = $('#scopePick');
+      sel.value = row.dataset.key;
+      updateScopePickHint();
     });
   });
 }
 
-async function loadScopeCandidates(selectedWs) {
+async function loadScopeCandidates(currentKey) {
   if (!S.bridge) return;
   try {
     const d = JSON.parse(await S.bridge.get_scope_candidates());
     if (!d.ok) return;
-    const ws = $('#scopeWorkspace');
-    const list = d.workspaces || [];
-    ws.innerHTML = '<option value="">（未选择）</option>' + list.map((w) => {
-      const key = 'ws-' + w.id;
-      const live = (d.liveScopes || {})[key];
-      const mark = live?.name ? ` · ${live.name}` : (live?.hasSoul ? ' · 有灵魂' : '');
-      const label = w.title || w.path || w.id;
-      return `<option value="${esc(w.id)}">${esc(label)}${esc(mark)}</option>`;
-    }).join('');
-    if (selectedWs) ws.value = selectedWs;
 
-    setText('#scopeWsHint',
-      `读到 ${list.length} 个工作区、${(d.sessions || []).length} 个会话`);
+    const list = d.scopes || [];
+    const sel = $('#scopePick');
+    if (!list.length) {
+      sel.innerHTML = '<option value="">（数据根下还没有任何份）</option>';
+      setText('#scopePickHint', '');
+      return;
+    }
+
+    sel.innerHTML = list.map((s) => {
+      const who = s.name ? s.name : '（还没写人格）';
+      const marks = [
+        s.hasSoul ? '灵魂' : '',
+        s.hasMood ? '心情' : '',
+        s.hasMemory ? '记忆' : '',
+      ].filter(Boolean).join('+') || '空';
+      return `<option value="${esc(s.key)}">${esc(who)} · ${esc(marks)}</option>`;
+    }).join('');
+
+    if (currentKey && list.some((s) => s.key === currentKey)) {
+      sel.value = currentKey;
+    }
+    updateScopePickHint(list);
   } catch (e) { /* 静默 */ }
 }
 
-function updateScopeFormState() {
-  const isWs = $('#scopeMode').value === 'workspace';
-  $('#scopeWorkspace').disabled = !isWs;
-  $('#scopeSessions').disabled = isWs;
-  $('#scopeWorkspace').style.opacity = isWs ? '1' : '.45';
-  $('#scopeSessions').style.opacity = isWs ? '.45' : '1';
+function updateScopePickHint(list) {
+  const list2 = list || S.scopeList || [];
+  const key = $('#scopePick').value;
+  const hit = list2.find((s) => s.key === key);
+  const h = $('#scopePickHint');
+  if (!hit) { h.textContent = ''; return; }
+  const who = hit.name ? `「${hit.name}」` : '（这一份还没写过人格）';
+  h.textContent = `${key} —— 里面住的是 ${who}`;
 }
-
-$('#scopeMode').addEventListener('change', updateScopeFormState);
 
 $('#btnScopeSave').addEventListener('click', async () => {
   if (!S.bridge) return toast('后端未就绪');
-  const mode = $('#scopeMode').value;
-  const wid = $('#scopeWorkspace').value;
-  const sids = $('#scopeSessions').value
-    .split(',').map((s) => s.trim()).filter(Boolean);
-
-  if (mode === 'workspace' && !wid) return toast('请先选工作区');
-  if (mode === 'session' && !sids.length) return toast('请填至少一个会话 id');
+  const key = $('#scopePick').value;
+  if (!key) return toast('先选一份');
+  if (key === S.data?.currentKey) return toast('已经在用这一份了');
 
   try {
-    const r = JSON.parse(await S.bridge.set_scope(
-      mode, mode === 'workspace' ? wid : '', JSON.stringify(sids)));
-    if (!r.ok) return toast(r.error || '保存失败');
+    // 只切范围，不碰工作区/会话绑定 —— 微信端不跟 DSH 的工作区绑。
+    // ws-<uuid> 拆成 mode + workspaceId；ss-<id> 拆成 mode + sessionIds。
+    let mode = 'workspace';
+    let wid = '';
+    let sids = [];
+    if (key.startsWith('ws-')) {
+      wid = key.slice(3);
+    } else if (key.startsWith('ss-')) {
+      mode = 'session';
+      sids = [key.slice(3)];
+    } else {
+      return toast('这个目录名看不懂：' + key);
+    }
+
+    const r = JSON.parse(await S.bridge.set_scope(mode, wid, JSON.stringify(sids)));
+    if (!r.ok) return toast(r.error || '切换失败');
     const h = $('#scopeHint');
-    h.textContent = '已切到 ' + (r.currentKey || '') + '　（DSH 插件那边会读到同一个文件）';
+    h.textContent = '已切到 ' + (r.currentKey || '');
     h.className = 'hint-line is-ok';
-    toast('范围已保存');
+    toast('已切换');
     S.soul = null;
     await loadDataRoot();
-  } catch (e) { toast('保存失败'); }
+  } catch (e) { toast('切换失败'); }
 });
 
 $('#btnScopeRefresh').addEventListener('click', () => loadDataRoot());

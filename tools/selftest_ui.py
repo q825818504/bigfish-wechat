@@ -124,17 +124,37 @@ expect("data", "数据根路径", "document.querySelector('#dataRootPath').value
        lambda v: v.strip() != "", "要回填")
 expect("data", "配置文件说明", "document.querySelector('#dataRootFile').textContent",
        lambda v: "root.json" in v, "要说明落盘位置")
-expect("data", "范围键", "document.querySelector('#scopeKeyTag').textContent",
-       lambda v: v.strip() not in ("", "—", "未确定"), "要显示当前范围键")
-expect("data", "工作区下拉", "document.querySelector('#scopeWorkspace').options.length",
-       lambda v: int(float(v)) >= 1, "至少有「未选择」一项")
-expect("data", "范围列表", "document.querySelectorAll('#scopeList .session-row').length",
-       lambda v: int(float(v)) >= 1, "至少要列出一个范围")
+expect("data", "份键", "document.querySelector('#scopeKeyTag').textContent",
+       lambda v: v.strip() not in ("", "—", "未确定"), "要显示当前用哪一份")
+expect("data", "选择下拉", "document.querySelector('#scopePick').options.length",
+       lambda v: int(float(v)) >= 1, "至少有一项")
+expect("data", "下拉项不是加载中", """(() => {
+  const s = document.querySelector('#scopePick');
+  const t = s.options.length ? s.options[0].textContent : '';
+  return t.includes('加载中') ? 0 : 1;
+})()""", lambda v: int(float(v)) == 1, "选项要真的填好")
+expect("data", "下拉显示的是名字不是工作区标题", """(() => {
+  const s = document.querySelector('#scopePick');
+  if (!s.value) return 0;
+  const opt = [...s.options].find(o => o.value === s.value);
+  // 名字从灵魂里读；没写人格时显示「还没写人格」
+  return opt && (opt.textContent.includes('灵魂') || opt.textContent.includes('人格')) ? 1 : 0;
+})()""", lambda v: int(float(v)) == 1, "选项文案要对")
+expect("data", "份列表", "document.querySelectorAll('#scopeList .session-row').length",
+       lambda v: int(float(v)) >= 1, "至少要列出一份")
 expect("data", "有当前标记", """(() => {
   return document.querySelectorAll('#scopeList .is-current').length;
-})()""", lambda v: int(float(v)) == 1, "当前范围要标出来")
+})()""", lambda v: int(float(v)) == 1, "当前那份要标出来")
 expect("data", "搬家按钮", "!!document.querySelector('#btnDataRootMove')",
        lambda v: v is True, "按钮存在")
+
+# 关键：不许把 DSH 的工作区/会话列出来
+expect("data", "没有工作区下拉", "!!document.querySelector('#scopeWorkspace')",
+       lambda v: v is False, "不该存在（越界读 DSH 会话库）")
+expect("data", "没有会话 id 输入框", "!!document.querySelector('#scopeSessions')",
+       lambda v: v is False, "不该存在")
+expect("data", "没有模式切换", "!!document.querySelector('#scopeMode')",
+       lambda v: v is False, "不该存在")
 
 # ── 设置 ──
 expect("settings", "接口地址", "document.querySelector('#cfgEndpoint').value",

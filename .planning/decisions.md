@@ -282,4 +282,38 @@ PyInstaller 打出来的 exe 里没有那条 Node 依赖链。读路径可以走
 - `bridge.mjs` 内联一份（Node 侧没法 import Python），但注释点名
   "改文案只改 vault.py，然后同步这里"；
 - `soul.py` 直接 `from bigfish.vault import TRAIT_DOC`，不再抄。
-- 两侧一致性由 `test_persona_parity.py` 钉住。
+- 两侧一致性由 `test_persona_parity.py` 钉住。---
+
+## D-15 · EXE 不许翻 DSH 的会话库
+
+**日期**：2026-11-01 20:45
+
+**背景**：用户看着「数据目录」页的截图问：
+
+> 现在不是已经是 EXE 了吗，为什么还能读取到会话和工作区呢？很不合理啊。
+
+这一问是对的。`get_scope_candidates` 当时会去扫
+`<DSH_HOME>/storages/workspace.json` 和 `<DSH_HOME>/sessions/`，
+把 DSH 里的 **7 个工作区标题、25 个会话 id** 全列成一个下拉框。
+
+两个问题，第二个更严重：
+
+1. **功能上没意义。** 那个下拉里显示的是「大肥鱼·大肥鱼」——
+   DSH 给工作区起的标题，跟微信里的大肥鱼毫无关系。用户要选的是
+   "用哪一份灵魂"，不是"DSH 里哪个工作区"。
+2. **越界。** EXE 是独立程序。让微信端能列出宿主里的全部对话目录，
+   等于给了一个不该有的视野。而且它和 D-12（微信端不跟工作区绑）
+   直接自相矛盾 —— 一边说不绑，一边把工作区全列出来。
+
+**决策**：`get_scope_candidates` 只读数据根下真实存在的 `ws-*` / `ss-*` 目录，
+身份显示那个目录里 `soul-*.json` 的 `identity.name` —— **她自己叫什么**，
+而不是 DSH 给工作区起的标题。
+
+界面上撤掉「模式 / 工作区 / 会话 id」三个控件，换成一个下拉：
+「大肥鱼 · 灵魂+心情+记忆」这样直接选人。
+
+**为什么这条要单独一个测试**：它不会让任何测试变红。多读了一个目录，
+功能"还能用"，只是多了不该有的东西。所以 `tools/test_no_leak.py`
+专门断言「不该存在什么」—— 用 AST 取函数真实代码（剥掉注释/docstring），
+14 条断言钉住：不许出现 workspace.json / sessions / session.v4，
+界面不许有 scopeWorkspace / scopeSessions / scopeMode 三个控件。

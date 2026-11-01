@@ -603,50 +603,33 @@
 
         <div class="card" style="margin-top:16px">
           <div class="card-head">
-            <h2>当前范围</h2>
+            <h2>当前用哪一份</h2>
             <span class="tag" id="scopeKeyTag">—</span>
           </div>
           <div class="card-desc" style="margin-bottom:14px">
-            一个范围 = 一个工作区，或一组会话。记忆、心情、灵魂都按它分家 ——
-            换范围就等于换一个人。<br>
-            <strong>微信这边不跟工作区绑</strong>，你只要指定用哪一份就行。
+            数据根下每有一个目录，就是一份独立的「她」。<br>
+            里面住的是谁，看那个目录里灵魂文件写的名字 —— 不是 DSH 给工作区起的标题。
           </div>
           <div class="form">
-            <div class="form-grid">
-              <div class="field">
-                <label>模式</label>
-                <select id="scopeMode">
-                  <option value="workspace">工作区</option>
-                  <option value="session">会话</option>
-                </select>
-                <small>工作区模式按 UUID 认；会话模式按会话 id 认。</small>
-              </div>
-              <div class="field">
-                <label>工作区</label>
-                <select id="scopeWorkspace">
-                  <option value="">（未选择）</option>
-                </select>
-                <small id="scopeWsHint">从 DSH 的 workspace.json 里读出来的。</small>
-              </div>
-            </div>
             <div class="field full">
-              <label>会话 id（会话模式下填，逗号分隔）</label>
-              <input type="text" id="scopeSessions" placeholder="session-xxxx, session-yyyy">
-              <small>会话模式取排序后第一个作范围键，和记忆分库的种子规则一致。</small>
+              <label>切换到</label>
+              <select id="scopePick">
+                <option value="">（加载中…）</option>
+              </select>
+              <small id="scopePickHint">—</small>
             </div>
           </div>
           <div class="memory-toolbar" style="margin-top:14px">
-            <button class="btn btn-primary" id="btnScopeSave">保存范围</button>
+            <button class="btn btn-primary" id="btnScopeSave">用这一份</button>
             <button class="btn btn-sm" id="btnScopeRefresh">重新读取</button>
           </div>
           <div class="card-desc" style="margin-top:12px" id="scopeHint"></div>
         </div>
 
         <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>数据根下有哪些范围</h2></div>
+          <div class="card-head"><h2>数据根下有哪些份</h2></div>
           <div class="card-desc" style="margin-bottom:12px">
-            每个目录是一份独立的「伙伴」。带灵魂的那份才是正在用的。
-            点一行可以切过去。
+            带灵魂的那份才是能用的。点一行直接切过去。
           </div>
           <div class="session-list" id="scopeList">
             <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
