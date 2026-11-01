@@ -1,0 +1,18 @@
+{
+  "_comment": "大肥鱼 × 微信配置。api_key 留空表示走本地 Magpie 网关（不需要 key）。",
+  "endpoint": "http://127.0.0.1:3425/v1/chat/completions",
+  "model": "workbuddy-ai/deepseek-v4.1-flash",
+  "api_key": "",
+  "temperature": 1.0,
+  "max_tokens": 1600,
+  "timeout": 90,
+
+  "auto_reply": {
+    "_comment": "chats 是要监听的会话。私聊写联系人昵称，群聊写群名。",
+    "chats": ["文件传输助手"],
+    "allow_self": true,
+    "interval": 1.2,
+    "max_reply_chars": 300,
+    "quiet_hours": []
+  }
+}

@@ -1,0 +1,11 @@
+"""bigfish — 大肥鱼接入微信的桥接包。
+
+两个子模块：
+  soul.py    从 DSH 灵魂文件生成人格（唯一人格来源）
+  wechat.py  微信数据库只读数据源（基于 wechatauto-replica）
+
+本包不提供发送能力。
+"""
+
+__all__ = ["soul", "wechat"]
+__version__ = "0.1.0"

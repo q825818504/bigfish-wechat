@@ -1,0 +1,38 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 本地运行产物 ----
+.tmp/
+out/
+state/
+*.log
+
+# ---- 敏感：绝不能提交 ----
+# 数据库密钥 = 微信全部聊天记录的钥匙
+wechatauto_db/
+keys.json
+image_keys.json
+credentials.json
+config.json
+
+# 灵魂数据（个人内容，不随代码走）
+soul-ws-*.json
+mood-ws-*.json
+memory-ws-*.sqlite3*
+
+# 研究阶段的临时产物
+research/_*.txt
+research/_*.bin
+tools/_*.txt
+tools/_*.bin
+_weixin_image.bin
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
