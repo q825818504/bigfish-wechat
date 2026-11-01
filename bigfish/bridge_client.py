@@ -280,9 +280,15 @@ def load_mood_only(data_root: str = "") -> Optional[Mood]:
     moods = d.get("moods") or {}
     if not isinstance(moods, dict) or not moods:
         return None
-    # 先按范围键取，取不到才退回 lastActive，最后才是任意一份
-    m = moods.get(key) or moods.get(str(d.get("lastActive") or "")) \
-        or next(iter(moods.values()), None)
+    # 先按 lastActive 取，取不到退回任意一份。
+    # ⚠ 以前这里写的是 `moods.get(key) or ...` —— `key` 是上一版
+    #   「按范围分家」遗留下来的变量，函数签名里早就没有它，于是
+    #   **只要 mood.json 里真有数据，这一行就 NameError**。
+    #   因为之前测试环境里 mood.json 一直是空的（if not moods: return None
+    #   先短路了），这个 bug 从来没暴露过。真实用户一有心情数据就炸，
+    #   而炸点在"心情页"和自检里，会被误当成"心情功能坏了"。
+    active = str(d.get("lastActive") or "")
+    m = moods.get(active) or next(iter(moods.values()), None)
     if not isinstance(m, dict):
         return None
     return Mood(

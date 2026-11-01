@@ -39,7 +39,13 @@ class ModelConfig:
     api_key: str = ""
     model: str = DEFAULT_MODEL
     temperature: float = 1.0
-    max_tokens: int = 1600
+    # 2600 而不是 1600：当前默认模型是**推理模型**（deepseek-v4.x 系列），
+    # 它先在 reasoning_content 里思考、再写正文，两者共用同一份 token 预算。
+    # 1600 时实测：短回复够用（13~16 字，4 秒），但提示词一长
+    # （记忆 + 事实 + 对话历史）就会把预算吃光，正文返回 None，
+    # call_model 抛「模型只输出了推理、正文为空」——看起来像"她不回复了"。
+    # 2600 给推理留了足够余量，普通聊天成本几乎不变（实际用多少算多少）。
+    max_tokens: int = 2600
     timeout: float = 90.0
 
     @classmethod

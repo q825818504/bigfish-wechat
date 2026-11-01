@@ -71,6 +71,11 @@ hiddenimports = [
     "bigfish.watcher",
     "bigfish.wechat_sender",
     "bigfish.updater",
+    # 记忆层：所有调用点都在函数体内 `from bigfish import memory`（为了
+    # 让 import 失败不拖垮启动）。PyInstaller 的静态分析看不到函数里的
+    # 局部 import 之外的动态情况，显式列出最稳 —— 漏了它，打包版会在
+    # 第一次写记忆时抛 ImportError，而不是启动时。
+    "bigfish.memory",
     "wechatauto",
     "wechatauto.db",
     "wechatauto.uia_driver",

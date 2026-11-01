@@ -195,6 +195,79 @@ async function loadMemoryStore(root, scope) {
   }
 }
 
+/**
+ * ① 本地融合检索：交给 Python 的 `bigfish.memory.search_chunks()`。
+ *
+ * 为什么不在这里用 node:sqlite 自己查：排序（bm25→0..1）、MMR 去冗余、
+ * 按 maxChars 填预算这三件事已经写在 memory.py 里，并有 selftest 钉住。
+ * 在 JS 里再实现一遍就是第二套语义 —— 正是这次重构要消灭的东西。
+ *
+ * 调用方式：`python -m bigfish.memory --recall <db> <query> <maxChars>`，
+ * stdout 一行 JSON，stderr 一律忽略（Python 那边的日志）。
+ * 找不到 python / 超时 / 输出不是 JSON —— 一律返回 null，让调用方退回 ②。
+ */
+async function localRecall(root, dbPath, query, maxChars, warnings) {
+  const py = process.env.BIGFISH_PYTHON ||
+    (process.platform === 'win32' ? 'python' : 'python3');
+  const env = { ...process.env, PYTHONPATH: [join(HERE, '..'), process.env.PYTHONPATH || '']
+    .filter(Boolean).join(process.platform === 'win32' ? ';' : ':') };
+  try {
+    const { spawnSync } = await import('node:child_process');
+    const r = spawnSync(py, ['-m', 'bigfish.memory', '--recall', dbPath,
+      '--query', query, '--maxChars', String(maxChars)],
+      { encoding: 'utf-8', env, timeout: 15000, windowsHide: true });
+    const raw = (r.stdout || '').trim();
+    if (!raw) {
+      if (r.error) warnings.push(`本地检索不可用: ${r.error.message}`);
+      return null;
+    }
+    const d = JSON.parse(raw);
+    if (!d || !d.ok || !d.text) return null;
+    return { text: d.text, ids: d.ids || [], diagnostics: d.diagnostics || { mode: 'hybrid' } };
+  } catch (e) {
+    warnings.push(`本地检索失败: ${e.message}`);
+    return null;
+  }
+}
+
+/** ② 退路：import 原版 MemoryStore，拷库到临时目录再检索。 */
+async function legacyRecall(root, scopeId, query, maxChars, dbPath, warnings) {
+  const MemoryStore = await loadMemoryStore(root, scopeId);
+  if (!MemoryStore) return null;
+  let tmpDir = null;
+  try {
+    const { mkdirSync, copyFileSync, rmSync } = await import('node:fs');
+    const baseTmp = process.env.BIGFISH_TMP || join(HERE, '..', '.tmp');
+    mkdirSync(baseTmp, { recursive: true });
+    tmpDir = join(baseTmp, `mem-${process.pid}-${Date.now()}`);
+    mkdirSync(tmpDir, { recursive: true });
+    const tmpDb = join(tmpDir, 'memory.sqlite3');
+    copyFileSync(dbPath, tmpDb);
+    for (const suffix of ['-wal', '-shm']) {
+      if (existsSync(dbPath + suffix)) {
+        try { copyFileSync(dbPath + suffix, tmpDb + suffix); } catch { /* 可选 */ }
+      }
+    }
+    const store = new MemoryStore(tmpDb);
+    try {
+      const r = store.recall(query, { maxChars });
+      return { text: r.text, ids: r.ids, diagnostics: r.diagnostics };
+    } finally {
+      store.db.close();
+    }
+  } catch (e) {
+    warnings.push(`记忆检索失败: ${e.message}`);
+    return null;
+  } finally {
+    if (tmpDir) {
+      try {
+        const { rmSync } = await import('node:fs');
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch { /* 清理失败不影响结果 */ }
+    }
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cmd = args._[0] || 'context';
@@ -270,56 +343,25 @@ async function main() {
   }
 
   // ---------- memory ----------
+  //
+  // 检索的顺序（改过一次，旧的只有第 ② 条）：
+  //   ① 本地融合检索：直接调 `bigfish.memory.search_chunks()`，一次 Python
+  //      调用拿回已经排好序、去过冗余、按预算填满的结果。
+  //   ② 原来那条 Node 侧 import 原版 MemoryStore 的路径，保留作退路 ——
+  //      本地库还没建索引、或 Python 侧不可用时才会走到这里。
+  //
+  // 为什么要把检索搬到 Python：旧实现每次都把整个库**拷到临时目录**再打开
+  // （因为 DSH 可能持有 WAL 写锁）。库到了 200MB 就是每轮 200MB 的读 IO。
+  // 现在主进程用 mode=ro 只读打开，WAL 本来就允许多读者，不用拷。
   let memory = null;
   if (query) {
-    const MemoryStore = await loadMemoryStore(root, scopeId);
-    if (MemoryStore) {
-      const dbPath = findDataFile('memory', 'sqlite3');
-      if (dbPath) {
-        // DSH 那边可能正持有这个库（WAL 模式需要写权限）。
-        // 复制一份到临时目录再检索：只读、不干扰、也不受锁影响。
-        // 复制时连 -wal / -shm 一起带上，否则会丢最近未 checkpoint 的数据。
-        let tmpDir = null;
-        try {
-          // 不用 os.tmpdir()：某些环境对系统临时目录有写限制，
-          // 统一放项目内的 .tmp/ 下，路径可预测也好清理。
-          const { mkdirSync, copyFileSync, rmSync } = await import('node:fs');
-          const baseTmp = process.env.BIGFISH_TMP ||
-            join(HERE, '..', '.tmp');
-          mkdirSync(baseTmp, { recursive: true });
-          tmpDir = join(baseTmp, `mem-${process.pid}-${Date.now()}`);
-          mkdirSync(tmpDir, { recursive: true });
-          const tmpDb = join(tmpDir, 'memory.sqlite3');
-          copyFileSync(dbPath, tmpDb);
-          for (const suffix of ['-wal', '-shm']) {
-            if (existsSync(dbPath + suffix)) {
-              try { copyFileSync(dbPath + suffix, tmpDb + suffix); } catch { /* 可选 */ }
-            }
-          }
-          const store = new MemoryStore(tmpDb);
-          try {
-            // 不传 sessionIds：库里的 session 形如
-            //   session-f1382628-...@1793030256761
-            // 而 workspace scope 形如 ws-83ba9d80-ec53-...
-            // 两者不是同一套命名，用它过滤会把所有记忆都筛掉。
-            // 记忆库本身已按 workspace 分文件，不需要再按 session 收窄。
-            const r = store.recall(query, { maxChars });
-            memory = { text: r.text, ids: r.ids, diagnostics: r.diagnostics };
-          } finally {
-            store.db.close();
-          }
-        } catch (e) {
-          warnings.push(`记忆检索失败: ${e.message}`);
-        } finally {
-          if (tmpDir) {
-            try {
-              const { rmSync } = await import('node:fs');
-              rmSync(tmpDir, { recursive: true, force: true });
-            } catch { /* 清理失败不影响结果 */ }
-          }
-        }
-      } else {
-        warnings.push(`找不到记忆库: ${dbPath}`);
+    const dbPath = findDataFile('memory', 'sqlite3');
+    if (!dbPath) {
+      warnings.push('找不到记忆库');
+    } else {
+      memory = await localRecall(root, dbPath, query, maxChars, warnings);
+      if (!memory) {
+        memory = await legacyRecall(root, scopeId, query, maxChars, dbPath, warnings);
       }
     }
   }

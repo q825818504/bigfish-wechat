@@ -774,6 +774,43 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   overflow-wrap: anywhere;
 }
 
+/* ══ 事实层（她认定的事） ══
+   和原文列表刻意长得不一样：原文是"事件"，认识是"结论"。
+   被取代/已忘掉的条目压暗但保留 —— 她能改主意，旧的那条不该消失。 */
+.health-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.health-tag {
+  font: 10px var(--mono-font);
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  color: var(--muted);
+  border: 1px solid var(--border-soft);
+}
+.health-tag.ok { color: var(--ok); border-color: var(--ok); background: transparent; }
+.health-tag.warn { color: var(--error); border-color: #eabfbb; background: var(--error-soft); }
+
+.fact-conf {
+  font: 10px var(--mono-font);
+  color: var(--muted);
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-soft);
+}
+.fact-note {
+  font-size: 10px;
+  color: var(--error);
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--error-soft);
+}
+.memory-item.is-dead { opacity: .55; }
+.memory-item.is-dead .memory-text { text-decoration: line-through; }
+
 /* ══ 心情页 ══ */
 .mood-hero {
   display: flex;

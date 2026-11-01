@@ -156,6 +156,45 @@ CONFIG_PATH = os.path.join(_ROOT, "config.json")
 # ══════════════════════════════════════════════════════════════════
 #  配置
 # ══════════════════════════════════════════════════════════════════
+def _source_ms(msg) -> "int | None":
+    """入站消息的发生时间，毫秒。取不到就返回 None（让写入方用当前时间）。
+
+    为什么要这一层：`Incoming` 的字段叫 `timestamp`（微信 `create_time`，
+    **秒**），而记忆库的 `source_time` / `recorded_at` 都是**毫秒**。
+    以前这里写的是 `getattr(msg, "source_time", None)` —— 那个属性根本
+    不存在，于是每条记忆的 source_time 都是 None，时间全塌成"写入时刻"。
+    检索时按时间排序、按时间窗过滤全部失真，而且界面上看到的是
+    "这条刚刚说过"，其实是三天前说的。
+    """
+    raw = getattr(msg, "timestamp", None)
+    try:
+        v = int(raw or 0)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    # 微信 4.x 的 create_time 是秒；万一哪天变成毫秒，按数量级判一下
+    return v * 1000 if v < 10_000_000_000 else v
+
+
+def _facts_block(limit: int = 12) -> str:
+    """取「她认定的事」渲染成注入段。失败返回空串，绝不中断对话。
+
+    和 `## 你记得的事`（原话切片）分开：原话是逐句、带时间的；
+    事实是稳定的、可被纠正的。两条腿走路，模型才知道
+    "你说过什么" 与 "我知道什么" 不是一回事。
+    """
+    try:
+        from bigfish import memory as M, vault as V
+
+        db = V.memory_db_path()
+        if not db or not os.path.isfile(db):
+            return ""
+        return M.facts_for_prompt(db, "dafeiyu", limit=limit)
+    except Exception:
+        return ""
+
+
 def load_json_config() -> dict:
     if os.path.isfile(CONFIG_PATH):
         try:
@@ -255,6 +294,55 @@ class EngineWorker(QThread):
         t = threading.Thread(target=work, daemon=True,
                              name=f"mood-{getattr(msg, 'local_id', 0)}")
         t.start()
+
+    def _reflect_async(self, chat_id: str, msg) -> None:
+        """后台把这一轮之后的原文沉淀成「事实」。
+
+        为什么单独一个线程、还要限频：
+          反思要调一次模型，并且只有在攒够几条新消息时才值得做 ——
+          每轮都反思既烧 token 也没意义（一句话说明不了什么）。
+          这里用 8 条 / 10 分钟两个闸门，宁缺毋滥。
+
+        为什么失败什么都不说：
+          反思是"变得更好"，不是"能用"的前提。它失败不该在日志里
+          刷红；只在真正产出事实时记一行，让用户看得见它在长。
+        """
+        import threading
+        import time as _t
+
+        now = _t.time()
+        last = getattr(self, "_last_reflect", 0.0)
+        if now - last < 600:
+            return
+        self._last_reflect = now
+
+        def work() -> None:
+            try:
+                from bigfish import memory as M
+                from bigfish.replier import call_model
+                import bigfish.vault as V
+
+                db = V.memory_db_path()
+                if not db:
+                    return
+                M.ensure_schema(db)
+                # 把她自己的名字一起传进去 —— 模型才不会把
+                # 对方发来的一句「肥鱼」当成自我介绍。
+                # 真实踩过：攒出一条「对方的名字叫肥鱼」，
+                # 而"肥鱼"本来就是她。
+                mine = [n for n in (getattr(self.soul, "name", ""),
+                                    getattr(self.soul, "aliases", "")) if n]
+                r = M.reflect_on_session(
+                    db, "dafeiyu", f"wechat:{chat_id}",
+                    lambda system, user: call_model(self.mcfg, system, user),
+                    batch=40, self_names=mine)
+                if r.get("ok") and (r.get("added") or r.get("reason")):
+                    self._log(f"[记] 提炼 {r.get('added', 0)} 条认识", "")
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True,
+                         name="reflect").start()
 
     def run(self) -> None:
         try:
@@ -485,6 +573,19 @@ class EngineWorker(QThread):
             mem = ctx.render_memory()
             if mem:
                 user_parts.append("## 你记得的事\n\n" + mem)
+
+            # 事实层：她「知道什么」。和原文分开注入 ——
+            #   原文是逐句的、带时间的；事实是稳定的、可被纠正的。
+            #   以前只有原文，于是「她改主意了」无处表达：只能删原文。
+            #   ⚠ 这段以前只写在 app.py（研究入口），EXE 跑的 desktop.py
+            #     里根本没有 —— 事实存了、界面看得见、但从不进提示词。
+            facts = _facts_block()
+            if facts:
+                user_parts.append(
+                    "## 你认定的事\n\n" + facts
+                    + "\n\n（这些是你自己整理过的认识，不是说过的原话；"
+                      "和对方现在的说法冲突时以对方为准，并改过来。）")
+
             scene = (f"你在微信群「{msg.chat_name}」里，"
                      f"{msg.sender_name or '某人'} @了你。" if is_group
                      else f"你在微信上和「{msg.chat_name}」聊天。")
@@ -557,7 +658,7 @@ class EngineWorker(QThread):
                             user_text=body,
                             reply_text=reply,
                             user_local_id=getattr(msg, "local_id", None),
-                            source_time=getattr(msg, "source_time", None),
+                            source_time=_source_ms(msg),
                         )
                         if n:
                             self._log(f"[记] 记忆库 +{n} 条", "")
@@ -570,6 +671,10 @@ class EngineWorker(QThread):
                     #   判断本身要调一次模型（1~2 秒），所以放后台线程，
                     #   不能卡住下一条消息的回复。
                     self._judge_mood_async(body, reply, msg)
+                    # ⭐ 顺带把这一轮的原文沉淀成「事实」。
+                    #   和心情一样放后台：它要调一次模型，且带限频闸门，
+                    #   绝不阻塞下一轮回复。
+                    self._reflect_async(msg.chat_id, msg)
                 else:
                     self._log(f"[发送失败] {r.detail}", "err")
             except SendError as exc:
@@ -1144,6 +1249,113 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
+    # ── 事实层（她「认定的事」，可纠正可遗忘） ──
+    @Slot(result=str)
+    def memory_health(self) -> str:
+        """记忆库体检：索引缺多少、有没有孤儿片段、事实多少条。
+
+        口径与插件那边一致：要么给可核对的数量，要么明确说读不到 ——
+        不把"检查失败"显示成 0。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            return json.dumps(M.health(db or "", "dafeiyu"), ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "message": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def memory_repair(self) -> str:
+        """重建派生层（FTS 索引 / 锚点关联 / chunk_meta）。原文不动。"""
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            if not db:
+                return json.dumps({"ok": False, "error": "数据目录未确定"},
+                                  ensure_ascii=False)
+            r = M.rebuild_derived(db)
+            return json.dumps(r, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, int, int, result=str)
+    def list_facts(self, status: str, query: str, limit: int, offset: int) -> str:
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            page = M.list_facts(db or "", "dafeiyu", status=status or "",
+                                query=query or "",
+                                limit=max(1, min(200, limit or 40)),
+                                offset=max(0, offset or 0))
+            for it in page.get("items", []):
+                it["createdText"] = ts_to_local(it.get("createdAt") or 0)
+            return json.dumps(page, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"items": [], "total": 0, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def fact_events(self, limit: str = "60") -> str:
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            try:
+                n = int(limit)
+            except Exception:
+                n = 60
+            rows = M.fact_events(db or "", "dafeiyu", limit=n)
+            for r in rows:
+                r["atText"] = ts_to_local(r.get("at") or 0)
+            return json.dumps({"events": rows}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"events": [], "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(int, str, result=str)
+    def forget_fact(self, fact_id: int, reason: str) -> str:
+        """忘掉一条认识。**不删行**：她确实这么想过，只是不再拿它当结论。"""
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            ok, err = M.forget_fact(db or "", "dafeiyu", int(fact_id),
+                                    reason or "用户手动遗忘")
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def reflect_now(self) -> str:
+        """手动触发一次反思（界面上的「现在整理一下」）。"""
+        try:
+            import bigfish.vault as V
+            from bigfish import memory as M
+            from bigfish.replier import call_model
+
+            db = V.memory_db_path()
+            if not db:
+                return json.dumps({"ok": False, "error": "数据目录未确定"},
+                                  ensure_ascii=False)
+            M.ensure_schema(db)
+            # 对最近活跃的那个会话反思；没有会话就明说
+            sessions = V.list_sessions(db, 1)
+            if not sessions:
+                return json.dumps({"ok": False, "error": "还没有任何对话"},
+                                  ensure_ascii=False)
+            sess = sessions[0]["session"]
+            mine = [n for n in (getattr(self.soul, "name", ""),
+                                getattr(self.soul, "aliases", "")) if n]
+            r = M.reflect_on_session(
+                db, "dafeiyu", sess,
+                lambda system, user: call_model(self.mcfg, system, user),
+                self_names=mine)
+            return json.dumps(r, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
     # ── 数据目录（就一个，没有"选哪份"） ──
     @Slot(result=str)
     def get_data_root(self) -> str:
@@ -1609,7 +1821,7 @@ class Backend(QObject):
             "model": c.get("model", ""),
             "api_key": c.get("api_key", ""),
             "temperature": c.get("temperature", 1.0),
-            "max_tokens": c.get("max_tokens", 1600),
+            "max_tokens": c.get("max_tokens", 2600),
             "interval": ar.get("interval", 1.2),
             "max_reply_chars": ar.get("max_reply_chars", 300),
             "quiet_hours": ar.get("quiet_hours", []),
@@ -1627,7 +1839,7 @@ class Backend(QObject):
             c["model"] = d.get("model", c.get("model"))
             c["api_key"] = d.get("api_key", "")
             c["temperature"] = float(d.get("temperature", 1.0))
-            c["max_tokens"] = int(d.get("max_tokens", 1600))
+            c["max_tokens"] = int(d.get("max_tokens", 2600))
 
             ar = c.setdefault("auto_reply", {})
             ar["interval"] = float(d.get("interval", 1.2))
@@ -2152,6 +2364,77 @@ def run_selftest() -> int:
         finally:
             _sh.rmtree(tmpd, ignore_errors=True)
     item("记忆写入", t_memory_write)
+
+    # 10b. 事实层链路 —— 这一条**只有打包版才会暴露问题**
+    #      bigfish.memory 是新增模块，所有调用点都是函数内局部 import：
+    #      源码跑得好好的，PyInstaller 漏收就变成"聊天正常、一记事实就 ImportError"。
+    #      所以这里必须真跑一遍：建库 → 纠正 → 遗忘 → 检索 → 级联。
+    def t_fact_layer():
+        import shutil as _sh
+        import tempfile as _tf
+
+        from bigfish import memory as M, vault as V
+
+        tmpd = _tf.mkdtemp(prefix="bf-fact-")
+        db = os.path.join(tmpd, V.MEMORY_NAME)
+        try:
+            ok, err = M.ensure_schema(db)
+            assert ok, err or "建库失败"
+
+            ok, fid, err = M.remember(db, "dafeiyu", M.Fact(
+                predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7))
+            assert ok and fid, err or "事实写入失败"
+
+            # 纠正：旧的标 superseded、新的 active、两行都在
+            ok, fid2, err = M.remember(db, "dafeiyu", M.Fact(
+                predicate="饮食偏好", object="改喝豆浆", anchor="老爸", confidence=0.85))
+            assert ok and fid2 != fid, "纠正没产生新行"
+            items = {f["id"]: f for f in M.list_facts(db, "dafeiyu")["items"]}
+            assert len(items) == 2, f"应为 2 行，实际 {len(items)}"
+            assert items[fid]["status"] == "superseded", items[fid]["status"]
+            assert items[fid]["supersededBy"] == fid2, "旧事实没指向新事实"
+
+            # 遗忘：不删行
+            ok, err = M.forget_fact(db, "dafeiyu", fid2, "自检")
+            assert ok, err or "遗忘失败"
+            got = {f["id"]: f for f in M.list_facts(db, "dafeiyu")["items"]}
+            assert got[fid2]["status"] == "forgotten", "遗忘没生效"
+            assert len(got) == 2, "遗忘不应该删行"
+
+            # 原文 + 检索（中文整句必须命得中）
+            V.capture_message("wechat:selftest", "f1", "user",
+                              "老爸今天加班到十点，很累", db_path=db)
+            hits = M.search_chunks(db, "dafeiyu", "老爸加班")
+            assert hits, "中文检索没命中"
+            assert "加班" in hits[0]["text"], "最相关没排第一"
+
+            # 级联：删原文不留幽灵
+            # ⚠ 这一步放在 CLI 检索**之后** —— 否则库被删空了，
+            #   后面的 CLI 检索自然"通道不通"，那是测试顺序的错，不是代码的错。
+            ok, n, err = V.delete_messages(db, [1])
+            assert ok and n == 1, err or "级联删除失败"
+            h = M.health(db, "dafeiyu")
+            assert h["ok"], h.get("message")
+            assert h["missingIndex"] == 0, f"索引缺口 {h['missingIndex']}"
+            assert h["orphanChunks"] == 0, f"孤儿片段 {h['orphanChunks']}"
+
+            # CLI 通道（bridge.mjs 靠它）—— 删完还剩事实与别的原文，
+            # 但这里要的是"检索通路能跑通"，所以再补一句可检索的原文。
+            V.capture_message("wechat:selftest", "f2", "user",
+                              "那爸爸记得早点休息", db_path=db)
+            import io as _io
+            import json as _json
+            from contextlib import redirect_stdout
+            buf = _io.StringIO()
+            with redirect_stdout(buf):
+                M._cli(["--recall", db, "--query", "爸爸", "--maxChars", "600"])
+            out = _json.loads(buf.getvalue().strip() or "{}")
+            assert out.get("ok"), f"CLI 检索通道不通：{buf.getvalue()[:120]}"
+
+            return f"事实/纠正/遗忘/检索/级联/CLI 正常（schema v{h['schemaVersion']}）"
+        finally:
+            _sh.rmtree(tmpd, ignore_errors=True)
+    item("事实层", t_fact_layer)
 
     # 11. 心情写入链路
     def t_mood_write():

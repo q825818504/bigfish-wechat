@@ -59,7 +59,7 @@ function go(page) {
 
   if (page === 'soul' && !S.soul) loadSoul();
   if (page === 'mood') loadMood();
-  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); }
+  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); }
   if (page === 'data') loadDataRoot();
 }
 
@@ -923,6 +923,122 @@ $('#btnMemNext').addEventListener('click', () => {
   }
 });
 
+/* ── 记忆：她认定的事（事实层） ──
+ *
+ * 和上面「记忆」列表的区别要讲清楚，否则用户分不清能删哪个：
+ *   · 原文列表 = 她听过的原话。删了就是没听过。
+ *   · 事实列表 = 她自己整理出的认识。可以「忘掉」（不删行，只失效），
+ *     也能看到它被哪条新认识取代了 —— 「她以前以为是 X」依然查得到。
+ */
+
+S.facts = { offset: 0, total: 0, status: '' };
+
+async function loadMemoryHealth() {
+  if (!S.bridge || !S.bridge.memory_health) return;
+  try {
+    const d = JSON.parse(await S.bridge.memory_health());
+    const box = $('#memHealth');
+    if (!box) return;
+    if (!d.ok) {
+      box.innerHTML = '<span class="health-tag warn">' + esc(d.message || '读不到') + '</span>';
+      return;
+    }
+    const bad = (d.problems || []).length;
+    const cls = bad ? 'warn' : 'ok';
+    box.innerHTML =
+      '<span class="health-tag ' + cls + '">' + esc(bad ? d.problems.join('；') : '索引一致') + '</span>' +
+      '<span class="health-tag">原文 ' + d.messages + ' 条 / 片段 ' + d.chunks + '</span>' +
+      '<span class="health-tag">认识 ' + d.facts + ' 条（已取代 ' + d.superseded + '）</span>' +
+      '<span class="health-tag">schema v' + d.schemaVersion + '</span>';
+  } catch (e) { /* 体检失败不影响使用 */ }
+}
+
+async function loadFacts(offset) {
+  if (!S.bridge || !S.bridge.list_facts) return;
+  if (typeof offset === 'number') S.facts.offset = Math.max(0, offset);
+  const status = $('#factStatus') ? $('#factStatus').value : '';
+  const query = $('#factQuery') ? $('#factQuery').value.trim() : '';
+  const box = $('#factList');
+  if (!box) return;
+  try {
+    const d = JSON.parse(await S.bridge.list_facts(status, query, 40, S.facts.offset));
+    if (d.error) return toast(d.error);
+    const items = d.items || [];
+    S.facts.total = d.total || 0;
+    const from = S.facts.total ? S.facts.offset + 1 : 0;
+    const to = Math.min(S.facts.offset + items.length, S.facts.total);
+    setText('#factPageInfo', from + '–' + to + ' / ' + S.facts.total);
+
+    if (!items.length) {
+      box.innerHTML = '<div class="empty"><h3>还没有整理出认识</h3>' +
+        '<p>聊够几轮后点「现在整理一下」，她会把原话沉淀成认识</p></div>';
+      return;
+    }
+    box.innerHTML = items.map((f) => {
+      const dead = f.status !== 'active';
+      const replaced = f.supersededBy
+        ? '<span class="fact-note">已被 #' + f.supersededBy + ' 取代</span>' : '';
+      const conf = '<span class="fact-conf">' + Math.round((f.confidence || 0) * 100) + '%</span>';
+      const del = dead ? '' :
+        '<button class="icon-btn" data-forget="' + f.id + '" title="忘掉这条（不删历史，只失效）" ' +
+        'style="margin-left:6px;width:22px;height:22px">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+        '<path d="M6 6l12 12M18 6L6 18"/></svg></button>';
+      return '<div class="memory-item' + (dead ? ' is-dead' : '') + '">' +
+        '<div class="memory-body"><div class="memory-meta">' +
+        '<span class="memory-role">' + esc(f.anchor || '她') + '</span>' +
+        '<span class="memory-time">' + esc(f.predicate) + '</span>' + conf + replaced +
+        '<span class="memory-time">' + esc(f.createdText || '') + '</span>' + del +
+        '</div><div class="memory-text">' + esc(f.object) + '</div></div></div>';
+    }).join('');
+  } catch (e) {
+    toast('读取认识失败');
+  }
+}
+
+async function forgetFact(id) {
+  const NL = String.fromCharCode(10);
+  const ok = confirm('忘掉这条认识？' + NL + NL +
+    '不会删掉聊天原话 —— 她只是不再拿它当结论。');
+  if (!ok) return;
+  try {
+    const r = JSON.parse(await S.bridge.forget_fact(id, '用户手动遗忘'));
+    if (!r.ok) return toast(r.error || '操作失败');
+    toast('已忘掉');
+    loadFacts();
+    loadMemoryHealth();
+  } catch (e) { toast('操作失败'); }
+}
+
+async function reflectNow() {
+  const btn = $('#btnReflect');
+  if (btn) { btn.disabled = true; btn.textContent = '整理中…'; }
+  try {
+    const r = JSON.parse(await S.bridge.reflect_now());
+    if (!r.ok) toast(r.error || '整理失败');
+    else toast('新整理出 ' + (r.added || 0) + ' 条认识');
+    loadFacts(0);
+    loadMemoryHealth();
+  } catch (e) {
+    toast('整理失败');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '现在整理一下'; }
+  }
+}
+
+async function repairMemory() {
+  const NL = String.fromCharCode(10);
+  const ok = confirm('重建检索索引？' + NL + NL +
+    '原文和认识都不动，只重排索引。');
+  if (!ok) return;
+  try {
+    const r = JSON.parse(await S.bridge.memory_repair());
+    if (!r.ok) return toast(r.error || '修复失败');
+    toast('索引已重建（' + r.chunks + ' 个片段）');
+    loadMemoryHealth();
+  } catch (e) { toast('修复失败'); }
+}
+
 /* ── 记忆：会话清单 ── */
 async function loadMemorySessions() {
   if (!S.bridge) return;
@@ -1023,6 +1139,37 @@ $('#btnMemVacuum').addEventListener('click', async () => {
     await loadMemoryStats();
   } catch (e) { toast('压缩失败'); }
 });
+
+/* ── 事实层：交互 ──
+ *
+ * 这些按钮跟上面「记忆」页的按钮是两套：
+ *   原文页 → 删（真的删）
+ *   事实页 → 忘掉（只失效）/ 整理（新增认识）/ 修索引（修复派生层）
+ */
+
+const bindFactUI = () => {
+  const on = (sel, ev, fn) => {
+    const el = $(sel);
+    if (el) el.addEventListener(ev, fn);
+  };
+  on('#btnFactRefresh', 'click', () => loadFacts(0));
+  on('#btnReflect', 'click', reflectNow);
+  on('#btnMemRepair', 'click', repairMemory);
+  on('#factStatus', 'change', () => loadFacts(0));
+  on('#factQuery', 'keydown', (e) => {
+    if (e.key === 'Enter') loadFacts(0);
+  });
+  on('#btnFactPrev', 'click', () => loadFacts(Math.max(0, S.facts.offset - 40)));
+  on('#btnFactNext', 'click', () => {
+    if (S.facts.offset + 40 < S.facts.total) loadFacts(S.facts.offset + 40);
+  });
+  document.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-forget]');
+    if (!t) return;
+    forgetFact(Number(t.dataset.forget));
+  });
+};
+bindFactUI();
 
 /* ────────── 数据目录 ────────── */
 

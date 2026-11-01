@@ -159,9 +159,20 @@ class BigFishApp:
                              f"（{ctx.mood.value:.0f}/100）")
 
         user_parts = []
+        # 原文检索：她「听过什么」。
         mem = ctx.render_memory()
         if mem:
             user_parts.append("## 你记得的事\n\n" + mem)
+
+        # 事实层：她「知道什么」。与原文分开注入 ——
+        #   原文是逐句的、带时间的；事实是稳定的、可被纠正的。
+        #   以前只有原文，于是「她改主意了」这件事无处表达：只能删原文。
+        facts = _facts_block()
+        if facts:
+            user_parts.append(
+                "## 你认定的事\n\n" + facts
+                + "\n\n（这些是你自己整理过的认识，不是说过的原话；"
+                  "和对方现在的说法冲突时以对方为准，并改过来。）")
 
         is_group = msg.chat_id.endswith("@chatroom")
         scene = (f"你在微信群「{msg.chat_name}」里，"
@@ -272,6 +283,20 @@ class BigFishApp:
         except SendError as exc:
             self.stats["fail"] += 1
             self.log(f"[发] ✗ {exc.kind}：{exc}")
+
+
+# ----------------------------------------------------------------------
+def _facts_block(limit: int = 12) -> str:
+    """从记忆库取「她认定的事」渲染成注入段。失败返回空串，绝不中断对话。"""
+    try:
+        from bigfish import memory as M, vault as V
+
+        db = V.memory_db_path()
+        if not db:
+            return ""
+        return M.facts_for_prompt(db, "dafeiyu", limit=limit)
+    except Exception:
+        return ""
 
 
 # ----------------------------------------------------------------------

@@ -531,6 +531,45 @@
         </div>
 
         <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>她认定的事</h2>
+            <span class="tag" id="memHealthTag">—</span>
+          </div>
+          <div class="card-desc" style="margin-bottom:12px">
+            <strong>和上面的原文不是一回事。</strong>
+            上面是她听过的原话，删了就真没了；这里是她自己整理出的认识 ——
+            可以说错、可以被纠正、可以忘掉。忘掉不删原话，只是不再拿它当结论，
+            所以「她以前以为是 X」以后还查得到。
+          </div>
+          <div class="health-row" id="memHealth">
+            <span class="health-tag">读取中…</span>
+          </div>
+          <div class="memory-toolbar" style="margin-top:12px;margin-bottom:12px">
+            <select id="factStatus">
+              <option value="">全部</option>
+              <option value="active">现在有效的</option>
+              <option value="superseded">已被取代</option>
+              <option value="forgotten">已忘掉</option>
+            </select>
+            <input class="memory-search" id="factQuery" placeholder="按内容过滤认识…">
+            <button class="btn btn-sm" id="btnFactRefresh" title="重新读取">刷新</button>
+            <button class="btn btn-sm" id="btnReflect" title="让她把最近的原话整理成认识">现在整理一下</button>
+            <button class="btn btn-sm" id="btnMemRepair" title="重建检索索引，原文不动">修索引</button>
+          </div>
+          <div class="memory-list" id="factList">
+            <div class="empty">
+              <h3>还没有整理出认识</h3>
+              <p>聊够几轮后点「现在整理一下」</p>
+            </div>
+          </div>
+          <div class="pager" id="factPager">
+            <button class="btn btn-sm" id="btnFactPrev">上一页</button>
+            <span class="pager-info" id="factPageInfo">—</span>
+            <button class="btn btn-sm" id="btnFactNext">下一页</button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
           <div class="card-head"><h2>会话</h2></div>
           <div class="card-desc" style="margin-bottom:12px">
             每个会话留下多少条记忆。删掉某个会话的记忆后，她就不记得那段对话了。

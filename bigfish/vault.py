@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -1042,8 +1043,13 @@ def delete_messages(db_path: str, ids: List[int]) -> Tuple[bool, int, str]:
     ⚠️ 顺序很重要：chunks 引用了 messages，必须先删 chunks 再删 messages，
        否则 foreign_keys=ON 时会抛约束错误。同时要把 FTS 索引里那些行清掉，
        不然检索会命中已经不存在的内容。
+
+    旁表清单已经收口到 `memory.CHUNK_SIDE_TABLES` —— 旧实现在这里手写五条
+    DELETE，漏一张表就留下幽灵命中，以后再加旁表也得记着回来改。
     """
     import sqlite3
+
+    from bigfish import memory as _memory
 
     ids = [int(i) for i in ids if str(i).strip()]
     if not ids or not db_path or not os.path.isfile(db_path):
@@ -1053,24 +1059,17 @@ def delete_messages(db_path: str, ids: List[int]) -> Tuple[bool, int, str]:
     try:
         conn.execute("PRAGMA foreign_keys=ON")
         marks = ",".join("?" * len(ids))
-        # 找出要删的 chunk id（FTS 的 rowid 就是 chunk.id）
         chunk_rows = conn.execute(
             f"SELECT id FROM chunks WHERE message IN ({marks})", ids).fetchall()
-        chunk_ids = [r[0] for r in chunk_rows]
+        chunk_ids = [int(r[0]) for r in chunk_rows]
 
         conn.execute("BEGIN")
         try:
-            for cid in chunk_ids:
-                conn.execute("DELETE FROM search_index WHERE rowid = ?", (cid,))
-            conn.execute(f"DELETE FROM chunks WHERE id IN ({','.join('?' * len(chunk_ids))})",
-                         chunk_ids) if chunk_ids else None
-            # anchor_sources / activations 通过外键 ON DELETE 处理不了（没建级联），手动清
+            _memory.forget_chunk_side_tables(conn, chunk_ids)
             if chunk_ids:
-                marks2 = ",".join("?" * len(chunk_ids))
-                conn.execute(f"DELETE FROM anchor_sources WHERE chunk IN ({marks2})", chunk_ids)
-                conn.execute(f"DELETE FROM activations WHERE chunk IN ({marks2})", chunk_ids)
-                conn.execute(f"DELETE FROM groups WHERE chunk IN ({marks2})", chunk_ids)
-                conn.execute(f"DELETE FROM replays WHERE chunk IN ({marks2})", chunk_ids)
+                conn.execute(
+                    f"DELETE FROM chunks WHERE id IN ({','.join('?' * len(chunk_ids))})",
+                    chunk_ids)
             cur = conn.execute(f"DELETE FROM messages WHERE id IN ({marks})", ids)
             deleted = cur.rowcount
             conn.execute("COMMIT")
@@ -1584,24 +1583,7 @@ def ensure_data_root(import_from_dsh: bool = True) -> Dict[str, Any]:
 #
 # 分词必须和 store.js 的 terms() 一模一样，否则检索会漏 ——
 # 这边建索引、那边（bridge.mjs）查索引，两套分词等于互相看不见。
-
-_STOP = {
-    "的", "了", "吗", "呢", "我", "你", "他", "它", "是", "在", "和", "有", "就", "啊",
-    "the", "a", "is", "and",
-}
-
-_HAN = None
-
-
-def _is_han(ch: str) -> bool:
-    if _HAN is None:
-        pass
-    o = ord(ch)
-    return (
-        0x4E00 <= o <= 0x9FFF      # CJK 统一表意
-        or 0x3400 <= o <= 0x4DBF   # 扩展 A
-        or 0xF900 <= o <= 0xFAFF   # 兼容表意
-    )
+# 实现见 bigfish/memory.py:terms()，这里不留第二份。
 
 
 def memory_terms(text: str) -> List[str]:
@@ -1611,97 +1593,33 @@ def memory_terms(text: str) -> List[str]:
       · 汉字串：单字（去掉停用字）+ 相邻二字
       · 英文/数字串：整词（去掉停用词）
       · 最后去重
-    """
-    import re
 
-    out: List[str] = []
-    for run in re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+|[a-z0-9_]+",
-                          (text or "").lower()):
-        if _is_han(run[0]):
-            chars = list(run)
-            for i, ch in enumerate(chars):
-                if ch not in _STOP:
-                    out.append(ch)
-                if i + 1 < len(chars):
-                    out.append(ch + chars[i + 1])
-        else:
-            if run not in _STOP:
-                out.append(run)
-    # 去重且保序
-    seen = set()
-    uniq = []
-    for t in out:
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    return uniq
+    ⚠ 实现已搬到 `bigfish/memory.py`（那边是唯一真源），这里只保留名字：
+      调用点有二十多处，存量测试也在断言这个函数。**不要在本地再实现一遍** ——
+      两套分词等于"这边建索引、那边查索引"，互相看不见。
+    """
+    from bigfish import memory as _memory
+
+    return _memory.terms(text)
 
 
 def ensure_memory_db(db_path: Optional[str] = None) -> Tuple[bool, str]:
-    """建库（如果还没有）。结构必须与 MemoryStore 的 constructor 完全一致。
+    """建库（如果还没有）。结构与 MemoryStore 的 constructor 完全一致。
 
     ⚠ 不能"先随便建个空文件"就算了 —— MemoryStore 打开时会执行一整套
       CREATE TABLE IF NOT EXISTS。少一个表，插件（或 bridge.mjs）
-      打开就会报错。所以这里把 DDL 原样抄一遍。
+      打开就会报错。
+
+    DDL 现在只有一份，在 `bigfish/memory.py` 的 all_statements() 里：
+    原文四表 + 事实层五表一起建。老库（user_version=1）由 migrate 补齐，
+    所以**同一个函数既能建新库，也能升级老库**。
     """
-    import sqlite3
+    from bigfish import memory as _memory
 
     path = db_path or memory_path()
     if not path:
         return False, "数据目录未确定"
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        conn = sqlite3.connect(path)
-        try:
-            conn.executescript("""
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY, bank TEXT NOT NULL, session TEXT NOT NULL,
-  event_key TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL,
-  content_json TEXT NOT NULL, source_message_id TEXT,
-  recorded_at INTEGER NOT NULL, source_time INTEGER,
-  interrupted INTEGER NOT NULL DEFAULT 0,
-  UNIQUE(bank,session,event_key));
-CREATE INDEX IF NOT EXISTS messages_bank_session ON messages(bank,session,id);
-CREATE INDEX IF NOT EXISTS messages_bank_time ON messages(bank,source_time);
-CREATE TABLE IF NOT EXISTS chunks (
-  id INTEGER PRIMARY KEY, message INTEGER NOT NULL REFERENCES messages(id),
-  start INTEGER NOT NULL, end INTEGER NOT NULL, text TEXT NOT NULL,
-  category TEXT NOT NULL DEFAULT 'episodic',
-  importance REAL NOT NULL DEFAULT 0.5,
-  activated INTEGER NOT NULL, boosts INTEGER NOT NULL DEFAULT 0,
-  last_boost INTEGER, UNIQUE(message,start));
-CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(terms, tokenize='unicode61');
-CREATE TABLE IF NOT EXISTS anchors (
-  id INTEGER PRIMARY KEY, bank TEXT NOT NULL, name TEXT NOT NULL,
-  UNIQUE(bank,name));
-CREATE TABLE IF NOT EXISTS aliases (
-  anchor INTEGER REFERENCES anchors(id), alias TEXT NOT NULL,
-  PRIMARY KEY(anchor,alias));
-CREATE TABLE IF NOT EXISTS anchor_sources (
-  anchor INTEGER REFERENCES anchors(id), chunk INTEGER REFERENCES chunks(id),
-  PRIMARY KEY(anchor,chunk));
-CREATE TABLE IF NOT EXISTS activations (
-  bank TEXT NOT NULL, chunk INTEGER REFERENCES chunks(id),
-  event_key TEXT NOT NULL, at INTEGER NOT NULL,
-  PRIMARY KEY(bank,chunk,event_key));
-CREATE TABLE IF NOT EXISTS ledger (
-  id INTEGER PRIMARY KEY, bank TEXT NOT NULL, at INTEGER NOT NULL,
-  kind TEXT NOT NULL, chars INTEGER NOT NULL, sources TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS housekeeping (
-  bank TEXT PRIMARY KEY, last_chunk INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS groups (
-  chunk INTEGER PRIMARY KEY REFERENCES chunks(id),
-  bank TEXT NOT NULL, digest TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS replays (
-  chunk INTEGER PRIMARY KEY REFERENCES chunks(id), at INTEGER NOT NULL);
-PRAGMA user_version=1;
-""")
-            conn.commit()
-        finally:
-            conn.close()
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
+    return _memory.ensure_schema(path)
 
 
 def capture_message(
@@ -1737,6 +1655,8 @@ def capture_message(
     if not ok:
         return False, None, err
 
+    from bigfish import memory as _memory
+
     try:
         conn = sqlite3.connect(path, timeout=10)
         try:
@@ -1759,6 +1679,14 @@ def capture_message(
                     return True, None, ""      # 已经有了，幂等返回
                 mid = int(cur.lastrowid)
 
+                # 落锚点：这句话里提到了谁，就把 chunk 挂到那个锚点上。
+                # 以前 anchors/aliases/anchor_sources 四张表建了没人写，
+                # 「老爸」和「爸爸」各算各的，检索互相看不见。
+                try:
+                    anchor_id = _memory.resolve_anchor(conn, bank, body)
+                except Exception:
+                    anchor_id = None
+
                 # 切片：640 步长 / 800 窗口，与 store.js 一致
                 start = 0
                 n = len(body)
@@ -1768,12 +1696,26 @@ def capture_message(
                     c = conn.execute(
                         "INSERT INTO chunks(message,start,end,text,activated) "
                         "VALUES(?,?,?,?,?)", (mid, start, end, part, now))
+                    chunk_id = int(c.lastrowid)
+                    body_terms = memory_terms(part)
                     conn.execute(
                         "INSERT INTO search_index(rowid,terms) VALUES(?,?)",
-                        (int(c.lastrowid), " ".join(memory_terms(part))))
+                        (chunk_id, " ".join(body_terms)))
+                    # 派生元数据：词数 + 内容指纹，供去重与健康检查
+                    conn.execute(
+                        "INSERT OR REPLACE INTO chunk_meta(chunk,bank,speaker,token_count,term_blob) "
+                        "VALUES(?,?,?,?,?)",
+                        (chunk_id, bank, role, len(body_terms),
+                         hashlib.sha1(part.encode("utf-8")).hexdigest()[:16]))
+                    _memory.link_anchor_chunk(conn, anchor_id, chunk_id)
                     if end == n:
                         break
                     start += 640
+                # 账本：这一轮记了多少字。以前 ledger 表建了没人写，
+                # 「记忆有没有真的在长」只能靠数表。
+                conn.execute(
+                    "INSERT INTO ledger(bank,at,kind,chars,sources) VALUES(?,?,?,?,?)",
+                    (bank, now, "capture", len(body), json.dumps([mid], ensure_ascii=False)))
                 conn.execute("COMMIT")
                 return True, mid, ""
             except Exception:
