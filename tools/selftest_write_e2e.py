@@ -273,11 +273,11 @@ def on_memory(v) -> None:
 def phase_restore() -> None:
     """G · 确认真实数据没被动过。无条件执行。"""
     print("\n── 还原 ──")
-    # 我们全程只设了 DSH_HOME 指到镜像，真实 root.json 根本没碰过
-    os.environ.pop("DSH_HOME", None)
+    # 全程只设了 BIGFISH_DATA_ROOT 指到镜像，真实数据目录根本没碰过
+    os.environ.pop("BIGFISH_DATA_ROOT", None)
 
     try:
-        real_root = vault.resolve_data_root()
+        real_root = vault.install_root()
         record("G 数据根已回到真实位置", real_root == _real_root,
                f"{real_root} vs {_real_root}")
         real = soul_file_path(real_root)
@@ -342,19 +342,12 @@ def main() -> int:
 
     _real_root = root
 
-    # 不走 root.json（那个文件本身可能不可写，会让整个测试卡在切换上）。
-    # 直接用环境变量把数据根指到镜像 —— vault 每次现算 DSH_HOME，
-    # 所以设一个临时 DSH_HOME 就能整条链都指向镜像，真实配置一字不动。
-    fake_home = os.path.join(_ROOT, ".tmp", "e2e-home")
-    shutil.rmtree(fake_home, ignore_errors=True)
-    os.makedirs(os.path.join(fake_home, "bigfish"), exist_ok=True)
-    with open(os.path.join(fake_home, "bigfish", "root.json"), "w",
-              encoding="utf-8") as f:
-        json.dump({"dataRoot": mirror}, f)
-    os.environ["DSH_HOME"] = fake_home
+    # 数据根现在固定在安装目录，只能用测试专用环境变量把它指到镜像。
+    # ⚠ 这个变量界面上没有入口，只为测试存在 —— 不然测试会跑在真实数据上。
+    os.environ["BIGFISH_DATA_ROOT"] = mirror
 
-    if vault.resolve_data_root() != mirror:
-        print(f"✗ 数据根未能指到镜像（实际 {vault.resolve_data_root()}）")
+    if vault.install_root() != mirror:
+        print(f"✗ 数据根未能指到镜像（实际 {vault.install_root()}）")
         return 1
 
     _soul_path = soul_file_path(mirror)

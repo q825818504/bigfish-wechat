@@ -200,8 +200,19 @@ def test_mood_config(tmp: str, home: str) -> None:
     section("心情配置读写（未知字段必须原样保留）")
 
     os.environ["DSH_HOME"] = home
+    # ⚠ 必须先把数据目录隔离开：
+    #   mood_config_path() 会优先看 <数据根>/mood-config.json ——
+    #   真实那份已经存在，不隔离的话读到的是用户实际参数，
+    #   "默认值"断言就会失败（而且是在用真实数据做断言，本就不该）。
+    data_root = os.path.join(tmp, "moodcfg-data")
+    os.makedirs(data_root, exist_ok=True)
+    os.environ["BIGFISH_DATA_ROOT"] = data_root
+
     cfg_path = vault.mood_config_path()
-    check("配置路径跟随 DSH_HOME", cfg_path.startswith(home), cfg_path)
+    check("没有本地配置时回落到 DSH", cfg_path.startswith(home), cfg_path)
+    check("本地路径在数据根下",
+          vault.local_mood_config_path().startswith(data_root),
+          vault.local_mood_config_path())
 
     # 没有配置 → 默认值
     c = vault.read_mood_config()
@@ -209,9 +220,10 @@ def test_mood_config(tmp: str, home: str) -> None:
     check("默认 injectMode=event", c["injectMode"] == "event")
     check("默认 decayHalfHours=12", c["decayHalfHours"] == 12)
 
-    # 写一份带未知字段的配置
-    os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
-    with open(cfg_path, "w", encoding="utf-8") as f:
+    # 写一份带未知字段的配置（写到本地）
+    local = vault.local_mood_config_path()
+    os.makedirs(os.path.dirname(local), exist_ok=True)
+    with open(local, "w", encoding="utf-8") as f:
         json.dump({"moodBase": 55, "dataRoot": r"D:\保留我", "weird": {"a": 1}}, f, ensure_ascii=False)
 
     ok, out, err = vault.write_mood_config({"moodBase": 62})
@@ -238,6 +250,8 @@ def test_mood_config(tmp: str, home: str) -> None:
     # 布尔
     ok, out, _ = vault.write_mood_config({"autoJudge": False})
     check("autoJudge False 生效", out["autoJudge"] is False)
+
+    os.environ.pop("BIGFISH_DATA_ROOT", None)
 
 
 def test_layout(tmp: str, home: str) -> None:
@@ -378,7 +392,8 @@ def test_mood_reset(tmp: str, home: str) -> None:
     with open(p, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
 
-    vault.write_data_root(root)
+    os.environ["BIGFISH_DATA_ROOT"] = root
+    os.environ["BIGFISH_DATA_ROOT"] = root
     ok, err = vault.reset_mood()
     check("重置成功", ok, err)
 
@@ -392,7 +407,7 @@ def test_mood_reset(tmp: str, home: str) -> None:
     check("时间线保留（是历史证据）", slot["timeline"] == [{"at": 1, "mood": 23}],
           str(slot["timeline"]))
 
-    vault.write_data_root("")
+    os.environ.pop("BIGFISH_DATA_ROOT", None)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -523,51 +538,75 @@ def test_memory(tmp: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
-def test_move(tmp: str, home: str) -> None:
-    section("数据根搬家")
+def test_bootstrap(tmp: str, home: str) -> None:
+    section("启动自动创建（固定在安装目录）")
 
     os.environ["DSH_HOME"] = home
-    src = os.path.join(tmp, "move-src")
-    dst = os.path.join(tmp, "move-dst")
-    os.makedirs(os.path.join(src, "ws-x"), exist_ok=True)
-    with open(os.path.join(src, "ws-x", "soul-ws-x.json"), "w", encoding="utf-8") as f:
-        json.dump({"identity": {"name": "搬家测试"}}, f, ensure_ascii=False)
-    with open(os.path.join(src, "scope.json"), "w", encoding="utf-8") as f:
-        json.dump({"mode": "workspace", "workspaceId": "x"}, f, ensure_ascii=False)
+    root = os.path.join(tmp, "boot-data")
+    os.environ["BIGFISH_DATA_ROOT"] = root
 
-    vault.write_data_root(src)
+    check("数据根固定读环境变量（测试口）",
+          vault.install_root() == root, vault.install_root())
 
-    plan = vault.inspect_move(src)
-    check("目标=当前 → 报错", not plan.ok and "相同" in plan.error, plan.error)
+    # 全空 → 应自己建目录 + 出厂人格
+    r = vault.ensure_data_root(import_from_dsh=False)
+    check("建了目录", os.path.isdir(root), r.get("error"))
+    check("创建了 soul.json", os.path.isfile(vault.soul_path(root)))
+    check("soul 标记为 created", r.get("soul") == "created", str(r))
+    check("没有报错", not r.get("error"), r.get("error"))
 
-    plan = vault.inspect_move(dst)
-    check("盘点成功", plan.ok, plan.error)
-    check("盘点看到 ws-x", any(i["name"] == "ws-x" for i in plan.items), str(plan.items))
-    check("盘点看到 scope.json",
-          any(i["name"] == "scope.json" for i in plan.items))
-    check("盘点统计了字节", plan.total_bytes > 0, str(plan.total_bytes))
-    check("盘点没有冲突", plan.conflicts == [], str(plan.conflicts))
+    soul, exists, err = vault.read_soul_file(vault.soul_path(root))
+    check("出厂人格能读", exists and not err)
+    check("出厂名字是「大肥鱼」", soul["identity"]["name"] == "大肥鱼")
+    check("出厂有 4 条价值", len(soul["values"]) == 4)
 
-    # 目标里已有同名 → 应报冲突
-    os.makedirs(dst, exist_ok=True)
-    with open(os.path.join(dst, "scope.json"), "w") as f:
-        f.write("{}")
-    plan = vault.inspect_move(dst)
-    check("检测到冲突", plan.conflicts == ["scope.json"], str(plan.conflicts))
+    # 再跑一次：不该覆盖
+    with open(vault.soul_path(root), "w", encoding="utf-8") as f:
+        json.dump({"identity": {"name": "我自己写的"}}, f, ensure_ascii=False)
+    r2 = vault.ensure_data_root(import_from_dsh=False)
+    check("第二次不覆盖", r2.get("soul") == "exists", str(r2))
+    soul2, _e, _err = vault.read_soul_file(vault.soul_path(root))
+    check("内容还是我写的", soul2["identity"]["name"] == "我自己写的",
+          soul2["identity"]["name"])
 
-    ok, err = vault.apply_move(dst)
-    check("搬家成功", ok, err)
-    check("root.json 指向新目录", vault.read_data_root() == dst, vault.read_data_root())
-    check("新目录里有灵魂",
-          os.path.isfile(os.path.join(dst, "ws-x", "soul-ws-x.json")))
-    check("源目录被改名保留（没删）",
-          any(".old-" in n for n in os.listdir(tmp)), str(os.listdir(tmp)))
+    # ── 从 DSH 导入 ──
+    root2 = os.path.join(tmp, "boot-data2")
+    os.environ["BIGFISH_DATA_ROOT"] = root2
+    dsh_root = os.path.join(tmp, "fake-dsh")
+    os.makedirs(dsh_root, exist_ok=True)
+    with open(os.path.join(dsh_root, "soul.json"), "w", encoding="utf-8") as f:
+        json.dump({"identity": {"name": "DSH 里的她"}}, f, ensure_ascii=False)
+    # 让 dsh_data_root 指到这个假目录
+    os.makedirs(os.path.join(home, "bigfish"), exist_ok=True)
+    with open(os.path.join(home, "bigfish", "root.json"), "w", encoding="utf-8") as f:
+        json.dump({"dataRoot": dsh_root}, f, ensure_ascii=False)
 
-    vault.write_data_root("")
-    check("恢复默认 → 读到空串", vault.read_data_root() == "")
+    r3 = vault.ensure_data_root(import_from_dsh=True)
+    check("从 DSH 导入", r3.get("soul") == "imported", str(r3))
+    soul3, _e, _err = vault.read_soul_file(vault.soul_path(root2))
+    check("导入的是 DSH 那份", soul3["identity"]["name"] == "DSH 里的她",
+          soul3["identity"]["name"])
+
+    # ── 老布局的 DSH 数据也要能导 ──
+    root3 = os.path.join(tmp, "boot-data3")
+    os.environ["BIGFISH_DATA_ROOT"] = root3
+    dsh_old = os.path.join(tmp, "fake-dsh-old")
+    lg = os.path.join(dsh_old, "ws-abc")
+    os.makedirs(lg, exist_ok=True)
+    with open(os.path.join(lg, "soul-ws-abc.json"), "w", encoding="utf-8") as f:
+        json.dump({"identity": {"name": "老布局的她"}}, f, ensure_ascii=False)
+    with open(os.path.join(home, "bigfish", "root.json"), "w", encoding="utf-8") as f:
+        json.dump({"dataRoot": dsh_old}, f, ensure_ascii=False)
+
+    r4 = vault.ensure_data_root(import_from_dsh=True)
+    check("从老布局 DSH 导入", r4.get("soul") == "imported", str(r4))
+    soul4, _e, _err = vault.read_soul_file(vault.soul_path(root3))
+    check("导入的是老布局那份", soul4["identity"]["name"] == "老布局的她",
+          soul4["identity"]["name"])
+
+    os.environ.pop("BIGFISH_DATA_ROOT", None)
 
 
-# ══════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════
 def main() -> int:
     global FAIL
@@ -592,7 +631,7 @@ def main() -> int:
         ("心情重置", lambda: test_mood_reset(tmp, home)),
         ("清空", lambda: test_wipe(tmp, home)),
         ("记忆库", lambda: test_memory(tmp)),
-        ("搬家", lambda: test_move(tmp, home)),
+        ("启动创建", lambda: test_bootstrap(tmp, home)),
     ]
 
     for name, fn in tests:

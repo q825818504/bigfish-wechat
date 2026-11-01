@@ -218,9 +218,10 @@ def load_soul(root: Optional[str] = None) -> Soul:
     path = find_soul_file(root)
     if not path:
         raise FileNotFoundError(
-            "找不到大肥鱼灵魂文件。请确认 DSH 的 bigfish 插件已初始化，"
-            r"通常位于 %USERPROFILE%\.dsh\bigfish\root.json 指向的数据根下。"
-            "也可以在「数据目录」页把数据根指过去。"
+            "还没有灵魂文件。\n"
+            f"应该在：{soul_path(root)}\n\n"
+            "程序启动时会自动创建（优先从 DSH 导入，没有就用出厂模板）。\n"
+            "如果这里是空的，可能是数据目录不可写 —— 到「数据目录」页看看原因。"
         )
     import json
 

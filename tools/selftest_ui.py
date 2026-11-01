@@ -126,8 +126,8 @@ expect("memory", "会话区已渲染", "!!document.querySelector('#memSessions')
 # ── 数据目录 ──
 expect("data", "数据根路径", "document.querySelector('#dataRootPath').value",
        lambda v: v.strip() != "", "要回填")
-expect("data", "配置文件说明", "document.querySelector('#dataRootFile').textContent",
-       lambda v: "root.json" in v, "要说明落盘位置")
+expect("data", "数据可带走说明", "document.querySelector('#dataRootFile').textContent",
+       lambda v: "data" in v, "要说明数据就在 data 文件夹里")
 expect("data", "布局状态标签", "document.querySelector('#layoutTag').textContent",
        lambda v: v.strip() not in ("", "—"), "要有状态")
 expect("data", "三样清单", "document.querySelectorAll('#layoutList .session-row').length",
@@ -139,8 +139,10 @@ expect("data", "有灵魂标记", """(() => {
 })()""", lambda v: int(float(v)) == 1, "灵魂那行要标「在」")
 expect("data", "清空盘点", "document.querySelector('#wipePlan').textContent",
        lambda v: v.strip() not in ("", "—"), "要显示会删什么")
-expect("data", "搬家按钮", "!!document.querySelector('#btnDataRootMove')",
-       lambda v: v is True, "按钮存在")
+# 数据根固定在安装目录 —— 搬家/改指向这套入口整体不该存在
+for _gone in ("btnDataRootMove", "btnDataRootSave", "btnDataRootPick", "dataRootTarget"):
+    expect("data", f"没有 #{_gone}", f"!!document.querySelector('#{_gone}')",
+           lambda v: v is False, "数据根固定，不该有编辑控件")
 expect("data", "清空按钮", "!!document.querySelector('#btnWipe')",
        lambda v: v is True, "按钮存在")
 

@@ -183,3 +183,45 @@ session scope 过滤。Python 重写必然产生偏差，结果是
 
 **清空的顺序**：盘点 → 备份 → 删。备份失败就中止，什么都不删。
 灵魂永远保留（`keep_soul=True`）—— 清记忆不等于洗掉人格。
+
+---
+
+## 数据目录：固定在安装目录
+
+```
+<安装目录>/
+  ├── BigFish.exe
+  ├── ui/  bridge/
+  ├── _internal/           ← PyInstaller 运行时（升级会整个替换）
+  └── data/                ← 她的全部
+       ├── soul.json
+       ├── mood.json
+       ├── mood-config.json
+       └── memory.sqlite3
+```
+
+**为什么不用 `_MEIPASS`**：onedir 模式下它是 `_internal/`，
+用户升级时会被整个替换掉 —— 数据放那里等于每次升级清空。必须是 exe 所在目录。
+
+**为什么不用 `%APPDATA%`**：用户明确要"固定在安装目录"。
+便携版拷走就能带走她，这是这个决定的实际好处。
+
+**启动流程**（`vault.ensure_data_root()`）：
+```
+建 data/  → 测可写  → 有 soul.json? → 有：什么都不做
+                                    → 无：DSH 有? → 有：导入一次
+                                                  → 无：出厂模板
+```
+
+**与 DSH 的边界**：
+
+| 动作 | 允许？ |
+|---|---|
+| 读 DSH 的 soul（首次导入） | ✅ 只做一次 |
+| 读 DSH 的 sessions / workspace.json | ❌ 永不 |
+| 写 DSH 的任何文件 | ❌ 永不 |
+| 读 DSH 的 mood 配置作初始值 | ✅ 只读回落 |
+
+最后一条是刻意的：插件那份 `bigfish-mood/config.json` 里有用户调过的参数
+（基线 70、半衰期 12h 之类），第一次用直接沿用比从头调好。
+但**写**永远写本地的 `data/mood-config.json`。

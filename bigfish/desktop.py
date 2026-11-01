@@ -1070,9 +1070,7 @@ class Backend(QObject):
             return json.dumps({
                 "ok": True,
                 "root": root,
-                "custom": vault.read_data_root(),
-                "defaultRoot": vault.default_data_root(),
-                "rootFile": vault.root_store_path(),
+                "fixed": True,          # 固定在安装目录，不可改
                 "writable": writable,
                 "writeError": w_err,
                 "soul": _stat("soul"),
@@ -1129,22 +1127,116 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
-    @Slot(str, result=str)
-    def set_data_root(self, path: str) -> str:
-        """直接改数据根（不搬数据）。想搬请走 inspect_move/apply_move。"""
+    @Slot(result=str)
+    def inspect_wipe(self) -> str:
+        """盘点"清空记忆+心情"会删什么。不改任何东西。"""
         try:
             from bigfish import vault
 
-            p = (path or "").strip()
-            if p and not os.path.isdir(p):
-                return json.dumps({"ok": False,
-                                   "error": f"目录不存在：{p}"}, ensure_ascii=False)
-            ok, err = vault.write_data_root(p)
-            if not ok:
-                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
-            self.log_message.emit(f"[数据] 数据根 → {p or '(默认)'}", "")
-            return json.dumps({"ok": True, "root": vault.resolve_data_root()},
+            plan = vault.inspect_wipe(keep_soul=True)
+            return json.dumps({
+                "ok": plan.ok,
+                "error": plan.error,
+                "root": plan.root,
+                "items": plan.items,
+                "totalBytes": plan.total_bytes,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def apply_wipe(self) -> str:
+        """清空心情 + 记忆（灵魂保留）。删之前先备份。"""
+        try:
+            from bigfish import vault
+
+            ok, err, backup = vault.apply_wipe(keep_soul=True, backup_first=True)
+            if ok:
+                self.log_message.emit(f"[数据] 已清空心情与记忆，备份在 {backup}", "")
+            return json.dumps({"ok": ok, "error": err, "backup": backup},
                               ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def migrate_legacy(self) -> str:
+        """把老的 ws-*/ 布局收成新布局。只搬有灵魂的那一份。"""
+        try:
+            from bigfish import vault
+
+            ok, err, done = vault.migrate_legacy()
+            return json.dumps({"ok": ok, "error": err, "done": done},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def import_soul(self, source: str) -> str:
+        """把别处的灵魂文件拷过来（比如 DSH 那份）。
+
+        数据目录固定在安装目录后，没有"改指向"这回事了，
+        但偶尔确实需要把旧的那份人格带过来 —— 那就直接拷文件。
+        """
+        try:
+            from bigfish import vault
+
+            root = vault.resolve_data_root()
+            dst = vault.soul_path(root)
+            src = (source or "").strip()
+
+            if not src:
+                # 没指定就试 DSH 那边
+                dsh = vault.dsh_data_root()
+                cand = os.path.join(dsh, vault.SOUL_NAME)
+                if os.path.isfile(cand):
+                    src = cand
+                else:
+                    lg = vault.legacy_layout(dsh)
+                    src = (lg or {}).get("soul", "")
+                if not src:
+                    return json.dumps({"ok": False,
+                                       "error": "DSH 那边也没找到灵魂文件"},
+                                      ensure_ascii=False)
+
+            ok, what = vault.import_soul_from(src, dst)
+            if not ok:
+                return json.dumps({"ok": False, "error": what}, ensure_ascii=False)
+            if what == "exists":
+                return json.dumps({"ok": False,
+                                   "error": "本地已经有 soul.json 了，不覆盖"},
+                                  ensure_ascii=False)
+            self.log_message.emit(f"[灵魂] 已从 {src} 导入", "")
+            return json.dumps({"ok": True, "from": src, "to": dst},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def reset_soul_to_default(self) -> str:
+        """把本地灵魂换回出厂模板（先备份旧的）。"""
+        try:
+            from bigfish import vault
+
+            root = vault.resolve_data_root()
+            p = vault.soul_path(root)
+            backup = ""
+            if os.path.isfile(p):
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                backup = os.path.join(root, f"soul.bak-{stamp}.json")
+                try:
+                    import shutil
+                    shutil.copyfile(p, backup)
+                except Exception:
+                    backup = ""
+                try:
+                    os.remove(p)
+                except Exception as exc:
+                    return json.dumps({"ok": False, "error": f"删不掉旧文件：{exc}"},
+                                      ensure_ascii=False)
+            ok, what = vault.write_default_soul(p)
+            if not ok:
+                return json.dumps({"ok": False, "error": what}, ensure_ascii=False)
+            return json.dumps({"ok": True, "backup": backup}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -1637,6 +1729,20 @@ def main() -> int:
     app.setApplicationName("大肥鱼")
     app.setOrganizationName("bigfish")
 
+    # 启动时确保数据目录和灵魂存在 —— 用户可能一次都没配过。
+    # 失败不拦启动：界面上「数据目录」页会把原因显示出来。
+    try:
+        from bigfish import vault
+        boot = vault.ensure_data_root()
+        if boot.get("soul") == "imported":
+            print(f"[boot] 已从 DSH 导入人格：{boot.get('imported')}")
+        elif boot.get("soul") == "created":
+            print(f"[boot] 已用内置模板创建人格：{boot.get('root')}")
+        if boot.get("error"):
+            print(f"[boot] {boot['error']}")
+    except Exception as exc:
+        print(f"[boot] 初始化数据目录失败：{exc}")
+
     win = MainWindow()
     win.show()
     return app.exec()
@@ -1705,11 +1811,23 @@ def run_selftest() -> int:
 
     # 1. 灵魂
     def t_soul():
+        from bigfish import vault
         from bigfish.soul import load_soul
+
+        # ⚠ 自检可能在任何时候跑（包括刚解压、从没启动过）。
+        #   数据目录现在固定在安装目录，第一次运行时它还是空的 ——
+        #   直接 load_soul() 会抛 FileNotFoundError，看起来像坏了，
+        #   其实只是"还没初始化"。先确保初始化，再验。
+        boot = vault.ensure_data_root()
+        if boot.get("error"):
+            raise RuntimeError(boot["error"])
+
         s = load_soul()
         p = s.render_persona()
         assert s.name and p
-        return f"{s.name} rev{s.revision}，人格 {len(p)} 字符"
+        origin = {"created": "出厂模板", "imported": "从 DSH 导入",
+                  "exists": "已存在"}.get(boot.get("soul", ""), boot.get("soul", ""))
+        return f"{s.name} rev{s.revision}，人格 {len(p)} 字符（{origin}）"
     print()
     print("工厂自检")
     print("-" * 66)

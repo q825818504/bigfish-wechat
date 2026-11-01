@@ -1034,9 +1034,8 @@ async function loadDataRoot() {
     S.data = d;
 
     $('#dataRootPath').value = d.root || '';
-    setText('#dataRootTag', d.custom ? '自定义' : '默认');
-    setText('#dataRootFile', `配置文件：${d.rootFile || '—'}`);
-    $('#dataRootTarget').value = '';
+    setText('#dataRootTag', d.fixed ? '固定位置' : '可配置');
+    setText('#dataRootFile', '整个 data 文件夹拷走就能带走她');
 
     // 可写性：不可写就直接在页面上说清楚，别等用户点保存才失败
     const hint = $('#dataRootHint');
@@ -1181,100 +1180,6 @@ $('#btnDataRootOpen').addEventListener('click', async () => {
     await S.bridge.open_path(p);
   } catch (e) { toast('打不开'); }
 });
-
-$('#btnDataRootPick').addEventListener('click', async () => {
-  try {
-    const r = JSON.parse(await S.bridge.pick_directory($('#dataRootPath').value));
-    if (r.path) $('#dataRootTarget').value = r.path;
-    else if (r.error) toast(r.error);
-  } catch (e) { toast('选择失败'); }
-});
-
-$('#btnDataRootPreview').addEventListener('click', async () => {
-  const target = $('#dataRootTarget').value.trim();
-  if (!target) return toast('先填目标目录');
-  try {
-    const d = JSON.parse(await S.bridge.inspect_move(target));
-    const h = $('#dataRootHint');
-    if (!d.ok) {
-      h.textContent = '检查失败：' + (d.error || '');
-      h.className = 'hint-line is-err';
-      return;
-    }
-    const files = d.items.reduce((n, it) => n + (it.files || 0), 0);
-    let msg = `要搬 ${d.items.length} 项 / ${files} 个文件 / ${fmtBytes(d.totalBytes)}`;
-    if (d.conflicts.length) {
-      msg += `　⚠ 目标里已存在同名项 ${d.conflicts.length} 个：${d.conflicts.slice(0, 5).join(', ')}`;
-    }
-    if (d.dstWritable === false) {
-      msg += `　⚠ 目标目录不能写（${d.dstWriteError}）—— 搬过去也用不了`;
-    }
-    h.textContent = msg;
-    h.className = 'hint-line' + ((d.conflicts.length || d.dstWritable === false) ? ' is-err' : ' is-ok');
-  } catch (e) { toast('检查失败'); }
-});
-
-$('#btnDataRootSave').addEventListener('click', async () => {
-  const target = $('#dataRootTarget').value.trim();
-  if (!target) return toast('先填目标目录');
-  if (!confirm(`把数据根指向 ${target}？\n原有数据不会搬过去 —— 那边没有灵魂记忆就都读不到。\n\n要连同数据一起搬请用「搬过去」。`)) return;
-  try {
-    const r = JSON.parse(await S.bridge.set_data_root(target));
-    const h = $('#dataRootHint');
-    if (!r.ok) {
-      h.textContent = '失败：' + (r.error || '');
-      h.className = 'hint-line is-err';
-      return toast('保存失败');
-    }
-    h.textContent = '数据根已改为 ' + r.root;
-    h.className = 'hint-line is-ok';
-    toast('已保存');
-    S.soul = null;
-    await loadDataRoot();
-  } catch (e) { toast('保存失败'); }
-});
-
-$('#btnDataRootMove').addEventListener('click', async () => {
-  const target = $('#dataRootTarget').value.trim();
-  if (!target) return toast('先填目标目录');
-  try {
-    const d = JSON.parse(await S.bridge.inspect_move(target));
-    if (!d.ok) return toast(d.error || '检查失败');
-    if (d.conflicts.length) {
-      if (!confirm(`目标里已有 ${d.conflicts.length} 个同名项，会被源覆盖：\n` +
-                   d.conflicts.slice(0, 8).join('\n') + '\n\n继续？')) return;
-    }
-    if (!confirm(`连同数据一起搬到 ${target}？\n\n源目录会被改名成 .old-时间戳 留着，不直接删。`)) return;
-
-    const h = $('#dataRootHint');
-    h.textContent = '正在搬…';
-    h.className = 'hint-line';
-
-    const r = JSON.parse(await S.bridge.apply_move(target));
-    if (!r.ok) {
-      h.textContent = '搬家失败：' + (r.error || '') + '（数据根未改动）';
-      h.className = 'hint-line is-err';
-      return toast('搬家失败');
-    }
-    h.textContent = '已搬到 ' + r.root;
-    h.className = 'hint-line is-ok';
-    toast('已搬家');
-    S.soul = null;
-    await loadDataRoot();
-  } catch (e) { toast('搬家失败'); }
-});
-
-$('#btnDataRootDefault').addEventListener('click', async () => {
-  if (!confirm('数据根恢复成默认位置？原来那个目录不会被删。')) return;
-  try {
-    const r = JSON.parse(await S.bridge.set_data_root(''));
-    if (!r.ok) return toast(r.error || '失败');
-    toast('已恢复默认');
-    S.soul = null;
-    await loadDataRoot();
-  } catch (e) { toast('失败'); }
-});
-
 
 /* ────────── 设置 ────────── */
 

@@ -563,40 +563,26 @@
         <div class="page-heading">
           <div>
             <h1>数据目录</h1>
-            <p>灵魂、心情、记忆存在哪。改这里等于改 DSH 插件读的那份配置。</p>
+            <p>她住在程序旁边，不动。<code>data\</code> 里三个文件就是她的全部。</p>
           </div>
           <div class="heading-side" id="dataRootTag">—</div>
         </div>
 
         <div class="card">
-          <div class="card-head"><h2>数据根目录</h2></div>
+          <div class="card-head"><h2>所在位置</h2></div>
           <div class="card-desc" style="margin-bottom:14px">
-            这是 <code>root.json</code> 里那个 <code>dataRoot</code>。
-            DSH 插件和本程序读的是同一个文件 —— 改一次，两边同时生效。
+            固定在安装目录下，不跟 DSH 共用。想带走她，整个 <code>data</code>
+            文件夹拷走就行。
           </div>
           <div class="form">
             <div class="field full">
-              <label>当前数据根</label>
+              <label>数据目录</label>
               <div class="path-row">
                 <input type="text" id="dataRootPath" readonly>
                 <button class="btn btn-sm" id="btnDataRootOpen">打开</button>
               </div>
               <small id="dataRootFile">—</small>
             </div>
-            <div class="field full">
-              <label>改成别的目录</label>
-              <div class="path-row">
-                <input type="text" id="dataRootTarget" placeholder="比如 D:\大肥鱼\灵魂">
-                <button class="btn btn-sm" id="btnDataRootPick">浏览…</button>
-                <button class="btn btn-sm" id="btnDataRootPreview">先看看要搬什么</button>
-              </div>
-              <small>只改指向不搬文件，原来的数据会留在那儿读不到。要搬请用下面那节。</small>
-            </div>
-          </div>
-          <div class="memory-toolbar" style="margin-top:14px">
-            <button class="btn btn-primary" id="btnDataRootSave">只改指向</button>
-            <button class="btn btn-sm" id="btnDataRootMove">搬过去（连同数据）</button>
-            <button class="btn btn-sm" id="btnDataRootDefault">恢复默认</button>
           </div>
           <div class="card-desc" style="margin-top:12px" id="dataRootHint"></div>
         </div>
@@ -607,8 +593,8 @@
             <span class="tag" id="layoutTag">—</span>
           </div>
           <div class="card-desc" style="margin-bottom:14px">
-            一个数据目录 = 一份灵魂 + 一份心情 + 一份记忆。没有「选哪一份」——
-            数据目录在哪，她就在哪。
+            一个数据目录 = 一份灵魂 + 一份心情 + 一份记忆。
+            缺哪个第一次用到时会自动建。
           </div>
           <div class="session-list" id="layoutList">
             <div class="empty" style="padding:12px 0"><p>读取中…</p></div>

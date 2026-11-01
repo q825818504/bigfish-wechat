@@ -39,59 +39,100 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 # ══════════════════════════════════════════════════════════════════════════
-# 路径解析 —— 与 dsh-bigfish/lib/scope-store.js 完全同一套规则
+# 路径解析 —— 固定在**安装目录**，与 DSH 完全脱离
 # ══════════════════════════════════════════════════════════════════════════
+#
+# 历史沿革（这段必须留着，否则以后有人会想"为什么不读 DSH 的配置"）：
+#
+#   第一版  读 <DSH_HOME>/bigfish/root.json 的 dataRoot —— 跟插件共用同一份配置。
+#           后果：在微信里改一次数据根，DSH 插件那边也跟着变；反过来亦然。
+#           两个程序互相踩，用户根本分不清"我改的是谁"。
+#   第二版  一个数据根 = 一份，但数据根仍由 root.json 决定。
+#   现在    固定在安装目录。**不读 root.json，也不写它。**
+#
+# 这是刻意的取舍：微信这边是独立程序，它的人格应该由它自己管。
+# 想同步到 DSH 就手动拷文件，不做隐式联动 —— 隐式联动是两个程序互相覆盖的根源。
+#
+# 目录结构：
+#   <安装目录>/data/
+#     ├── soul.json          启动时若不存在，用内置模板创建
+#     ├── mood.json          首次用到时创建
+#     └── memory.sqlite3     首次用到时创建
 
+DATA_DIR_NAME = "data"
+
+
+def app_dir() -> str:
+    """程序所在目录。
+
+    打包后是 exe 所在目录（dist/BigFish/），开发时是仓库根。
+    ⚠ 必须是**exe 所在目录**而不是 _MEIPASS —— onedir 模式下后者是 _internal/，
+      用户升级时可能被整个替换掉，数据放那里等于每次升级清空。
+    """
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def default_data_root() -> str:
+    """默认数据根 = <安装目录>/data。"""
+    return os.path.join(app_dir(), DATA_DIR_NAME)
+
+
+def install_root() -> str:
+    """数据根。**唯一**的解析：一直是安装目录下的 data/。
+
+    ⚠ 留了一个测试专用的逃生口 `BIGFISH_DATA_ROOT`。
+      没有它的话，测试会在真实数据目录上跑 —— 那是绝对不行的。
+      这不是"配置项"：界面上没有入口，文档里也不提，只给测试用。
+    """
+    override = (os.environ.get("BIGFISH_DATA_ROOT") or "").strip()
+    if override:
+        return override
+    return default_data_root()
+
+
+# ── 与 DSH 的关系：只读探测，永不写入 ──────────────────────────────────
+#
+# 「完全脱离」不等于"故意看不见对方"。用户第一次打开时，
+# 如果 DSH 那边已经有一份人格，直接搬过来比让他从零再写一遍好得多。
+# 但**只在本地还没有人格时做一次**，之后两边各管各的。
 
 def dsh_home() -> str:
-    """DSH 主目录。每次现算，不缓存（用户可能改了环境变量）。"""
+    """DSH 主目录。只用于「导入」时的一次性探测，不参与日常读写。"""
     v = (os.environ.get("DSH_HOME") or "").strip()
     if v:
         return v
     return os.path.join(os.path.expanduser("~"), ".dsh")
 
 
-def root_store_path() -> str:
-    """<DSH_HOME>/bigfish/root.json —— 数据根的唯一真源。"""
+def dsh_root_store_path() -> str:
+    """<DSH_HOME>/bigfish/root.json —— 只读，用来找 DSH 那份数据在哪。"""
     return os.path.join(dsh_home(), "bigfish", "root.json")
 
 
-def default_data_root() -> str:
-    """root.json 为空时的默认根，与插件 defaultDataRoot() 一致。"""
+def dsh_data_root() -> str:
+    """DSH 那边正在用的数据根（只读探测）。读不到返回空串。"""
+    try:
+        with open(dsh_root_store_path(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        custom = str((raw or {}).get("dataRoot") or "").strip()
+        if custom:
+            return custom
+    except Exception:
+        pass
     return os.path.join(dsh_home(), "bigfish", "scopes")
 
 
-def read_data_root() -> str:
-    """读自定义数据根；没有或读坏返回空串。"""
-    try:
-        with open(root_store_path(), "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        return str((raw or {}).get("dataRoot") or "").strip()
-    except Exception:
-        return ""
-
-
 def resolve_data_root() -> str:
-    """最终生效的数据根：自定义优先，否则默认。"""
-    custom = read_data_root()
-    if custom:
-        return custom
-    return default_data_root()
+    """历史名字，等价于 install_root()。
 
-
-def write_data_root(path: str) -> Tuple[bool, str]:
-    """写数据根。传空串 = 恢复默认（文件里留空串，不删文件）。
-
-    与插件 writeDataRoot 行为一致：空值也落盘，否则「恢复默认」之后
-    seedDataRootFromProfile 会把 profile 里那个旧值又拉回来。
+    留着是因为调用点很多（二十来处），一次性全改容易漏。
+    但语义已经完全变了：**这里没有任何"解析"**，就是安装目录。
     """
-    target = root_store_path()
-    body = {"dataRoot": str(path or "").strip()}
-    try:
-        _atomic_write_json(target, body)
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
+    return install_root()
 
 
 def scope_store_path(root: str) -> str:
@@ -464,6 +505,43 @@ def default_soul() -> Dict[str, Any]:
     return normalize_soul({})
 
 
+def write_default_soul(path: str) -> Tuple[bool, str]:
+    """用内置模板创建一个灵魂文件。**已存在就不动。**
+
+    为什么需要它：数据目录固定在安装目录后，用户可能从来没配过任何东西 ——
+    第一次打开时连 soul.json 都不存在。那时候界面上应该看到一个可编辑的
+    出厂人格，而不是"找不到灵魂文件"。
+
+    ⚠ 只创建、不覆盖。已有的文件哪怕内容很奇怪也不碰 ——
+      那是用户的，不是我的。返回的第二项说明到底做了什么。
+    """
+    if os.path.isfile(path):
+        return True, "exists"
+    try:
+        soul = default_soul()
+        soul["revision"] = 1
+        _atomic_write_json(path, soul)
+        return True, "created"
+    except WriteDenied as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def import_soul_from(src: str, dst: str) -> Tuple[bool, str]:
+    """把别处的灵魂拷过来（DSH 那份）。dst 已存在就不动。"""
+    if not src or not os.path.isfile(src):
+        return False, "源文件不存在"
+    if os.path.isfile(dst):
+        return True, "exists"
+    try:
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        shutil.copyfile(src, dst)
+        return True, "imported"
+    except Exception as exc:
+        return False, str(exc)
+
+
 def read_soul_file(path: str, normalize: bool = False) -> Tuple[Dict[str, Any], bool, str]:
     """读灵魂。返回 (soul, exists, error)。文件缺失不是错误。
 
@@ -554,7 +632,24 @@ INJECT_MODES = ["off", "label", "event"]
 
 
 def mood_config_path() -> str:
+    """心情**参数**（基线、半衰期那些）存哪。
+
+    ⚠ 先在数据目录里找一份 `mood-config.json`；没有才回落到 DSH 的
+      `<DSH_HOME>/bigfish-mood/config.json`（**只读**，兼容老部署）。
+
+      为什么不直接写 DSH 那份：那是插件的配置文件，我们不去改它 ——
+      两边是独立程序，各管各的参数。第一次读的时候如果发现 DSH 那边有，
+      就照它的值当初始参数，然后写到本地，之后各改各的。
+    """
+    local = os.path.join(install_root(), "mood-config.json")
+    if os.path.isfile(local):
+        return local
     return os.path.join(dsh_home(), MOOD_STORE_NAME, "config.json")
+
+
+def local_mood_config_path() -> str:
+    """本地心情参数文件（写入永远走这个）。"""
+    return os.path.join(install_root(), "mood-config.json")
 
 
 def read_mood_config() -> Dict[str, Any]:
@@ -621,7 +716,8 @@ def write_mood_config(patch: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], str]
         if isinstance(patch.get("autoJudge"), bool):
             next_["autoJudge"] = patch["autoJudge"]
 
-        _atomic_write_json(mood_config_path(), next_)
+        # 写入永远走本地那份，不碰 DSH 的配置
+        _atomic_write_json(local_mood_config_path(), next_)
         return True, next_, ""
     except WriteDenied as exc:
         return False, cur, str(exc)
@@ -1266,3 +1362,86 @@ def migrate_legacy(root: Optional[str] = None) -> Tuple[bool, str, List[str]]:
     if not done:
         return False, "老布局里没有可搬的文件", []
     return True, "", done
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 启动初始化
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def ensure_data_root(import_from_dsh: bool = True) -> Dict[str, Any]:
+    """确保数据目录存在，且里面有一份能用的灵魂。程序启动时调一次。
+
+    顺序（每一步都只在"缺"的时候动手）：
+      1. 建 <安装目录>/data/
+      2. 没有 soul.json 时：
+         a. DSH 那边有现成的人格 → 拷过来（用户不用从零重写）
+         b. 那边也没有 → 用内置模板创建
+      3. 报告做了什么，界面直接显示
+
+    ⚠ 任何一步失败都不抛 —— 启动不该因为磁盘问题整块崩掉。
+      失败信息放进返回值的 error 里，界面自己决定怎么显示。
+    """
+    root = install_root()
+    report: Dict[str, Any] = {
+        "root": root,
+        "created": [],
+        "imported": "",
+        "soul": "",
+        "error": "",
+        "writable": True,
+        "writeError": "",
+    }
+
+    try:
+        if not os.path.isdir(root):
+            os.makedirs(root, exist_ok=True)
+            report["created"].append(root)
+    except Exception as exc:
+        report["error"] = f"建不了数据目录：{exc}"
+        return report
+
+    # 可写性先测一次 —— 不可写的话后面所有写入都会失败，早点说清楚
+    ok_w, w_err = probe_writable(os.path.join(root, SOUL_NAME))
+    report["writable"] = ok_w
+    report["writeError"] = w_err
+    if not ok_w:
+        report["error"] = f"数据目录不可写：{w_err}"
+        return report
+
+    soul_file = soul_path(root)
+    if os.path.isfile(soul_file):
+        report["soul"] = "exists"
+        return report
+
+    # 先看 DSH 那边有没有
+    if import_from_dsh:
+        try:
+            dsh_root = dsh_data_root()
+            src = ""
+            if dsh_root and os.path.isdir(dsh_root):
+                # 新布局
+                cand = os.path.join(dsh_root, SOUL_NAME)
+                if os.path.isfile(cand):
+                    src = cand
+                else:
+                    # 老布局：找带灵魂的那一份
+                    lg = legacy_layout(dsh_root)
+                    if lg and lg.get("soul"):
+                        src = lg["soul"]
+            if src:
+                ok, what = import_soul_from(src, soul_file)
+                if ok and what == "imported":
+                    report["soul"] = "imported"
+                    report["imported"] = src
+                    return report
+        except Exception as exc:
+            report["error"] = f"从 DSH 导入失败（不影响使用）：{exc}"
+
+    # 都没 → 出厂模板
+    ok, what = write_default_soul(soul_file)
+    if ok:
+        report["soul"] = what
+    else:
+        report["error"] = f"创建默认人格失败：{what}"
+    return report
