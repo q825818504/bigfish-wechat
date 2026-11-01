@@ -1056,6 +1056,7 @@ async function loadDataRoot() {
 
     renderLayout(d);
     await refreshWipePlan(true);
+    await refreshWhalePlan();
   } catch (e) { toast('读取数据目录失败'); }
 }
 
@@ -1146,12 +1147,13 @@ async function refreshWipePlan(silent) {
 
 $('#btnWipePreview').addEventListener('click', () => {
   refreshWipePlan(false);
+  refreshWhalePlan();
   toast('已重新盘点');
 });
 
 $('#btnWipe').addEventListener('click', async () => {
   if (!S.bridge) return toast('后端未就绪');
-  if (!confirm('清空心情和全部记忆？\n\n灵魂（她是谁）会保留。\n删之前会自动备份到数据目录旁边。')) return;
+  if (!confirm('清空心情和全部记忆？\n\n灵魂（她是谁）会保留 —— 她还在，只是忘了。\n删之前会自动备份。')) return;
   const btn = $('#btnWipe');
   btn.disabled = true;
   const h = $('#wipeHint');
@@ -1168,8 +1170,74 @@ $('#btnWipe').addEventListener('click', async () => {
     S.soul = null;
     await loadDataRoot();
     await refreshWipePlan(true);
+    refreshWhalePlan();
   } catch (e) {
     toast('清空失败');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+/* ── 鲸落 ── */
+
+async function refreshWhalePlan() {
+  if (!S.bridge) return;
+  try {
+    const d = JSON.parse(await S.bridge.whale_fall_status());
+    const el = $('#whalePlan');
+    if (!d.ok) {
+      el.textContent = '盘点失败：' + (d.error || '');
+      el.className = 'card-desc is-err';
+      return;
+    }
+    const items = d.items || [];
+    if (d.isEmpty || !items.length) {
+      el.textContent = '数据目录已经是空的 —— 她本来就不在这里。';
+      el.className = 'card-desc';
+      return;
+    }
+    const files = items.reduce((n, i) => n + (i.files || 1), 0);
+    el.innerHTML =
+      `将删除 <strong>${items.length} 项 / ${files} 个文件 / ${fmtBytes(d.totalBytes)}</strong>` +
+      `：${items.slice(0, 6).map((i) => esc(i.name)).join('、')}` +
+      (items.length > 6 ? ' …' : '') +
+      `<br>备份会放在：<code>${esc(d.backupTo || '')}</code>`;
+    el.className = 'card-desc';
+  } catch (e) { /* 静默 */ }
+}
+
+$('#btnWhale').addEventListener('click', async () => {
+  if (!S.bridge) return toast('后端未就绪');
+  const typed = ($('#whaleConfirm').value || '').trim();
+  if (typed !== '鲸落') {
+    toast('请先输入「鲸落」两个字');
+    $('#whaleConfirm').focus();
+    return;
+  }
+  if (!confirm('最后一次确认：\n\n灵魂、心情、记忆全部删除。\n她不存在了，留下的只有一份备份。\n\n继续？')) return;
+
+  const btn = $('#btnWhale');
+  btn.disabled = true;
+  const h = $('#whaleHint');
+  try {
+    const r = JSON.parse(await S.bridge.whale_fall(typed));
+    if (!r.ok) {
+      h.textContent = '删除失败：' + (r.error || '');
+      h.className = 'card-desc is-err';
+      return toast('鲸落失败');
+    }
+    const n = (r.deleted || []).length;
+    h.innerHTML = `已删除 ${n} 项。` +
+      (r.backup ? `<br>备份在 <code>${esc(r.backup)}</code>` : '');
+    h.className = 'card-desc is-ok';
+    toast('鲸落完成');
+    $('#whaleConfirm').value = '';
+    S.soul = null;
+    await loadDataRoot();
+    await refreshWipePlan(true);
+    await refreshWhalePlan();
+  } catch (e) {
+    toast('鲸落失败');
   } finally {
     btn.disabled = false;
   }

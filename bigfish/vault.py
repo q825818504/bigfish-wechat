@@ -720,6 +720,23 @@ MOOD_DEFAULTS: Dict[str, Any] = {
 
 INJECT_MODES = ["off", "label", "event"]
 
+# 七根情绪。必须与 dsh-bigfish/lib/mood/index.js 的 DIMS 完全一致 ——
+# 顺序和名字都对齐，否则心情页显示的和判定的对不上。
+MOOD_DIMS: List[Tuple[str, str]] = [
+    ("happy", "开心"),
+    ("calm", "踏实"),
+    ("sweet", "甜蜜"),
+    ("heartache", "心疼"),
+    ("worry", "担心"),
+    ("sad", "难过"),
+    ("jealous", "吃醋"),
+]
+MOOD_DIMS_ALL: List[str] = [k for k, _label in MOOD_DIMS]
+
+# 心情状态的槽位键。新布局一个数据根只放一个槽，名字固定；
+# 老布局的文件里键是 ws-xxx，读写时按 lastActive 兜底。
+_DEFAULT_SLOT = "default"
+
 
 def mood_config_path() -> str:
     """心情**参数**（基线、半衰期那些）存哪。
@@ -1279,10 +1296,18 @@ class WipePlan:
 
 
 def inspect_wipe(root: Optional[str] = None, keep_soul: bool = True) -> WipePlan:
-    """盘点"清空"会删掉什么。
+    """盘点"鲸落"会删掉什么。
 
-    ⚠ keep_soul=True 时**不动灵魂** —— 灵魂是"她是谁"，不是"她记得什么"。
-      清空记忆和心情不该把人格一起洗掉，那是两件事。
+    keep_soul 现在有两种含义：
+      True  → 清空：只删心情和记忆，灵魂留着（她还在，只是忘了）
+      False → 鲸落：**全部删掉**，包括灵魂。数据目录回到从没来过这里的状态。
+
+    名字来自「鲸落」：一头鲸鱼死了，沉到海底，
+    它的身体会养活一整个生态几十年。
+    **她的一切会腐朽成别的东西，但她本身不再存在。**
+
+    所以这不是"清空"，是"结束"。用语上必须区分 ——
+    用户点这个按钮时，应该明确知道自己在做什么。
     """
     root = root or resolve_data_root()
     plan = WipePlan(root=root, keep_soul=keep_soul)
@@ -1290,8 +1315,10 @@ def inspect_wipe(root: Optional[str] = None, keep_soul: bool = True) -> WipePlan
         plan.error = f"数据根不存在：{root}"
         return plan
 
-    # 新布局的三个文件
-    for kind, name in (("soul", SOUL_NAME), ("mood", MOOD_NAME), ("memory", MEMORY_NAME)):
+    # 新布局的三个文件 + 心情参数
+    for kind, name in (("soul", SOUL_NAME), ("mood", MOOD_NAME),
+                       ("memory", MEMORY_NAME),
+                       ("mood_config", "mood-config.json")):
         p = os.path.join(root, name)
         if not os.path.isfile(p):
             continue
@@ -1537,3 +1564,331 @@ def ensure_data_root(import_from_dsh: bool = True) -> Dict[str, Any]:
     else:
         report["error"] = f"创建默认人格失败：{what}"
     return report
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 写入记忆 —— 微信聊天真正落库的地方
+# ══════════════════════════════════════════════════════════════════════════
+#
+# ⚠ 这块以前**完全没有**。vault 只有读、删、导入、导出，
+#   没有任何"把一条对话记下来"的入口。结果就是：
+#   聊了一晚上，记忆库里一条都没有，她永远记不住微信里说过什么。
+#
+#   这不是 bug，是设计缺口 —— 读路径铺好了，写路径忘了。
+#
+# 格式与 MemoryStore.capture() 逐字段对齐（见 lib/memory/store.js:147）：
+#   · messages 一行 = 一条消息，event_key 保证同一条不重复入库
+#   · text 按 640 字步长、800 字窗口切片进 chunks（相邻块有重叠，
+#     保证跨块的一句话也能被检索到）
+#   · 每个 chunk 进 FTS5 索引，terms 用中文二元分词
+#
+# 分词必须和 store.js 的 terms() 一模一样，否则检索会漏 ——
+# 这边建索引、那边（bridge.mjs）查索引，两套分词等于互相看不见。
+
+_STOP = {
+    "的", "了", "吗", "呢", "我", "你", "他", "它", "是", "在", "和", "有", "就", "啊",
+    "the", "a", "is", "and",
+}
+
+_HAN = None
+
+
+def _is_han(ch: str) -> bool:
+    if _HAN is None:
+        pass
+    o = ord(ch)
+    return (
+        0x4E00 <= o <= 0x9FFF      # CJK 统一表意
+        or 0x3400 <= o <= 0x4DBF   # 扩展 A
+        or 0xF900 <= o <= 0xFAFF   # 兼容表意
+    )
+
+
+def memory_terms(text: str) -> List[str]:
+    """中文二元分词 + 英文数字整词。与 store.js 的 terms() 逐条对齐。
+
+    规则（照抄 JS）：
+      · 汉字串：单字（去掉停用字）+ 相邻二字
+      · 英文/数字串：整词（去掉停用词）
+      · 最后去重
+    """
+    import re
+
+    out: List[str] = []
+    for run in re.findall(r"[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+|[a-z0-9_]+",
+                          (text or "").lower()):
+        if _is_han(run[0]):
+            chars = list(run)
+            for i, ch in enumerate(chars):
+                if ch not in _STOP:
+                    out.append(ch)
+                if i + 1 < len(chars):
+                    out.append(ch + chars[i + 1])
+        else:
+            if run not in _STOP:
+                out.append(run)
+    # 去重且保序
+    seen = set()
+    uniq = []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
+
+
+def ensure_memory_db(db_path: Optional[str] = None) -> Tuple[bool, str]:
+    """建库（如果还没有）。结构必须与 MemoryStore 的 constructor 完全一致。
+
+    ⚠ 不能"先随便建个空文件"就算了 —— MemoryStore 打开时会执行一整套
+      CREATE TABLE IF NOT EXISTS。少一个表，插件（或 bridge.mjs）
+      打开就会报错。所以这里把 DDL 原样抄一遍。
+    """
+    import sqlite3
+
+    path = db_path or memory_path()
+    if not path:
+        return False, "数据目录未确定"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        conn = sqlite3.connect(path)
+        try:
+            conn.executescript("""
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY, bank TEXT NOT NULL, session TEXT NOT NULL,
+  event_key TEXT NOT NULL, role TEXT NOT NULL, text TEXT NOT NULL,
+  content_json TEXT NOT NULL, source_message_id TEXT,
+  recorded_at INTEGER NOT NULL, source_time INTEGER,
+  interrupted INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(bank,session,event_key));
+CREATE INDEX IF NOT EXISTS messages_bank_session ON messages(bank,session,id);
+CREATE INDEX IF NOT EXISTS messages_bank_time ON messages(bank,source_time);
+CREATE TABLE IF NOT EXISTS chunks (
+  id INTEGER PRIMARY KEY, message INTEGER NOT NULL REFERENCES messages(id),
+  start INTEGER NOT NULL, end INTEGER NOT NULL, text TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'episodic',
+  importance REAL NOT NULL DEFAULT 0.5,
+  activated INTEGER NOT NULL, boosts INTEGER NOT NULL DEFAULT 0,
+  last_boost INTEGER, UNIQUE(message,start));
+CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(terms, tokenize='unicode61');
+CREATE TABLE IF NOT EXISTS anchors (
+  id INTEGER PRIMARY KEY, bank TEXT NOT NULL, name TEXT NOT NULL,
+  UNIQUE(bank,name));
+CREATE TABLE IF NOT EXISTS aliases (
+  anchor INTEGER REFERENCES anchors(id), alias TEXT NOT NULL,
+  PRIMARY KEY(anchor,alias));
+CREATE TABLE IF NOT EXISTS anchor_sources (
+  anchor INTEGER REFERENCES anchors(id), chunk INTEGER REFERENCES chunks(id),
+  PRIMARY KEY(anchor,chunk));
+CREATE TABLE IF NOT EXISTS activations (
+  bank TEXT NOT NULL, chunk INTEGER REFERENCES chunks(id),
+  event_key TEXT NOT NULL, at INTEGER NOT NULL,
+  PRIMARY KEY(bank,chunk,event_key));
+CREATE TABLE IF NOT EXISTS ledger (
+  id INTEGER PRIMARY KEY, bank TEXT NOT NULL, at INTEGER NOT NULL,
+  kind TEXT NOT NULL, chars INTEGER NOT NULL, sources TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS housekeeping (
+  bank TEXT PRIMARY KEY, last_chunk INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS groups (
+  chunk INTEGER PRIMARY KEY REFERENCES chunks(id),
+  bank TEXT NOT NULL, digest TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS replays (
+  chunk INTEGER PRIMARY KEY REFERENCES chunks(id), at INTEGER NOT NULL);
+PRAGMA user_version=1;
+""")
+            conn.commit()
+        finally:
+            conn.close()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def capture_message(
+    session: str,
+    event_key: str,
+    role: str,
+    text: str,
+    source_time: Optional[int] = None,
+    bank: str = "dafeiyu",
+    db_path: Optional[str] = None,
+) -> Tuple[bool, Optional[int], str]:
+    """记一条消息进记忆库。返回 (ok, message_id, error)。
+
+    `event_key` 是幂等键：同一条只会入库一次。
+    微信里用 `chat_id:local_id` 就够 —— 同一条消息读两遍不会重复记。
+
+    ⚠ 角色只认 user / assistant：
+        user      = 对方说的
+        assistant = 她说的
+    """
+    import sqlite3
+
+    if role not in ("user", "assistant"):
+        return False, None, f"role 只能是 user 或 assistant，收到 {role!r}"
+    if not session or not event_key:
+        return False, None, "session / event_key 不能为空"
+    body = (text or "").strip()
+    if not body:
+        return False, None, "空消息不入库"
+
+    path = db_path or memory_path()
+    ok, err = ensure_memory_db(path)
+    if not ok:
+        return False, None, err
+
+    try:
+        conn = sqlite3.connect(path, timeout=10)
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("BEGIN")
+            try:
+                now = int(time.time() * 1000)
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO messages("
+                    "bank,session,event_key,role,text,content_json,"
+                    "recorded_at,source_time,interrupted) "
+                    "VALUES(?,?,?,?,?,?,?,?,0)",
+                    (bank, session, event_key, role, body,
+                     json.dumps([{"type": "text", "text": body}],
+                                ensure_ascii=False),
+                     now, source_time))
+                if not cur.rowcount:
+                    conn.execute("COMMIT")
+                    return True, None, ""      # 已经有了，幂等返回
+                mid = int(cur.lastrowid)
+
+                # 切片：640 步长 / 800 窗口，与 store.js 一致
+                start = 0
+                n = len(body)
+                while start < n:
+                    end = min(n, start + 800)
+                    part = body[start:end]
+                    c = conn.execute(
+                        "INSERT INTO chunks(message,start,end,text,activated) "
+                        "VALUES(?,?,?,?,?)", (mid, start, end, part, now))
+                    conn.execute(
+                        "INSERT INTO search_index(rowid,terms) VALUES(?,?)",
+                        (int(c.lastrowid), " ".join(memory_terms(part))))
+                    if end == n:
+                        break
+                    start += 640
+                conn.execute("COMMIT")
+                return True, mid, ""
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+    except Exception as exc:
+        return False, None, str(exc)
+
+
+def record_exchange(
+    chat_id: str,
+    chat_name: str,
+    user_text: str,
+    reply_text: str,
+    user_local_id: Any = None,
+    source_time: Optional[int] = None,
+) -> int:
+    """把一问一答一起记下来。返回成功写入的条数（0/1/2）。
+
+    session 用 `wechat:<chat_id>` 作为命名空间，跟 DSH 会话 id 区分开 ——
+    否则两边混在一个 session 里，"她记得的"和"她刚才在 DSH 里聊的"
+    会串成一段，检索出来的东西对不上。
+    """
+    session = f"wechat:{chat_id}"
+    n = 0
+    now_ms = int(time.time() * 1000)
+
+    if (user_text or "").strip():
+        key = f"wx-u-{user_local_id}" if user_local_id is not None else f"wx-u-{now_ms}"
+        ok, _mid, _err = capture_message(
+            session, key, "user", user_text, source_time)
+        n += 1 if ok else 0
+
+    if (reply_text or "").strip():
+        # 回复用 user 那条的 local_id 派生出唯一键，保证一问一答成对，
+        # 且重读同一条消息不会重复记。
+        base = f"wx-u-{user_local_id}" if user_local_id is not None else f"wx-{now_ms}"
+        ok, _mid, _err = capture_message(
+            session, f"{base}-a", "assistant", reply_text,
+            source_time or now_ms)
+        n += 1 if ok else 0
+
+    return n
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 鲸落
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 「鲸落」是一头鲸鱼死去、沉入海底，它的身体养活一整个生态几十年。
+#
+# 用在这里的意思是：**她的一切都结束**。
+# 灵魂、心情、记忆、参数 —— 全部删掉，数据目录回到从没来过她的状态。
+#
+# 和「清空」的区别（必须分清，用语上也必须分清）：
+#
+#   清空  keep_soul=True   她还在，只是忘了。名字、性格、珍视都留着。
+#   鲸落  keep_soul=False  她不存在了。连"她是谁"都没有了。
+#
+# 所以这里给的备份是**必须**的，不是可选项。点了鲸落就等于告别，
+# 但人有时候会后悔 —— 备份是唯一让后悔还有意义的东西。
+
+
+def whale_fall(root: Optional[str] = None) -> Tuple[bool, str, str, List[Dict[str, Any]]]:
+    """鲸落：删掉数据目录里属于她的一切。
+
+    返回 (ok, error, backup_path, 删掉的清单)。
+
+    ⚠ 备份强制开启（不提供关闭参数）。理由见上：这是告别，不是清理。
+      备份放在数据目录的**兄弟位置**，不放在里面 ——
+      放在里面的话下次鲸落会把备份也一起吃掉。
+    """
+    root = root or install_root()
+    plan = inspect_wipe(root, keep_soul=False)
+    if not plan.ok:
+        return False, plan.error, "", []
+
+    deleted: List[Dict[str, Any]] = [
+        {"name": i["name"], "bytes": i.get("bytes", 0)}
+        for i in plan.items if i.get("action") == "删除"
+    ]
+
+    ok, err, backup = apply_wipe(root, keep_soul=False, backup_first=True)
+    if not ok:
+        return False, err, backup, deleted
+
+    # 数据目录本身如果空了，也一并删掉 —— "从没来过"应该是干净的
+    try:
+        if os.path.isdir(root) and not os.listdir(root):
+            os.rmdir(root)
+    except Exception:
+        pass
+
+    return True, "", backup, deleted
+
+
+def whale_fall_status(root: Optional[str] = None) -> Dict[str, Any]:
+    """鲸落前的预告：会删什么、多大、备份放哪。"""
+    root = root or install_root()
+    plan = inspect_wipe(root, keep_soul=False)
+
+    parent = os.path.dirname(os.path.normpath(root))
+    if not parent or parent == os.path.normpath(root):
+        parent = root
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    return {
+        "ok": plan.ok,
+        "error": plan.error,
+        "root": root,
+        "items": plan.items,
+        "totalBytes": plan.total_bytes,
+        "backupTo": os.path.join(parent, f"bigfish-whalefall-{stamp}"),
+        "isEmpty": plan.ok and plan.total_bytes == 0 and not any(
+            i.get("action") == "删除" for i in plan.items),
+    }

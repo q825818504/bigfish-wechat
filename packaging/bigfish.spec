@@ -63,6 +63,7 @@ hiddenimports = [
     "PySide6.QtNetwork",
     "bigfish.soul",
     "bigfish.vault",
+    "bigfish.mood_judge",
     "bigfish.render",
     "bigfish.wechat",
     "bigfish.bridge_client",

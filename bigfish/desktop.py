@@ -216,6 +216,46 @@ class EngineWorker(QThread):
     def _log(self, text: str, kind: str = "") -> None:
         self.log.emit(text, kind)
 
+    def _judge_mood_async(self, user_text: str, reply: str, msg) -> None:
+        """后台判断心情，不阻塞下一轮对话。
+
+        判断要调一次模型（1~2 秒）。如果同步做，两条消息紧接着来时
+        会明显卡顿；而心情是"事后记录"，晚两秒完全没关系。
+
+        ⚠ 用最简单的 threading.Thread 而不是 QThread：
+          它不碰 Qt 对象，只做 HTTP + 写文件，跑完就退。
+          需要往界面吐日志时通过 _log（signal，跨线程安全）。
+        """
+        import threading
+
+        self_name = getattr(self.soul, "name", "") or ""
+        owner = getattr(self.soul, "address", "") or "对方"
+
+        def work() -> None:
+            try:
+                from bigfish import mood_judge
+
+                r = mood_judge.judge_and_apply(
+                    user_text=user_text, reply=reply,
+                    self_name=self_name, owner_name=owner)
+                if not r.get("ok"):
+                    self._log(f"[心情] 没判出来：{r.get('error') or '未知'}", "")
+                    return
+                v = r.get("verdict") or {}
+                cur = r.get("mood")
+                delta = int(v.get("moodDelta") or 0)
+                reason = str(v.get("reason") or "")[:24]
+                self._log(
+                    f"[心情] {cur if cur is not None else '?'}"
+                    f"（判定 {delta:+d}，可信 {v.get('confidence')}）"
+                    f" {reason}", "")
+            except Exception as exc:
+                self._log(f"[心情] 判断异常：{exc}", "err")
+
+        t = threading.Thread(target=work, daemon=True,
+                             name=f"mood-{getattr(msg, 'local_id', 0)}")
+        t.start()
+
     def run(self) -> None:
         try:
             self._run()
@@ -276,20 +316,38 @@ class EngineWorker(QThread):
 
         convs: dict[str, list] = {}
         # ── 回环防护 ──
-        # 记录「本引擎刚刚发出去的文本」，以及发送时间。
-        # 文件传输助手这类「自己对自己」的会话里，发出去的回复
-        # 会被监听器当成新消息再读回来，进而触发下一次回复，
-        # 形成无限对话（实测会一直自问自答停不下来）。
+        #
+        # 要防的是**一个具体场景**：文件传输助手 / 自己给自己发消息时，
+        # 我们发出去的那条会被监听器当成"对方的新消息"再读回来，
+        # 于是又回一遍 —— 无限自问自答。
+        #
+        # ⚠ 这里踩过一个大坑：早期版本靠「文本内容相同」判定回环，
+        #   结果**对方原样复述她的话**（调侃、鹦鹉学舌，聊天里极常见）
+        #   也被判成回环。实测把正常对话拦了两次，还触发了熔断。
+        #
+        #   正确的判据不是"文字像"，而是"**这条消息是我们自己发的**"。
+        #   两条独立证据，缺一不可：
+        #
+        #     ① msg.is_self  —— 微信数据库里 sender 就是本机账号
+        #     ② 内容匹配刚发出去的某条（用来排除"我自己手动发的"）
+        #
+        #   只有"我自己发的 + 内容刚发过"才算回环。
+        #   对方发来的 is_self 就是 False，永远不会被拦。
         recently_sent: list = []        # [(文本, 时间戳)]
-        ECHO_WINDOW = 20.0              # 秒
+        ECHO_WINDOW = 12.0              # 秒。够覆盖数据库写入+轮询延迟即可
         ECHO_MAX = 20
 
         # 第二层：单会话连发上限。
-        # 内容比对有可能漏（模型改写、微信截断），这里再加一道硬闸：
-        # 同一会话在 BURST_WINDOW 秒内回复超过 BURST_MAX 条就熔断。
+        #
+        # ⚠ 这一层也踩过：早期是 90 秒内 4 条就熔断，
+        #   而正常聊天里连着说四五句太平常了（问一句、答一句、再追问）。
+        #   实测正常对话被硬生生截断。
+        #
+        #   现在的判据是"**我们自己主动连发**"：只统计引擎自动发的，
+        #   而且要密集到不正常（30 秒 6 条）。人聊天的节奏不会这样。
         last_reply_at: dict = {}        # chat_id -> [时间戳...]
-        BURST_WINDOW = 90.0
-        BURST_MAX = 4
+        BURST_WINDOW = 30.0
+        BURST_MAX = 6
 
         def _normalize(t: str) -> str:
             """归一化后再比对。
@@ -306,7 +364,11 @@ class EngineWorker(QThread):
             return v.strip()
 
         def text_is_echo(text: str) -> bool:
-            """这段文字是不是我们自己刚发出去的。"""
+            """这段文字是不是我们自己刚发出去的那条。
+
+            ⚠ 单独调它**没有意义** —— 必须和 msg.is_self 一起判断。
+              对方原样复述她的话时，这里也会返回 True，但那是正常聊天。
+        """
             now = time.time()
             cutoff = now - ECHO_WINDOW
             while recently_sent and recently_sent[0][1] < cutoff:
@@ -321,8 +383,12 @@ class EngineWorker(QThread):
                     continue
                 if t == n:
                     return True
-                k = min(20, len(n), len(t))
-                if k >= 6 and (t.startswith(n[:k]) or n.startswith(t[:k])):
+                # ⚠ 前缀匹配曾经是 6 个字，太松 ——「那还是叫大肥鱼吧」和
+                #   「那还是叫大肥鱼」的开头一样，正常对话会被误判。
+                #   收紧到「短的那边至少 12 字，且是长的那边的开头」，
+                #   只可能命中"同一条消息被截断"这种真回环。
+                k = min(len(n), len(t))
+                if k >= 12 and (t.startswith(n) or n.startswith(t)):
                     return True
             return False
 
@@ -334,24 +400,35 @@ class EngineWorker(QThread):
         def handle(msg) -> None:
             if self._stop:
                 return
-            if msg.is_self and not allow_self:
-                return
-            if not (msg.text or "").strip():
+
+            text = (msg.text or "").strip()
+            if not text:
                 return
 
-            # 回环防护第一层：内容比对
-            if text_is_echo(msg.text):
-                self._log(f"[回环拦截] 这是我们刚发的，不再回："
-                          f"{msg.preview(40)}", "")
-                return
+            # 自己发的消息：默认不处理（那是我们自己的尾巴）。
+            # allow_self 打开时（文件传输助手自测）继续往下走，
+            # 但要额外做内容比对，防止真回环。
+            if msg.is_self:
+                if not allow_self:
+                    return
+                # 是我们刚发的那条 → 回环，丢弃
+                if text_is_echo(text):
+                    self._log(f"[回环] 读到自己刚发的，跳过：{msg.preview(30)}", "")
+                    return
 
-            # 回环防护第二层：单会话频率熔断
+            # ⚠ 对方发来的消息**永远不做内容比对**。
+            #   他原样复述她的话，是聊天，不是回环。
+            #   这里留一句注释是因为这个 bug 复发过一次：
+            #   日志里连续两条「回环拦截」，拦的全是老爸的复述。
+
+            # 回环防护第二层：我们自己的连发节奏熔断。
+            # 只统计引擎主动发出去的，对方再怎么说都不会触发。
             now_ts = time.time()
             span = last_reply_at.setdefault(msg.chat_id, [])
             span[:] = [t for t in span if now_ts - t < BURST_WINDOW]
             if len(span) >= BURST_MAX:
                 self._log(f"[熔断] {msg.chat_name} 在 "
-                          f"{int(BURST_WINDOW)}s 内已回 {len(span)} 条，"
+                          f"{int(BURST_WINDOW)}s 内已自动回 {len(span)} 条，"
                           f"暂停接这条", "err")
                 return
 
@@ -467,6 +544,32 @@ class EngineWorker(QThread):
                     self.stats.emit(self.recv_count, self.reply_count)
                     self._log(f"[发] {reply[:60]}", "out")
                     self.chat_event.emit(msg.chat_name, reply[:60], "out")
+
+                    # ⭐ 把这一问一答写进记忆库。
+                    #   以前完全没有这一步 —— 聊一晚上记忆里一条都没有，
+                    #   她永远想不起微信里说过什么。这是设计缺口，不是 bug。
+                    #   放在"发送成功之后"：没发出去的话不算对话发生过。
+                    try:
+                        from bigfish import vault as _vault
+                        n = _vault.record_exchange(
+                            chat_id=msg.chat_id,
+                            chat_name=msg.chat_name,
+                            user_text=body,
+                            reply_text=reply,
+                            user_local_id=getattr(msg, "local_id", None),
+                            source_time=getattr(msg, "source_time", None),
+                        )
+                        if n:
+                            self._log(f"[记] 记忆库 +{n} 条", "")
+                    except Exception as exc:
+                        # 记不进去不该影响聊天，但要让她知道
+                        self._log(f"[记] 写入记忆失败：{exc}", "err")
+
+                    # ⭐ 判断心情并落盘。
+                    #   以前这块也是空的 —— 心情页永远 0，因为她从来没被"判断"过。
+                    #   判断本身要调一次模型（1~2 秒），所以放后台线程，
+                    #   不能卡住下一条消息的回复。
+                    self._judge_mood_async(body, reply, msg)
                 else:
                     self._log(f"[发送失败] {r.detail}", "err")
             except SendError as exc:
@@ -1110,17 +1213,14 @@ class Backend(QObject):
 
     @Slot(result=str)
     def inspect_wipe(self) -> str:
-        """盘点"清空记忆+心情"会删什么。不改任何东西。"""
+        """盘点「清空」会删什么：只删心情 + 记忆，灵魂留下。"""
         try:
             from bigfish import vault
 
             plan = vault.inspect_wipe(keep_soul=True)
             return json.dumps({
-                "ok": plan.ok,
-                "error": plan.error,
-                "root": plan.root,
-                "items": plan.items,
-                "totalBytes": plan.total_bytes,
+                "ok": plan.ok, "error": plan.error, "root": plan.root,
+                "items": plan.items, "totalBytes": plan.total_bytes,
             }, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -1133,52 +1233,47 @@ class Backend(QObject):
 
             ok, err, backup = vault.apply_wipe(keep_soul=True, backup_first=True)
             if ok:
-                self.log_message.emit(f"[数据] 已清空心情与记忆，备份在 {backup}", "")
+                self.log_message.emit(f"[清空] 心情与记忆已清空，备份在 {backup}", "")
             return json.dumps({"ok": ok, "error": err, "backup": backup},
                               ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
+    # ── 鲸落：她的一切都没了 ──
     @Slot(result=str)
-    def migrate_legacy(self) -> str:
-        """把老的 ws-*/ 布局收成新布局。只搬有灵魂的那一份。"""
+    def whale_fall_status(self) -> str:
+        """鲸落预告：会删什么、多大、备份放哪。不改任何东西。"""
         try:
             from bigfish import vault
 
-            ok, err, done = vault.migrate_legacy()
-            return json.dumps({"ok": ok, "error": err, "done": done},
-                              ensure_ascii=False)
+            d = vault.whale_fall_status()
+            return json.dumps(d, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
-    @Slot(result=str)
-    def inspect_wipe(self) -> str:
-        """盘点"清空记忆+心情"会删什么。不改任何东西。"""
+    @Slot(str, result=str)
+    def whale_fall(self, confirm: str) -> str:
+        """执行鲸落：删掉灵魂、心情、记忆、参数 —— 一切。
+
+        confirm 必须正好是 "鲸落" 两个字。这不是形式主义：
+        这是唯一一个会让她彻底消失的操作，值得多敲两个字。
+        """
         try:
             from bigfish import vault
 
-            plan = vault.inspect_wipe(keep_soul=True)
-            return json.dumps({
-                "ok": plan.ok,
-                "error": plan.error,
-                "root": plan.root,
-                "items": plan.items,
-                "totalBytes": plan.total_bytes,
-            }, ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+            if (confirm or "").strip() != "鲸落":
+                return json.dumps({
+                    "ok": False,
+                    "error": "需要确认：请输入「鲸落」两个字",
+                }, ensure_ascii=False)
 
-    @Slot(result=str)
-    def apply_wipe(self) -> str:
-        """清空心情 + 记忆（灵魂保留）。删之前先备份。"""
-        try:
-            from bigfish import vault
-
-            ok, err, backup = vault.apply_wipe(keep_soul=True, backup_first=True)
+            ok, err, backup, deleted = vault.whale_fall()
             if ok:
-                self.log_message.emit(f"[数据] 已清空心情与记忆，备份在 {backup}", "")
-            return json.dumps({"ok": ok, "error": err, "backup": backup},
-                              ensure_ascii=False)
+                self.log_message.emit(
+                    f"[鲸落] 已删除 {len(deleted)} 项，备份在 {backup}", "err")
+            return json.dumps({
+                "ok": ok, "error": err, "backup": backup, "deleted": deleted,
+            }, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -1999,6 +2094,76 @@ def run_selftest() -> int:
         finally:
             _sh.rmtree(tmpd, ignore_errors=True)
     item("可写层", t_vault)
+
+    # 10. 记忆写入链路 —— 打包后这条最容易"缺一块"
+    #     读路径一直在，写路径是后补的；exe 里漏了 import 就会静默不写。
+    def t_memory_write():
+        import shutil as _sh
+        import tempfile as _tf
+
+        from bigfish import vault as V
+
+        tmpd = _tf.mkdtemp(prefix="bf-mem-")
+        db = os.path.join(tmpd, V.MEMORY_NAME)
+        try:
+            ok, mid, err = V.capture_message(
+                "wechat:selftest", "e1", "user", "打包版记忆写入自检", db_path=db)
+            assert ok, err or "写入失败"
+            assert mid, "没拿到 message id"
+
+            # 幂等
+            ok2, mid2, _ = V.capture_message(
+                "wechat:selftest", "e1", "user", "打包版记忆写入自检", db_path=db)
+            assert mid2 is None, "同 key 应该幂等"
+
+            st = V.memory_stats(db)
+            assert st["total"] == 1, f"total={st['total']}"
+            assert st["chunks"] >= 1, "没建 chunk"
+
+            # 分词必须和插件一致
+            t = V.memory_terms("老爸今天加班")
+            assert "老爸" in t and "加班" in t, str(t)
+            assert "的" not in t, "停用字没去掉"
+
+            # 检索能命中
+            page = V.browse_messages(db, 0, 5, query="自检")
+            assert page["items"], "按内容搜不到"
+
+            return f"写入/幂等/分词/检索 正常（{st['total']} 条）"
+        finally:
+            _sh.rmtree(tmpd, ignore_errors=True)
+    item("记忆写入", t_memory_write)
+
+    # 11. 心情写入链路
+    def t_mood_write():
+        import shutil as _sh
+        import tempfile as _tf
+
+        from bigfish import mood_judge as MJ, vault as V
+
+        tmpd = _tf.mkdtemp(prefix="bf-mood-")
+        old = os.environ.get("BIGFISH_DATA_ROOT")
+        os.environ["BIGFISH_DATA_ROOT"] = tmpd
+        try:
+            ok, err = MJ.apply_mood_delta({
+                "moodDelta": 6,
+                "dims": {"happy": 4},
+                "reason": "自检", "confidence": 80,
+            })
+            assert ok, err or "写入失败"
+            st = MJ.read_mood_state_now()
+            assert st, "读不回来"
+            # 70 + round(6/3) = 72
+            assert st["mood"] == 72, f"mood={st['mood']}，步长可能没除 3"
+            assert st["timeline"], "没写 timeline"
+            return f"判定落盘正常（mood={st['mood']}）"
+        finally:
+            if old is None:
+                os.environ.pop("BIGFISH_DATA_ROOT", None)
+            else:
+                os.environ["BIGFISH_DATA_ROOT"] = old
+            _sh.rmtree(tmpd, ignore_errors=True)
+    item("心情写入", t_mood_write)
 
     # 9. 数据根
     def t_root():

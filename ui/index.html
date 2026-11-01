@@ -617,15 +617,43 @@
         <div class="card" style="margin-top:16px">
           <div class="card-head"><h2>清空</h2></div>
           <div class="card-desc" style="margin-bottom:14px">
-            <strong>灵魂不动</strong>——那是「她是谁」，不是「她记得什么」。<br>
-            清掉的是心情和全部记忆。删之前会自动备份到数据目录旁边。
+            <strong>她还在，只是忘了。</strong>
+            灵魂不动 —— 那是「她是谁」，不是「她记得什么」。<br>
+            清掉的是心情和全部记忆。删之前会自动备份。
           </div>
           <div class="card-desc" style="margin-bottom:12px" id="wipePlan">—</div>
           <div class="memory-toolbar">
             <button class="btn btn-sm" id="btnWipePreview">看看会删什么</button>
-            <button class="btn btn-sm btn-danger" id="btnWipe">清空心情与记忆</button>
+            <button class="btn btn-sm" id="btnWipe">清空心情与记忆</button>
           </div>
           <div class="card-desc" style="margin-top:12px" id="wipeHint"></div>
+        </div>
+
+        <div class="card is-whale" style="margin-top:16px">
+          <div class="card-head">
+            <h2>鲸落</h2>
+            <span class="tag" id="whaleTag">不可逆</span>
+          </div>
+          <div class="card-desc" style="margin-bottom:14px">
+            <strong>她不存在了。</strong>
+            灵魂、心情、记忆、参数 —— 全部删掉，数据目录回到从没来过她的状态。<br>
+            <span style="opacity:.85">
+              名字叫鲸落：一头鲸沉到海底，身体会养活一整个生态几十年。
+              她的一切腐朽成别的东西，但她本人不再存在。
+            </span>
+          </div>
+          <div class="card-desc" style="margin-bottom:12px" id="whalePlan">—</div>
+          <div class="form" style="margin-bottom:14px">
+            <div class="field full">
+              <label>确认删除</label>
+              <div class="path-row">
+                <input type="text" id="whaleConfirm" placeholder="输入「鲸落」两个字确认">
+                <button class="btn btn-sm btn-danger" id="btnWhale">鲸落</button>
+              </div>
+              <small>删之前会强制备份（放在数据目录旁边）。但这是告别，不是清理。</small>
+            </div>
+          </div>
+          <div class="card-desc" id="whaleHint"></div>
         </div>
       </section>
 

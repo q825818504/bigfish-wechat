@@ -1156,3 +1156,20 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 }
 .hint-line.is-ok { color: var(--ok); }
 .hint-line.is-err { color: var(--error); }
+
+/* ══ 鲸落卡片：整站唯一一处"危险"视觉 ══
+   不喧哗，但一眼能看出它跟别的卡片不是一回事 */
+.card.is-whale {
+  border-color: #e8d5d2;
+  background: linear-gradient(180deg, #fdf8f7 0%, var(--surface) 90px);
+}
+.card.is-whale .card-head h2 { color: var(--error); }
+.card.is-whale .tag {
+  background: var(--error-soft);
+  color: var(--error);
+  border-color: #eabfbb;
+}
+.card.is-whale .field input:focus {
+  border-color: var(--error);
+  box-shadow: 0 0 0 3px var(--error-soft);
+}
