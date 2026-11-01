@@ -64,13 +64,23 @@ def target_dir():
 
 
 def make_shortcut(path, target, workdir, icon):
-    """用 PowerShell 建 .lnk，不需要 pywin32。"""
+    """用 PowerShell 建 .lnk，不需要 pywin32。
+
+    ⚠ 这里**故意不设 IconLocation**。
+      设成独立 .ico 的路径时，Shell 会用「大图标」尺寸（32px）去那个文件里
+      按索引取第 0 帧。我们的 ico 第 0 帧是 256×256，索引对不上，
+      Shell 就退回到通用快捷方式图标 —— 桌面上一片白纸带箭头。
+
+      而 exe 自己内嵌了完整的多尺寸图标，不指定 IconLocation 时
+      Windows 会自己挑合适的那一帧，反而永远正确。
+
+      `icon` 参数留着只为兼容旧调用点，不再使用。
+    """
     ps = (
         "$W = New-Object -ComObject WScript.Shell;"
         f"$S = $W.CreateShortcut('{path}');"
         f"$S.TargetPath = '{target}';"
         f"$S.WorkingDirectory = '{workdir}';"
-        f"$S.IconLocation = '{icon}';"
         "$S.Save()"
     )
     subprocess.run(["powershell", "-NoProfile", "-Command", ps],
