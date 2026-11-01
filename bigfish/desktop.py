@@ -20,7 +20,24 @@ import sys
 import time
 import traceback
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+def _safe_reconfigure_stdout() -> None:
+    """安全地设置 stdout 编码。
+
+    GUI 程序（PyInstaller console=False）里 sys.stdout 是 None，
+    直接调 .reconfigure() 会抛 AttributeError 导致程序启动即崩。
+    这里判断后再操作，失败也静默——输出流不可用不影响界面运行。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_safe_reconfigure_stdout()
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -61,6 +78,37 @@ if not BRIDGE_DIR:
     BRIDGE_DIR = os.path.join(_APP_DIR, "bridge")
 
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
+
+
+def is_admin() -> bool:
+    """当前进程是否有管理员权限（UIA 热激活需要）。"""
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def ts_to_local(ts) -> str:
+    """把时间戳转成本地时间字符串。
+
+    微信的 source_time 是**毫秒**，Python 的 localtime 要**秒**。
+    直接传毫秒会抛 OSError [Errno 22]（实测踩过）。
+    这里按量级自动判断：大于 1e11 当作毫秒。
+    """
+    if not ts:
+        return ""
+    try:
+        t = float(ts)
+    except (TypeError, ValueError):
+        return ""
+    if t > 1e11:
+        t /= 1000.0
+    try:
+        return time.strftime("%m-%d %H:%M", time.localtime(t))
+    except (OSError, ValueError, OverflowError):
+        return ""
+
 
 # 打包后依赖在 _internal 里，sys.path 需要包含它以便 import vendor 包
 _VENDOR = os.path.join(_APP_DIR, "_internal", "vendor", "wechatauto-replica")
@@ -212,13 +260,75 @@ class EngineWorker(QThread):
             self._log(f"监听：{uid} -> {got}")
 
         if not self.dry:
-            self.sender = UiaSender()
-            self.sender.wake()
-            self._log("UIA 已就绪", "in")
+            # UIA 初始化失败不应该让整个引擎死掉：
+            # 监听和生成仍然有价值，只是发不出去。
+            try:
+                self.sender = UiaSender()
+                self.sender.wake()
+                self._log("UIA 已就绪", "in")
+            except Exception as exc:
+                self.sender = None
+                self._log(f"[警告] UIA 初始化失败，本次只监听不发送：{exc}",
+                          "err")
 
         from bigfish.bridge_client import load_context
 
         convs: dict[str, list] = {}
+        # ── 回环防护 ──
+        # 记录「本引擎刚刚发出去的文本」，以及发送时间。
+        # 文件传输助手这类「自己对自己」的会话里，发出去的回复
+        # 会被监听器当成新消息再读回来，进而触发下一次回复，
+        # 形成无限对话（实测会一直自问自答停不下来）。
+        recently_sent: list = []        # [(文本, 时间戳)]
+        ECHO_WINDOW = 20.0              # 秒
+        ECHO_MAX = 20
+
+        # 第二层：单会话连发上限。
+        # 内容比对有可能漏（模型改写、微信截断），这里再加一道硬闸：
+        # 同一会话在 BURST_WINDOW 秒内回复超过 BURST_MAX 条就熔断。
+        last_reply_at: dict = {}        # chat_id -> [时间戳...]
+        BURST_WINDOW = 90.0
+        BURST_MAX = 4
+
+        def _normalize(t: str) -> str:
+            """归一化后再比对。
+
+            读回来的文本可能多出：
+              - 群消息的 "wxid_xxx: " 前缀
+              - 发送时自己加的 "@昵称 "
+            这些必须剥掉，否则回环识别会失效（实测群里漏拦）。
+            """
+            import re as _re
+            v = (t or "").strip()
+            v = _re.sub(r"^[A-Za-z0-9_@-]{4,}:\s?", "", v)
+            v = _re.sub(r"^(@\S+\s*)+", "", v)
+            return v.strip()
+
+        def text_is_echo(text: str) -> bool:
+            """这段文字是不是我们自己刚发出去的。"""
+            now = time.time()
+            cutoff = now - ECHO_WINDOW
+            while recently_sent and recently_sent[0][1] < cutoff:
+                recently_sent.pop(0)
+
+            t = _normalize(text)
+            if not t:
+                return False
+            for sent_text, _ in recently_sent:
+                n = _normalize(sent_text)
+                if not n:
+                    continue
+                if t == n:
+                    return True
+                k = min(20, len(n), len(t))
+                if k >= 6 and (t.startswith(n[:k]) or n.startswith(t[:k])):
+                    return True
+            return False
+
+        def remember_sent(text: str) -> None:
+            recently_sent.append((text.strip(), time.time()))
+            if len(recently_sent) > ECHO_MAX:
+                del recently_sent[:-ECHO_MAX]
 
         def handle(msg) -> None:
             if self._stop:
@@ -227,6 +337,23 @@ class EngineWorker(QThread):
                 return
             if not (msg.text or "").strip():
                 return
+
+            # 回环防护第一层：内容比对
+            if text_is_echo(msg.text):
+                self._log(f"[回环拦截] 这是我们刚发的，不再回："
+                          f"{msg.preview(40)}", "")
+                return
+
+            # 回环防护第二层：单会话频率熔断
+            now_ts = time.time()
+            span = last_reply_at.setdefault(msg.chat_id, [])
+            span[:] = [t for t in span if now_ts - t < BURST_WINDOW]
+            if len(span) >= BURST_MAX:
+                self._log(f"[熔断] {msg.chat_name} 在 "
+                          f"{int(BURST_WINDOW)}s 内已回 {len(span)} 条，"
+                          f"暂停接这条", "err")
+                return
+
             if time.localtime().tm_hour in quiet:
                 self._log(f"[安静时段] 跳过 {msg.chat_name}", "err")
                 return
@@ -323,10 +450,19 @@ class EngineWorker(QThread):
                 # 群里回复时带上 @，不然没人知道在跟谁说话
                 send_text = f"@{msg.sender_name} {reply}"
 
+            if self.sender is None:
+                self._log(f"[未发送] UIA 未就绪，生成内容：{reply[:50]}",
+                          "think")
+                return
+
             try:
                 r = self.sender.send(msg.chat_name, send_text)
                 if r.ok:
                     self.reply_count += 1
+                    # 记下来，等这条消息被监听器读回来时能认出来
+                    remember_sent(send_text)
+                    remember_sent(reply)
+                    last_reply_at.setdefault(msg.chat_id, []).append(time.time())
                     self.stats.emit(self.recv_count, self.reply_count)
                     self._log(f"[发] {reply[:60]}", "out")
                     self.chat_event.emit(msg.chat_name, reply[:60], "out")
@@ -362,6 +498,11 @@ class Backend(QObject):
         self.reply_count = 0
         self.account = ""
         self._reader = None
+        # 日志缓冲：信号可能因为界面还没连上而丢失，
+        # get_status 里带上增量，前端补进去。
+        self._log_buffer = []
+        self._log_seq = 0
+        self._log_sent = 0
 
     # ------------------------------------------------------------------
     def _reader_or_open(self):
@@ -379,6 +520,12 @@ class Backend(QObject):
             s = int(time.time() - self.started_at)
             up = f"{s // 60}分{s % 60}秒" if s >= 60 else f"{s}秒"
 
+        # 账号名：没启动时也要显示。
+        # 直接从数据目录名推导（wxid_xxx_abcd → 只在必要时打开数据库读昵称），
+        # 避免每 2 秒轮询都去解锁数据库。
+        if not self.account:
+            self.account = self._peek_account()
+
         diag = self._diagnose_items()
         return json.dumps({
             "running": running,
@@ -390,7 +537,55 @@ class Backend(QObject):
             "account": self.account,
             "diagnose": diag,
             "recent": getattr(self, "_recent", []),
+            "logs": self._pending_logs(),
         }, ensure_ascii=False)
+
+    def _pending_logs(self) -> list:
+        """返回上次之后新增的日志（最多 200 条）。"""
+        out = []
+        for seq, text, kind in self._log_buffer:
+            if seq > self._log_sent:
+                out.append({"seq": seq, "text": text, "kind": kind})
+        if out:
+            self._log_sent = out[-1]["seq"]
+        return out[-200:]
+
+    def _peek_account(self) -> str:
+        """尽量便宜地拿到当前账号显示名。
+
+        顺序：
+          1. 已打开的 reader → 用它的昵称
+          2. 数据目录里最新的 wxid_* 目录 → 用目录名（不打开数据库）
+        """
+        try:
+            if self._reader is not None:
+                info = self._reader.self_info()
+                nick = info.get("nick_name")
+                if nick:
+                    return nick
+        except Exception:
+            pass
+
+        try:
+            from bigfish.wechat import _VENDOR  # noqa: F401
+            import glob
+            from bigfish.bridge_client import _default_data_root  # noqa: F401
+
+            root = os.path.expandvars(
+                r"%USERPROFILE%\Documents\xwechat_files")
+            if not os.path.isdir(root):
+                root = r"C:\Users\Alime\Documents\xwechat_files"
+            dirs = [d for d in glob.glob(os.path.join(root, "wxid_*"))
+                    if os.path.isdir(os.path.join(d, "db_storage"))]
+            if not dirs:
+                return ""
+            dirs.sort(key=lambda d: os.path.getmtime(
+                os.path.join(d, "db_storage")), reverse=True)
+            name = os.path.basename(dirs[0])
+            # wxid_74pumkyi8vs422_2470 -> wxid_74pumkyi8vs422
+            return name.rsplit("_", 1)[0] if "_" in name else name
+        except Exception:
+            return ""
 
     def _diagnose_items(self) -> list[dict]:
         import ctypes
@@ -572,9 +767,7 @@ class Backend(QObject):
             return json.dumps({
                 "total": total,
                 "sessions": sessions,
-                "newest": time.strftime("%m-%d %H:%M",
-                                        time.localtime(newest))
-                if newest else "",
+                "newest": ts_to_local(newest),
             }, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
@@ -636,10 +829,7 @@ class Backend(QObject):
                         items.append({
                             "role": it.get("role") or "user",
                             "text": (it.get("text") or "")[:600],
-                            "time": time.strftime(
-                                "%m-%d %H:%M", time.localtime(ts / 1000)
-                                if ts > 1e12 else time.localtime(ts))
-                            if ts else "",
+                            "time": ts_to_local(ts),
                         })
                 except Exception:
                     pass
@@ -871,14 +1061,22 @@ class Backend(QObject):
         self.reply_count = 0
         self.started_at = time.time()
 
-        w = EngineWorker(self.watching, dry=False)
+        # 非管理员时不能发（UIA 热激活要写 gate 字节）。
+        # 与其让引擎整个死掉，不如降级成「只看不发」，并在界面说明。
+        dry = not is_admin()
+        if dry:
+            self.log_message.emit(
+                "[提示] 当前不是管理员权限，引擎以「只看不发」模式运行。"
+                "以管理员身份启动才能真正回复。", "err")
+
+        w = EngineWorker(self.watching, dry=dry)
         w.log.connect(self._on_log)
         w.chat_event.connect(self._on_chat)
         w.stats.connect(self._on_stats)
         w.failed.connect(self._on_fail)
         w.start()
         self.worker = w
-        return json.dumps({"ok": True})
+        return json.dumps({"ok": True, "dry": dry})
 
     @Slot()
     def stop_engine(self) -> None:
@@ -889,6 +1087,10 @@ class Backend(QObject):
         self.started_at = 0.0
 
     def _on_log(self, text: str, kind: str) -> None:
+        self._log_seq += 1
+        self._log_buffer.append((self._log_seq, text, kind))
+        if len(self._log_buffer) > 400:
+            del self._log_buffer[:-400]
         self.log_message.emit(text, kind)
 
     def _on_chat(self, who: str, text: str, direction: str) -> None:
@@ -937,7 +1139,110 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def run_live_send() -> int:
+    """真的发一条消息到文件传输助手，然后回读数据库确认。
+
+    这是唯一会真的发东西的入口，用 --live-send 显式触发。
+    发出去的内容带时间戳，方便事后识别是哪一次测试。
+    """
+    if getattr(sys, "frozen", False):
+        try:
+            import ctypes
+            if ctypes.windll.kernel32.AttachConsole(-1):
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8",
+                                  errors="replace", buffering=1)
+        except Exception:
+            pass
+
+    HR = "=" * 66
+    print(HR)
+    print("  真实发送测试")
+    print(HR)
+    print(f"  管理员: {is_admin()}")
+    if not is_admin():
+        print("  [!] 需要管理员权限")
+        return 1
+
+    # 数据库
+    print("\n[1] 打开数据库")
+    from bigfish.wechat import WeChatReader
+    r = WeChatReader().open()
+    info = r.self_info()
+    print(f"    账号: {info.get('nick_name')}")
+
+    # UIA
+    print("\n[2] 热激活 UIA")
+    t0 = time.time()
+    from bigfish.wechat_sender import SendError, UiaSender
+    try:
+        sender = UiaSender()
+        sender.wake()
+    except SendError as exc:
+        print(f"    [!] {exc.kind}: {exc}")
+        return 1
+    print(f"    成功 {time.time()-t0:.1f}s，当前 {sender.current_chat()!r}")
+
+    # 发送
+    stamp = time.strftime("%H:%M:%S")
+    text = f"[自检 {stamp}] 大肥鱼发的，收到说明收发都通。"
+    print(f"\n[3] 发送到 文件传输助手")
+    print(f"    {text}")
+    try:
+        res = sender.send("文件传输助手", text)
+    except SendError as exc:
+        print(f"    [!] {exc.kind}: {exc}")
+        return 1
+    print(f"    返回 ok={res.ok}")
+
+    # 回读
+    print(f"\n[4] 回读数据库确认")
+    found = False
+    for i in range(10):
+        time.sleep(1.0)
+        try:
+            r2 = WeChatReader().open()
+            for m in r2.messages("filehelper", limit=3):
+                if stamp in m.content:
+                    found = True
+                    print(f"    ✓ 第 {i+1} 次查询命中")
+                    print(f"      local_id={m.local_id}")
+                    print(f"      {m.content[:60]}")
+                    break
+        except Exception:
+            continue
+        if found:
+            break
+
+    print()
+    print(HR)
+    if found:
+        print("  ✓ 收发链路确认打通（消息已落库）")
+    else:
+        print("  ✗ 数据库里没找到这条消息，请手动看微信")
+    print(HR)
+    return 0 if found else 1
+
+
 def main() -> int:
+    # ── 命令行自检入口 ──
+    # 打包成 exe 之后，外部脚本（tools/selftest.py）跑不到 exe 里的代码，
+    # 所以自检必须内建：BigFish.exe --selftest
+    if "--selftest" in sys.argv:
+        return run_selftest()
+
+    # BigFish.exe --version
+    if "--version" in sys.argv:
+        try:
+            from bigfish.updater import __version__
+        except Exception:
+            __version__ = "?"
+        print(__version__)
+        return 0
+
+    # BigFish.exe --live-send   真的发一条到文件传输助手
+    if "--live-send" in sys.argv:
+        return run_live_send()
+
     QApplication.setAttribute(
         getattr(Qt, "AA_ShareOpenGLContexts", Qt.ApplicationAttribute.AA_ShareOpenGLContexts),
         True)
@@ -948,6 +1253,177 @@ def main() -> int:
     win = MainWindow()
     win.show()
     return app.exec()
+
+
+def run_selftest() -> int:
+    """在 exe 内部跑自检，输出到控制台。
+
+    检查项和 tools/selftest.py 一致，但跑的是**打包后的代码**——
+    这才是用户实际会遇到的那份。
+
+    exe 是 console=False 的 GUI 程序，默认没有控制台。
+    从命令行带 --selftest 启动时，主动 AttachConsole 到父进程
+    （cmd/PowerShell），这样输出才能被看到。
+    """
+    import traceback
+
+    # GUI 程序附加到父控制台，否则 print 全部丢弃
+    if getattr(sys, "frozen", False):
+        try:
+            import ctypes
+            ATTACH_PARENT_PROCESS = -1
+            if ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
+                sys.stdout = open("CONOUT$", "w", encoding="utf-8",
+                                  errors="replace", buffering=1)
+                sys.stderr = open("CONOUT$", "w", encoding="utf-8",
+                                  errors="replace", buffering=1)
+        except Exception:
+            pass
+
+    HR = "=" * 66
+    results = []
+
+    def item(name, fn):
+        t0 = time.time()
+        try:
+            detail = fn()
+            dt = time.time() - t0
+            results.append((name, "OK", detail, dt))
+            print(f"  [OK  ] {name}  ({dt:.2f}s)")
+            if detail:
+                for line in str(detail).splitlines():
+                    print(f"         {line}")
+            return True
+        except Exception as exc:
+            dt = time.time() - t0
+            results.append((name, "FAIL", f"{type(exc).__name__}: {exc}", dt))
+            print(f"  [FAIL] {name}  ({dt:.2f}s)")
+            print(f"         {type(exc).__name__}: {exc}")
+            return False
+
+    print(HR)
+    print("  大肥鱼 自检（打包版）")
+    print(HR)
+    print(f"  版本    : ", end="")
+    try:
+        from bigfish.updater import __version__
+        print(__version__)
+    except Exception:
+        print("?")
+    print(f"  打包    : {getattr(sys, 'frozen', False)}")
+    print(f"  管理员  : {is_admin()}")
+    print(f"  安装目录: {_APP_DIR}")
+    print(f"  界面目录: {UI_DIR}")
+    print(f"  桥接目录: {BRIDGE_DIR}")
+
+    # 1. 灵魂
+    def t_soul():
+        from bigfish.soul import load_soul
+        s = load_soul()
+        p = s.render_persona()
+        assert s.name and p
+        return f"{s.name} rev{s.revision}，人格 {len(p)} 字符"
+    print()
+    print("工厂自检")
+    print("-" * 66)
+    item("灵魂", t_soul)
+
+    # 2. 心情
+    def t_mood():
+        from bigfish.bridge_client import load_mood_only
+        m = load_mood_only()
+        assert m and m.value is not None
+        return f"{m.label} {m.value:.1f}"
+    item("心情", t_mood)
+
+    # 3. 记忆
+    def t_mem():
+        import glob
+        import sqlite3
+        import shutil
+
+        from bigfish.bridge_client import _default_data_root, _pick_scope_dir
+        root = _default_data_root()
+        assert root, "找不到 dataRoot"
+        scope = _pick_scope_dir(root)
+        assert scope, "找不到 scope"
+        dbs = glob.glob(os.path.join(scope, "memory-*.sqlite3"))
+        assert dbs, "找不到记忆库"
+        tmp = os.path.abspath(os.path.join(_APP_DIR, ".tmp",
+                                           "exe_selftest.sqlite3"))
+        os.makedirs(os.path.dirname(tmp), exist_ok=True)
+        shutil.copyfile(dbs[0], tmp)
+        conn = sqlite3.connect(tmp)
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        finally:
+            conn.close()
+        assert n > 0, "记忆库为空"
+        return f"库里 {n} 条"
+    item("记忆", t_mem)
+
+    # 4. 模型
+    def t_model():
+        from bigfish.replier import ModelConfig, call_model
+        c = ModelConfig.load()
+        assert c.ready, f"模型未就绪 {c.endpoint}"
+        r = call_model(c, "你叫大肥鱼。", "回两个字")
+        assert r
+        return f"{c.model} -> {r[:20]!r}"
+    item("模型", t_model)
+
+    # 5. 数据库
+    disk_db = {}
+
+    def t_db():
+        from bigfish.wechat import WeChatReader
+        r = WeChatReader().open()
+        disk_db["r"] = r
+        info = r.self_info()
+        return (f"{info.get('nick_name')}，"
+                f"密钥 {len(r._db._keys)}/{len(r._db._db_files)}")
+    item("微信数据库", t_db)
+
+    # 6. 会话
+    def t_chats():
+        r = disk_db.get("r")
+        assert r, "数据库未就绪"
+        rows = r.sessions(limit=5)
+        assert rows
+        return f"{len(rows)} 个会话，首个「{rows[0]['name']}」"
+    item("会话读取", t_chats)
+
+    # 7. UIA
+    def t_uia():
+        if not is_admin():
+            raise RuntimeError("非管理员，UIA 需要提权")
+        from bigfish.wechat_sender import UiaSender
+        s = UiaSender()
+        s.wake()
+        cur = s.current_chat()
+        if not cur:
+            s.open_chat("文件传输助手")
+            time.sleep(0.5)
+            cur = s.current_chat()
+        assert cur, "读不到当前会话"
+        return f"热激活成功，当前 {cur!r}"
+    item("UIA 热激活", t_uia)
+
+    # 汇总
+    nok = sum(1 for r in results if r[1] == "OK")
+    nfail = sum(1 for r in results if r[1] == "FAIL")
+    print()
+    print(HR)
+    print(f"  通过 {nok} / 失败 {nfail}")
+    if nfail:
+        for name, st, detail, dt in results:
+            if st == "FAIL":
+                print(f"    {name}: {detail}")
+        print("  ✗ 有失败项")
+        return 1
+    print("  ✓ 全部通过")
+    print(HR)
+    return 0
 
 
 if __name__ == "__main__":

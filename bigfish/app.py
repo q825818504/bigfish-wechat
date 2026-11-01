@@ -25,7 +25,12 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+for _s in (sys.stdout, sys.stderr):
+    if _s is not None:
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)

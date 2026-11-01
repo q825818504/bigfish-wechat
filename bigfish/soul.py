@@ -188,7 +188,12 @@ def load_soul(data_root: Optional[str] = None) -> Soul:
 
 if __name__ == "__main__":
     import sys
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    for _s in (sys.stdout, sys.stderr):
+        if _s is not None:
+            try:
+                _s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     s = load_soul()
     print(f"来源: {s.source_path}")
     print(f"revision: {s.revision}")

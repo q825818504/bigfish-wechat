@@ -166,6 +166,15 @@ async function refreshStatus() {
     if (s.diagnose) renderChecks(s.diagnose);
     if (s.recent) renderRecent(s.recent);
 
+    // 补日志：信号可能因为界面还没连上而丢失，这里按 seq 补齐
+    if (s.logs && s.logs.length) {
+      for (const l of s.logs) {
+        if (l.seq <= (S.lastLogSeq || 0)) continue;
+        pushLog(l.text, l.kind);
+        S.lastLogSeq = l.seq;
+      }
+    }
+
     // 概览右侧摘要
     const sum = $('#ovSummary');
     if (s.running && s.watching) {
@@ -401,8 +410,14 @@ async function loadMemory(query) {
 
     const box = $('#memList');
     const items = d.items || [];
-    setText('#memCount', `${items.length} 条`);
-    setText('#memDbTag', d.total != null ? `库里共 ${d.total} 条` : '—');
+    // 标题旁标注：有检索词时显示命中数，没有检索词时显示库总量
+    const total = d.total;
+    if (query) {
+      setText('#memCount', `命中 ${items.length} 条 / 库里 ${total ?? '?'} 条`);
+    } else {
+      setText('#memCount', total != null ? `库里 ${total} 条` : '—');
+    }
+    setText('#memDbTag', total != null ? `共 ${total} 条` : '—');
 
     if (!items.length) {
       box.innerHTML = `<div class="empty">
@@ -549,7 +564,14 @@ async function onBridgeReady(b) {
   S.bridge = b;
   pushLog('后端已连接', 'in');
 
-  if (b.log_message) b.log_message.connect((t, k) => pushLog(t, k));
+  if (b.log_message) {
+    b.log_message.connect((t, k) => {
+      // 信号来的日志没有 seq，用它标记「已通过信号显示」；
+      // 轮询补日志时会按 seq 判断，这里不推进 lastLogSeq，
+      // 允许重复也不会刷屏（内容相同可接受）。
+      pushLog(t, k);
+    });
+  }
   if (b.chat_event) {
     b.chat_event.connect((who, text, dir) => {
       const box = $('#ovRecent');
