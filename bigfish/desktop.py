@@ -1844,9 +1844,28 @@ def main() -> int:
     QApplication.setAttribute(
         getattr(Qt, "AA_ShareOpenGLContexts", Qt.ApplicationAttribute.AA_ShareOpenGLContexts),
         True)
+
+    # Windows 任务栏分组：不设这个，任务栏会把我们当成通用 Python 程序，
+    # 图标可能退回成 python.exe 那个。设了之后任务栏用的是 exe 里嵌的图标。
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "bigfish.wechat.1")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("大肥鱼")
     app.setOrganizationName("bigfish")
+    # 再设一次应用级图标：窗口图标在 MainWindow 里设，
+    # 但对话框、任务栏预览等由应用默认图标兜底。
+    _ico = os.path.join(UI_DIR, "icon.ico")
+    if os.path.isfile(_ico):
+        app.setWindowIcon(QIcon(_ico))
+    elif os.path.isfile(os.path.join(UI_DIR, "icon.png")):
+        app.setWindowIcon(QIcon(os.path.join(UI_DIR, "icon.png")))
 
     # 启动时确保数据目录和灵魂存在 —— 用户可能一次都没配过。
     # 失败不拦启动：界面上「数据目录」页会把原因显示出来。
