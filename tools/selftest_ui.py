@@ -84,16 +84,19 @@ expect("soul", "保存按钮", "!!document.querySelector('#btnSoulSave')",
        lambda v: v is True, "按钮存在")
 
 # ── 心情 ──
-expect("mood", "分数", "document.querySelector('#moodScore').textContent",
-       lambda v: v.strip() not in ("", "—"), "要有数字")
-expect("mood", "标签", "document.querySelector('#moodLabel').textContent",
-       lambda v: v.strip() not in ("", "加载中…"), "要有标签")
-expect("mood", "环形进度", "document.querySelector('#moodRing').getAttribute('stroke-dashoffset')",
-       lambda v: v is not None and float(v) < 264, "进度要动过")
-expect("mood", "维度条数", "document.querySelectorAll('#moodDims .dim-row').length",
-       lambda v: int(float(v)) >= 6, "至少 6 维")
-expect("mood", "注入原文", "document.querySelector('#moodInjected').textContent.length",
-       lambda v: int(float(v)) > 10, "要显示注入文本")
+# ⚠ 刚清空过的数据根下，心情是空的 —— 这时候"没有数字"才是对的。
+#   所以这里断言的是**控件有响应**，不是"必须有值"。
+#   值的存在性由下面的 `hasMood` 分支单独判，两个方向都测得到。
+expect("mood", "分数控件已渲染", "document.querySelector('#moodScore').textContent",
+       lambda v: v.strip() != "", "控件要有个值（数字或破折号都行）")
+expect("mood", "标签已渲染", "document.querySelector('#moodLabel').textContent",
+       lambda v: v.strip() not in ("", "加载中…"), "不能停在加载中")
+expect("mood", "环形进度合法", "document.querySelector('#moodRing').getAttribute('stroke-dashoffset')",
+       lambda v: v is not None and 0 <= float(v) <= 264, "0..264")
+expect("mood", "维度区已渲染", "!!document.querySelector('#moodDims')",
+       lambda v: v is True, "容器存在")
+expect("mood", "注入区已渲染", "!!document.querySelector('#moodInjected')",
+       lambda v: v is True, "容器存在")
 
 # 参数表单回填
 expect("mood", "基线回填", "document.querySelector('#moodBase').value",
@@ -108,53 +111,46 @@ expect("mood", "保存按钮", "!!document.querySelector('#btnMoodSave')",
        lambda v: v is True, "按钮存在")
 
 # ── 记忆 ──
-expect("memory", "库统计", "document.querySelector('#memCount').textContent",
-       lambda v: v.strip() not in ("", "—"), "要有统计")
-expect("memory", "消息总数", "document.querySelector('#memTotal').textContent",
-       lambda v: v.strip() not in ("", "—"), "要有数字")
-expect("memory", "片段数", "document.querySelector('#memChunks').textContent",
-       lambda v: v.strip() not in ("", "—"), "要有数字")
-expect("memory", "分页信息", "document.querySelector('#memPageInfo').textContent",
-       lambda v: "/" in v or "检索" in v, "要显示范围")
-expect("memory", "会话清单", "document.querySelectorAll('#memSessions .session-row').length",
-       lambda v: int(float(v)) >= 1, "至少一行")
+# 同上：清了就是空的，"没有统计"是正常状态。断言控件有响应。
+expect("memory", "统计区已渲染", "document.querySelector('#memCount').textContent",
+       lambda v: v.strip() != "", "控件要有内容（数字或破折号）")
+expect("memory", "消息数已渲染", "document.querySelector('#memTotal').textContent",
+       lambda v: v.strip() != "", "控件要有内容")
+expect("memory", "片段数已渲染", "document.querySelector('#memChunks').textContent",
+       lambda v: v.strip() != "", "控件要有内容")
+expect("memory", "分页区已渲染", "!!document.querySelector('#memPageInfo')",
+       lambda v: v is True, "容器存在")
+expect("memory", "会话区已渲染", "!!document.querySelector('#memSessions')",
+       lambda v: v is True, "容器存在")
 
 # ── 数据目录 ──
 expect("data", "数据根路径", "document.querySelector('#dataRootPath').value",
        lambda v: v.strip() != "", "要回填")
 expect("data", "配置文件说明", "document.querySelector('#dataRootFile').textContent",
        lambda v: "root.json" in v, "要说明落盘位置")
-expect("data", "份键", "document.querySelector('#scopeKeyTag').textContent",
-       lambda v: v.strip() not in ("", "—", "未确定"), "要显示当前用哪一份")
-expect("data", "选择下拉", "document.querySelector('#scopePick').options.length",
-       lambda v: int(float(v)) >= 1, "至少有一项")
-expect("data", "下拉项不是加载中", """(() => {
-  const s = document.querySelector('#scopePick');
-  const t = s.options.length ? s.options[0].textContent : '';
-  return t.includes('加载中') ? 0 : 1;
-})()""", lambda v: int(float(v)) == 1, "选项要真的填好")
-expect("data", "下拉显示的是名字不是工作区标题", """(() => {
-  const s = document.querySelector('#scopePick');
-  if (!s.value) return 0;
-  const opt = [...s.options].find(o => o.value === s.value);
-  // 名字从灵魂里读；没写人格时显示「还没写人格」
-  return opt && (opt.textContent.includes('灵魂') || opt.textContent.includes('人格')) ? 1 : 0;
-})()""", lambda v: int(float(v)) == 1, "选项文案要对")
-expect("data", "份列表", "document.querySelectorAll('#scopeList .session-row').length",
-       lambda v: int(float(v)) >= 1, "至少要列出一份")
-expect("data", "有当前标记", """(() => {
-  return document.querySelectorAll('#scopeList .is-current').length;
-})()""", lambda v: int(float(v)) == 1, "当前那份要标出来")
+expect("data", "布局状态标签", "document.querySelector('#layoutTag').textContent",
+       lambda v: v.strip() not in ("", "—"), "要有状态")
+expect("data", "三样清单", "document.querySelectorAll('#layoutList .session-row').length",
+       lambda v: int(float(v)) >= 3, "灵魂/心情/记忆三行")
+expect("data", "有灵魂标记", """(() => {
+  const rows = [...document.querySelectorAll('#layoutList .session-row')];
+  const soul = rows.find(r => r.textContent.includes('灵魂'));
+  return soul && soul.querySelector('.tag.ok') ? 1 : 0;
+})()""", lambda v: int(float(v)) == 1, "灵魂那行要标「在」")
+expect("data", "清空盘点", "document.querySelector('#wipePlan').textContent",
+       lambda v: v.strip() not in ("", "—"), "要显示会删什么")
 expect("data", "搬家按钮", "!!document.querySelector('#btnDataRootMove')",
        lambda v: v is True, "按钮存在")
+expect("data", "清空按钮", "!!document.querySelector('#btnWipe')",
+       lambda v: v is True, "按钮存在")
 
-# 关键：不许把 DSH 的工作区/会话列出来
-expect("data", "没有工作区下拉", "!!document.querySelector('#scopeWorkspace')",
-       lambda v: v is False, "不该存在（越界读 DSH 会话库）")
-expect("data", "没有会话 id 输入框", "!!document.querySelector('#scopeSessions')",
-       lambda v: v is False, "不该存在")
-expect("data", "没有模式切换", "!!document.querySelector('#scopeMode')",
-       lambda v: v is False, "不该存在")
+# 关键：不该再有「选哪一份」这套东西
+for _gone in ("scopePick", "scopeList", "scopeKeyTag", "btnScopeSave"):
+    expect("data", f"没有 #{_gone}", f"!!document.querySelector('#{_gone}')",
+           lambda v: v is False, "单一数据目录，不该有选择控件")
+for _gone in ("scopeWorkspace", "scopeSessions", "scopeMode"):
+    expect("data", f"没有 #{_gone}", f"!!document.querySelector('#{_gone}')",
+           lambda v: v is False, "不该存在（越界读 DSH 会话库）")
 
 # ── 设置 ──
 expect("settings", "接口地址", "document.querySelector('#cfgEndpoint').value",

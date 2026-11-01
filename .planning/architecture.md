@@ -157,4 +157,29 @@ session scope 过滤。Python 重写必然产生偏差，结果是
 | 灵魂 | `soul-*.json` | 同上（整卡，含 locked 保护与 revision 并发校验） |
 | 心情 | `mood-*.json` + `bigfish-mood/config.json` | 配置参数 + 状态重置 |
 | 记忆 | `memory-*.sqlite3` | 删消息/删会话/导出/导入/VACUUM |
-| 数据目录 | `root.json` + `scope.json` + 范围目录扫描 | 改数据根、搬家、切范围 |
+| 数据目录 | `root.json` + 数据根三件套 | 改数据根、搬家、迁移老布局、清空 |
+
+---
+
+## 存储布局：一个数据目录 = 一份
+
+```
+<数据根>/                     ← root.json 里的 dataRoot
+  ├── soul.json               她是谁
+  ├── mood.json               此刻怎样
+  └── memory.sqlite3          她记得什么
+```
+
+没有「范围」这个概念。换数据根 = 换一个人。
+
+**老布局兼容**（`<数据根>/ws-<uuid>/soul-ws-xx.json` 那套）：
+- `legacy_layout()` 找出"有灵魂的那一份"（带灵魂才算真正在用）；
+- `existing_path()` 新布局没有就顺着老路径读；
+- `migrate_legacy()` 由用户点按钮迁移，不自动做。
+
+**为什么保留兼容而不是直接删老的**：
+用户的老数据可能是几个月攒下来的。升级一次就"记忆全没了"是不可接受的，
+哪怕技术上更干净。所以读要兼容，写只走新路径。
+
+**清空的顺序**：盘点 → 备份 → 删。备份失败就中止，什么都不删。
+灵魂永远保留（`keep_soul=True`）—— 清记忆不等于洗掉人格。

@@ -76,35 +76,6 @@ def section(title: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
-def test_scope_key() -> None:
-    section("范围键（与 scope-key.js 对齐）")
-
-    check("工作区键", vault.scope_key("workspace", "abc-123") == "ws-abc-123")
-    check("空工作区 → 空串", vault.scope_key("workspace", "") == "")
-    check("会话键取排序第一个",
-          vault.scope_key("session", "", ["z", "a", "m"]) == "ss-a")
-    check("空会话 → 空串", vault.scope_key("session", "", []) == "")
-    check("未知模式 → 空串", vault.scope_key("nope", "x") == "")
-
-    check("短键截 16 位",
-          vault.short_key("ws-83ba9d80-ec53-4a24-9245-7ce877a74e70")
-          == "ws-83ba9d80-ec53")
-    check("短键只留字母数字下划线横线",
-          vault.short_key("ws-a/b\\c*d e-f") == "ws-abcde-f",
-          repr(vault.short_key("ws-a/b\\c*d e-f")))
-
-    root = r"D:\x"
-    check("灵魂路径",
-          vault.scope_file_path(root, "ws-83ba9d80-ec53-aaaa", "soul")
-          == os.path.join(root, "ws-83ba9d80-ec53-aaaa", "soul-ws-83ba9d80-ec53.json"),
-          vault.scope_file_path(root, "ws-83ba9d80-ec53-aaaa", "soul"))
-    check("记忆路径结尾",
-          vault.scope_file_path(root, "ws-1", "memory").endswith("memory-ws-1.sqlite3"))
-    check("心情路径结尾",
-          vault.scope_file_path(root, "ws-1", "mood").endswith("mood-ws-1.json"))
-    check("空键 → 空路径", vault.scope_file_path(root, "", "soul") == "")
-
-
 # ══════════════════════════════════════════════════════════════════════
 def test_soul_normalize() -> None:
     section("灵魂归一化（与 normalizeSoul 对齐）")
@@ -224,64 +195,6 @@ def test_soul_io(tmp: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
-def test_scope_io(tmp: str) -> None:
-    section("scope.json 读写")
-
-    root = os.path.join(tmp, "root")
-    os.makedirs(root, exist_ok=True)
-
-    check("没有 scope.json 时返回 None", vault.read_scope(root) is None)
-
-    ok, err = vault.write_scope(root, "workspace", "")
-    check("工作区模式缺 id → 拒绝", not ok, err)
-
-    ok, err = vault.write_scope(root, "session", "", [])
-    check("会话模式缺 id → 拒绝", not ok)
-
-    ok, err = vault.write_scope(root, "nope", "x")
-    check("非法模式 → 拒绝", not ok)
-
-    ok, err = vault.write_scope(root, "workspace", "uuid-1")
-    check("工作区模式写入成功", ok, err)
-
-    sc = vault.read_scope(root)
-    check("读回 mode", sc and sc["mode"] == "workspace")
-    check("读回 workspaceId", sc and sc["workspaceId"] == "uuid-1")
-    check("updatedAt 是毫秒", sc and sc["updatedAt"] > 1_000_000_000_000,
-          str(sc and sc["updatedAt"]))
-
-    ok, _ = vault.write_scope(root, "session", "", ["s2", "s1", "s1"])
-    sc = vault.read_scope(root)
-    check("会话 id 去重排序", sc["sessionIds"] == ["s1", "s2"], str(sc["sessionIds"]))
-
-    # 损坏的 scope.json → None（不能崩）
-    with open(os.path.join(root, "scope.json"), "w", encoding="utf-8") as f:
-        f.write("not json")
-    check("损坏 scope.json → None", vault.read_scope(root) is None)
-
-
-def test_infer_scope(tmp: str) -> None:
-    section("范围推导兜底（与 inferScopeKey 对齐）")
-
-    root = os.path.join(tmp, "root2")
-    os.makedirs(root, exist_ok=True)
-    check("空目录 → 空串", vault.infer_scope_key(root) == "")
-
-    os.makedirs(os.path.join(root, "ws-a"))
-    check("只有一个范围 → 直接用它", vault.infer_scope_key(root) == "ws-a")
-
-    os.makedirs(os.path.join(root, "ws-b"))
-    os.makedirs(os.path.join(root, "ss-c"))
-    # ws-a / ws-b / ss-c 都是空的，应该按 mtime 取最新
-    with open(os.path.join(root, "ws-b", "soul-ws-b.json"), "w") as f:
-        f.write("{}")
-    check("有灵魂的优先", vault.infer_scope_key(root) == "ws-b")
-
-    with open(os.path.join(root, "ss-c", "mood-ss-c.json"), "w") as f:
-        f.write("{}")
-    check("灵魂优先于心情", vault.infer_scope_key(root) == "ws-b")
-
-
 # ══════════════════════════════════════════════════════════════════════
 def test_mood_config(tmp: str, home: str) -> None:
     section("心情配置读写（未知字段必须原样保留）")
@@ -299,7 +212,7 @@ def test_mood_config(tmp: str, home: str) -> None:
     # 写一份带未知字段的配置
     os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
     with open(cfg_path, "w", encoding="utf-8") as f:
-        json.dump({"moodBase": 55, "dataRoot": r"D:\保留我", "weird": {"a": 1}}, f)
+        json.dump({"moodBase": 55, "dataRoot": r"D:\保留我", "weird": {"a": 1}}, f, ensure_ascii=False)
 
     ok, out, err = vault.write_mood_config({"moodBase": 62})
     check("写入成功", ok, err)
@@ -327,19 +240,131 @@ def test_mood_config(tmp: str, home: str) -> None:
     check("autoJudge False 生效", out["autoJudge"] is False)
 
 
+def test_layout(tmp: str, home: str) -> None:
+    section("存储布局（一个数据根 = 一份）")
+
+    os.environ["DSH_HOME"] = home
+    root = os.path.join(tmp, "layoutroot")
+    os.makedirs(root, exist_ok=True)
+
+    check("soul 路径", vault.soul_path(root) == os.path.join(root, "soul.json"))
+    check("mood 路径", vault.mood_path(root) == os.path.join(root, "mood.json"))
+    check("memory 路径", vault.memory_path(root) == os.path.join(root, "memory.sqlite3"))
+
+    # 新布局什么都没有时，existing_path 返回新路径（写下去会创建）
+    check("空的根 → existing 给新路径",
+          vault.existing_path(root, "soul") == os.path.join(root, "soul.json"))
+    check("空的根 → 没有老布局", vault.legacy_layout(root) is None)
+
+    # 造一份老布局（带灵魂的那份才是"她"）
+    lg_key = "ws-83ba9d80-ec53-4a24-9245-7ce877a74e70"
+    lg_dir = os.path.join(root, lg_key)
+    os.makedirs(lg_dir, exist_ok=True)
+    with open(os.path.join(lg_dir, "soul-ws-83ba9d80-ec53.json"), "w", encoding="utf-8") as f:
+        json.dump({"identity": {"name": "老她", "whoIAm": "老内容"}}, f, ensure_ascii=False)
+    with open(os.path.join(lg_dir, "mood-ws-83ba9d80-ec53.json"), "w", encoding="utf-8") as f:
+        json.dump({"version": 2, "moods": {}}, f, ensure_ascii=False)
+
+    lg = vault.legacy_layout(root)
+    check("发现老布局", lg is not None and lg["key"] == lg_key, str(lg))
+    check("老布局认出 soul", bool((lg or {}).get("soul")))
+    check("老布局认出 mood", bool((lg or {}).get("mood")))
+
+    # 新布局没有 → 顺着老路径读
+    check("existing 回落到老 soul",
+          vault.existing_path(root, "soul").endswith("soul-ws-83ba9d80-ec53.json"),
+          vault.existing_path(root, "soul"))
+
+    # 迁移：把老的那份搬成新的
+    ok, err, done = vault.migrate_legacy(root)
+    check("迁移成功", ok, err)
+    check("新 soul.json 生成", os.path.isfile(os.path.join(root, "soul.json")))
+    # ⚠ 必须显式 encoding="utf-8"：Windows 默认 GBK，读 UTF-8 文件会抛
+    #   UnicodeDecodeError（或更糟：静默读出乱码让断言假失败）。
+    with open(os.path.join(root, "soul.json"), "r", encoding="utf-8") as f:
+        migrated = json.load(f)
+    check("迁移后名字对",
+          migrated.get("identity", {}).get("name") == "老她", str(migrated)[:80])
+    check("迁移记录了三件事", len([d for d in done if "搬" in d or "跳过" in d]) >= 2,
+          str(done))
+
+    # 已经有了就不覆盖
+    ok2, err2, done2 = vault.migrate_legacy(root)
+    check("再迁一次不覆盖",
+          any("已存在" in d for d in done2), str(done2))
+
+    # 新布局优先
+    check("existing 优先新路径",
+          vault.existing_path(root, "soul") == os.path.join(root, "soul.json"))
+
+
+def test_wipe(tmp: str, home: str) -> None:
+    section("清空（灵魂保留，其余删掉，先备份）")
+
+    os.environ["DSH_HOME"] = home
+    root = os.path.join(tmp, "wiperoot")
+    os.makedirs(root, exist_ok=True)
+
+    with open(os.path.join(root, "soul.json"), "w", encoding="utf-8") as f:
+        json.dump({"identity": {"name": "要被保留的"}}, f, ensure_ascii=False)
+    with open(os.path.join(root, "mood.json"), "w", encoding="utf-8") as f:
+        json.dump({"version": 2, "moods": {"x": {"mood": 30}}}, f, ensure_ascii=False)
+    with open(os.path.join(root, "memory.sqlite3"), "w", encoding="utf-8") as f:
+        f.write("fake db")
+    with open(os.path.join(root, "memory.sqlite3-wal"), "w", encoding="utf-8") as f:
+        f.write("fake wal")
+    # 老布局残留
+    lg = os.path.join(root, "ws-dead")
+    os.makedirs(lg, exist_ok=True)
+    with open(os.path.join(lg, "memory-ws-dead.sqlite3"), "w", encoding="utf-8") as f:
+        f.write("old")
+    with open(os.path.join(root, "scope.json"), "w", encoding="utf-8") as f:
+        json.dump({"mode": "workspace"}, f, ensure_ascii=False)
+
+    plan = vault.inspect_wipe(root, keep_soul=True)
+    check("盘点成功", plan.ok, plan.error)
+    names = [i["name"] for i in plan.items]
+    check("盘点看到 soul.json", "soul.json" in names, str(names))
+    check("盘点看到老目录", any(n.startswith("ws-dead") for n in names), str(names))
+    check("soul 标为保留",
+          any(i["name"] == "soul.json" and i["action"] == "保留" for i in plan.items),
+          str(plan.items))
+    check("mood 标为删除",
+          any(i["name"] == "mood.json" and i["action"] == "删除" for i in plan.items))
+
+    ok, err, backup = vault.apply_wipe(root, keep_soul=True, backup_first=True)
+    check("清空成功", ok, err)
+    check("生成了备份目录", bool(backup) and os.path.isdir(backup), backup)
+    check("备份里有 soul", os.path.isfile(os.path.join(backup, "soul.json")))
+    check("备份里有老目录", os.path.isdir(os.path.join(backup, "ws-dead")))
+
+    check("soul.json 还在", os.path.isfile(os.path.join(root, "soul.json")))
+    with open(os.path.join(root, "soul.json"), "r", encoding="utf-8") as f:
+        kept = json.load(f)
+    check("soul 内容没变",
+          kept.get("identity", {}).get("name") == "要被保留的", str(kept)[:80])
+    check("mood.json 已删", not os.path.exists(os.path.join(root, "mood.json")))
+    check("memory 已删", not os.path.exists(os.path.join(root, "memory.sqlite3")))
+    check("memory-wal 已删", not os.path.exists(os.path.join(root, "memory.sqlite3-wal")))
+    check("老目录已删", not os.path.exists(lg))
+    check("scope.json 已删", not os.path.exists(os.path.join(root, "scope.json")))
+
+    # 清完再盘点应该只剩 soul
+    plan2 = vault.inspect_wipe(root, keep_soul=True)
+    check("清完只剩 soul 需保留", plan2.total_bytes == 0, str(plan2.total_bytes))
+
+
 def test_mood_reset(tmp: str, home: str) -> None:
     section("心情重置")
 
     os.environ["DSH_HOME"] = home
     root = os.path.join(tmp, "moodroot")
-    key = "ws-moodtest"
-    d = os.path.join(root, key)
-    os.makedirs(d, exist_ok=True)
-    p = os.path.join(d, "mood-ws-moodtest.json")
+    os.makedirs(root, exist_ok=True)
+    p = os.path.join(root, "mood.json")
 
     state = {
         "version": 2,
-        "moods": {key: {
+        "moods": {"seat": {
             "mood": 23,
             "dims": {"happy": 0.8, "calm": 0.1, "sweet": 0.3,
                      "heartache": 0.5, "worry": 0.4, "sad": 0.6, "jealous": 0.2},
@@ -348,10 +373,10 @@ def test_mood_reset(tmp: str, home: str) -> None:
             "timeline": [{"at": 1, "mood": 23}],
             "updatedAt": 111,
         }},
-        "lastActive": key,
+        "lastActive": "seat",
     }
     with open(p, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+        json.dump(state, f, ensure_ascii=False)
 
     vault.write_data_root(root)
     ok, err = vault.reset_mood()
@@ -359,7 +384,7 @@ def test_mood_reset(tmp: str, home: str) -> None:
 
     with open(p, "r", encoding="utf-8") as f:
         after = json.load(f)
-    slot = after["moods"][key]
+    slot = after["moods"]["seat"]
     cfg = vault.read_mood_config()
     check("mood 回到基线", slot["mood"] == cfg["moodBase"], str(slot["mood"]))
     check("dims 全部归零", all(v == 0 for v in slot["dims"].values()), str(slot["dims"]))
@@ -506,9 +531,9 @@ def test_move(tmp: str, home: str) -> None:
     dst = os.path.join(tmp, "move-dst")
     os.makedirs(os.path.join(src, "ws-x"), exist_ok=True)
     with open(os.path.join(src, "ws-x", "soul-ws-x.json"), "w", encoding="utf-8") as f:
-        json.dump({"identity": {"name": "搬家测试"}}, f)
+        json.dump({"identity": {"name": "搬家测试"}}, f, ensure_ascii=False)
     with open(os.path.join(src, "scope.json"), "w", encoding="utf-8") as f:
-        json.dump({"mode": "workspace", "workspaceId": "x"}, f)
+        json.dump({"mode": "workspace", "workspaceId": "x"}, f, ensure_ascii=False)
 
     vault.write_data_root(src)
 
@@ -543,30 +568,6 @@ def test_move(tmp: str, home: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
-def test_list_scopes(tmp: str, home: str) -> None:
-    section("范围列表")
-
-    os.environ["DSH_HOME"] = home
-    root = os.path.join(tmp, "listroot")
-    os.makedirs(os.path.join(root, "ws-one"), exist_ok=True)
-    os.makedirs(os.path.join(root, "ws-two"), exist_ok=True)
-    with open(os.path.join(root, "ws-one", "soul-ws-one.json"), "w",
-              encoding="utf-8") as f:
-        json.dump({"identity": {"name": "一号"}}, f)
-    with open(os.path.join(root, "ws-two", "mood-ws-two.json"), "w") as f:
-        f.write("{}")
-
-    rows = vault.list_scopes(root)
-    check("列出 2 个范围", len(rows) == 2, str(len(rows)))
-    one = next(r for r in rows if r["key"] == "ws-one")
-    two = next(r for r in rows if r["key"] == "ws-two")
-    check("ws-one 有灵魂", one["has_soul"] is True)
-    check("ws-one 无记忆", one["has_memory"] is False)
-    check("ws-one 名字读到了", one["name"] == "一号", one["name"])
-    check("ws-two 有心情", two["has_mood"] is True)
-    check("ws-two 无灵魂", two["has_soul"] is False)
-
-
 # ══════════════════════════════════════════════════════════════════════
 def main() -> int:
     global FAIL
@@ -583,17 +584,15 @@ def main() -> int:
     print("=" * 66)
 
     tests = [
-        ("范围键", lambda: test_scope_key()),
         ("灵魂归一化", lambda: test_soul_normalize()),
         ("性格文案", lambda: test_trait_sentence()),
         ("灵魂读写", lambda: test_soul_io(tmp)),
-        ("scope.json", lambda: test_scope_io(tmp)),
-        ("范围推导", lambda: test_infer_scope(tmp)),
+        ("存储布局", lambda: test_layout(tmp, home)),
         ("心情配置", lambda: test_mood_config(tmp, home)),
         ("心情重置", lambda: test_mood_reset(tmp, home)),
+        ("清空", lambda: test_wipe(tmp, home)),
         ("记忆库", lambda: test_memory(tmp)),
         ("搬家", lambda: test_move(tmp, home)),
-        ("范围列表", lambda: test_list_scopes(tmp, home)),
     ]
 
     for name, fn in tests:

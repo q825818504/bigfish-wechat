@@ -76,27 +76,20 @@ def section(t: str) -> None:
     print(f"\n── {t} " + "─" * max(0, 54 - len(t)))
 
 
-def make_root(tmp: str, soul: dict, name: str = "ws-parity") -> str:
+def make_root(tmp: str, soul: dict, name: str = "parity") -> str:
     """造一个只有一份灵魂的最小数据根。
 
-    ⚠ 每个用例必须**独立一个新根**。共用一个 root/ 目录会互相污染：
-       findScope 在多个 ws-* 里挑「有灵魂且最新」的那个，
-       上一轮的目录还在，这一轮就可能读到上一轮的灵魂 ——
-       表现成「两侧不一致」，实际是夹具串了。
+    ⚠ 每个用例独立一个新根。共用一个 root/ 会互相污染 ——
+      老布局的 findScope 会在多个 ws-* 里挑「有灵魂且最新」的，
+      上一轮的目录还在，这一轮就可能读到上一轮的灵魂，
+      表现成「两侧不一致」，实际是测试夹具串了。
 
-    ⚠ 目录名与文件名的「短键」必须自洽：
-       vault 用 short_key(key) 生成文件名，取前 16 位。
+    新布局就一个文件：<root>/soul.json。
     """
     root = os.path.join(tmp, f"root-{name}")
-    d = os.path.join(root, name)
-    os.makedirs(d, exist_ok=True)
-    short = vault.short_key(name)
-    with open(os.path.join(d, f"soul-{short}.json"), "w", encoding="utf-8") as f:
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, "soul.json"), "w", encoding="utf-8") as f:
         json.dump(soul, f, ensure_ascii=False)
-    with open(os.path.join(root, "scope.json"), "w", encoding="utf-8") as f:
-        json.dump({"version": 1, "mode": "workspace",
-                   "workspaceId": name[3:] if name.startswith("ws-") else name,
-                   "sessionIds": []}, f)
     return root
 
 
@@ -121,28 +114,16 @@ def node_persona(root: str) -> str | None:
         return None
 
 
-def python_persona(root: str, key: str) -> str:
+def python_persona(root: str, key: str = "") -> str:
     """Python 侧渲染：与生产路径一致 —— 读原样内容，不补默认值。"""
-    p = os.path.join(root, key, f"soul-{vault.short_key(key)}.json")
+    p = os.path.join(root, "soul.json")
     soul, _e, _err = vault.read_soul_file(p)
     return Soul.from_dict(soul).render_persona()
 
 
-def key_of(root: str, name: str) -> str:
-    """从夹具自己的 scope.json 推出范围键。
-
-    ⚠ 不能调 vault.current_scope_key() —— 它读的是**全局** <DSH_HOME>/bigfish/root.json，
-      不是这里传进去的 root。用了就会去真实的那个数据根上找，
-      算出真实的 ws-xxx，然后拿着它去夹具目录里拼一个不存在的路径，
-      读回默认灵魂 —— 现象是"Python 侧 682 字、Node 侧 3 字"。
-    """
-    return vault.scope_key("workspace", name[3:] if name.startswith("ws-") else name)
-
-
-def compare(label: str, soul: dict, tmp: str, name: str = "ws-parity") -> None:
+def compare(label: str, soul: dict, tmp: str, name: str = "parity") -> None:
     root = make_root(tmp, soul, name=name)
-    key = key_of(root, name)
-    py = python_persona(root, key)
+    py = python_persona(root)
     js = node_persona(root)
     if js is None:
         check(f"{label}（Node 侧跳过：没有 node 或 bridge.mjs 跑不起来）", True)
@@ -167,13 +148,11 @@ def main() -> int:
     try:
         section("1 · 真实灵魂文件")
         real_root = vault.resolve_data_root()
-        real_key = vault.current_scope_key(real_root)
-        real_soul = os.path.join(
-            real_root, real_key, f"soul-{vault.short_key(real_key)}.json")
+        real_soul = vault.existing_path(real_root, "soul")
         if os.path.isfile(real_soul):
             with open(real_soul, "r", encoding="utf-8") as f:
                 soul = json.load(f)
-            compare("真实文件两侧一致", soul, tmp, name=real_key)
+            compare("真实文件两侧一致", soul, tmp, name="real")
         else:
             check("真实灵魂文件存在", False, real_soul)
 
@@ -184,10 +163,9 @@ def main() -> int:
                  "values": [{"text": "甲", "locked": True}],
                  "traits": {"warmth": v},
                  "selfNotes": ["一"]}
-            name = f"ws-b{v}"
+            name = f"b{v}"
             root = make_root(tmp, s, name=name)
-            key = key_of(root, name)
-            py = python_persona(root, key)
+            py = python_persona(root)
             sent = [l for l in py.splitlines() if "温暖" in l]
             got = sent[0] if sent else ""
             band_ok = ("克制" in got) if want == "低" else \
@@ -201,8 +179,8 @@ def main() -> int:
              "traits": {"warmth": 65, "assertiveness": 30,
                         "playfulness": 88, "directness": 50},
              "selfNotes": ["一"]}
-        root = make_root(tmp, s, name="ws-num")
-        py = python_persona(root, key_of(root, "ws-num"))
+        root = make_root(tmp, s, name="num")
+        py = python_persona(root)
         check("Python 侧无 /100", "/100" not in py, py)
         js = node_persona(root) or ""
         check("Node 侧无 /100", "/100" not in js, js)
@@ -220,9 +198,9 @@ def main() -> int:
                         "traits": {"warmth": 200, "directness": -50}},
         }
         for i, (label, s) in enumerate(edge.items()):
-            name = f"ws-e{i}"
+            name = f"e{i}"
             root = make_root(tmp, s, name=name)
-            py = python_persona(root, key_of(root, name))
+            py = python_persona(root)
             js = node_persona(root) or ""
             # 归一化只在 Python 侧做；Node 侧读的是**原始 JSON**，
             # 越界值两边会不同 —— 这是设计上接受的（bridge 只读不写，

@@ -603,37 +603,30 @@
 
         <div class="card" style="margin-top:16px">
           <div class="card-head">
-            <h2>当前用哪一份</h2>
-            <span class="tag" id="scopeKeyTag">—</span>
+            <h2>这里就是她</h2>
+            <span class="tag" id="layoutTag">—</span>
           </div>
           <div class="card-desc" style="margin-bottom:14px">
-            数据根下每有一个目录，就是一份独立的「她」。<br>
-            里面住的是谁，看那个目录里灵魂文件写的名字 —— 不是 DSH 给工作区起的标题。
+            一个数据目录 = 一份灵魂 + 一份心情 + 一份记忆。没有「选哪一份」——
+            数据目录在哪，她就在哪。
           </div>
-          <div class="form">
-            <div class="field full">
-              <label>切换到</label>
-              <select id="scopePick">
-                <option value="">（加载中…）</option>
-              </select>
-              <small id="scopePickHint">—</small>
-            </div>
+          <div class="session-list" id="layoutList">
+            <div class="empty" style="padding:12px 0"><p>读取中…</p></div>
           </div>
-          <div class="memory-toolbar" style="margin-top:14px">
-            <button class="btn btn-primary" id="btnScopeSave">用这一份</button>
-            <button class="btn btn-sm" id="btnScopeRefresh">重新读取</button>
-          </div>
-          <div class="card-desc" style="margin-top:12px" id="scopeHint"></div>
         </div>
 
         <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>数据根下有哪些份</h2></div>
-          <div class="card-desc" style="margin-bottom:12px">
-            带灵魂的那份才是能用的。点一行直接切过去。
+          <div class="card-head"><h2>清空</h2></div>
+          <div class="card-desc" style="margin-bottom:14px">
+            <strong>灵魂不动</strong>——那是「她是谁」，不是「她记得什么」。<br>
+            清掉的是心情和全部记忆。删之前会自动备份到数据目录旁边。
           </div>
-          <div class="session-list" id="scopeList">
-            <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
+          <div class="card-desc" style="margin-bottom:12px" id="wipePlan">—</div>
+          <div class="memory-toolbar">
+            <button class="btn btn-sm" id="btnWipePreview">看看会删什么</button>
+            <button class="btn btn-sm btn-danger" id="btnWipe">清空心情与记忆</button>
           </div>
+          <div class="card-desc" style="margin-top:12px" id="wipeHint"></div>
         </div>
       </section>
 

@@ -25,12 +25,12 @@ from bigfish.vault import (
     DEFAULT_ADDRESS,
     TRAIT_DOC,
     default_soul,
+    existing_path,
+    legacy_layout,
     normalize_soul,
     read_soul_file,
     resolve_data_root,
-    scope_file_path,
-    current_scope_key,
-    short_key,
+    soul_path,
     trait_sentence,
 )
 
@@ -187,44 +187,29 @@ class Soul:
 # 定位与加载
 # ----------------------------------------------------------------------
 def soul_file_path(root: Optional[str] = None, key: Optional[str] = None) -> str:
-    """当前范围的灵魂文件绝对路径（空串 = 范围未定）。"""
+    """灵魂文件路径。整个数据目录只有一份 <数据根>/soul.json。
+
+    `key` 参数留着只为兼容老调用点，已无意义。
+    新布局没有这个文件、但老布局（ws-*/*.json）有时，返回老路径 ——
+    老用户升级后还能看见自己的人格。
+    """
     root = root or resolve_data_root()
-    key = key or current_scope_key(root)
-    if not key:
+    if not root:
         return ""
-    return scope_file_path(root, key, "soul")
+    return existing_path(root, "soul")
 
 
 def find_soul_file(root: Optional[str] = None) -> Optional[str]:
-    """在数据根下找一个真正可用的灵魂文件。
-
-    解析顺序与插件一致：scope.json → 推出来的当前范围 → 那个范围的 soul 文件。
-    找不到当前范围的，再退回"有灵魂文件且最新的那个目录"（兼容从没写过 scope.json 的老部署）。
-    """
+    """找一个真正可用的灵魂文件。找不到返回 None。"""
     root = root or resolve_data_root()
-    p = soul_file_path(root)
-    if p:
-        import os
-        if os.path.isfile(p):
-            return p
-
-    # 兜底：扫所有范围目录，挑最新且有灵魂的
-    import glob
+    if not root:
+        return None
     import os
 
-    cands = glob.glob(os.path.join(root, "ws-*", "soul-*.json"))
-    cands += glob.glob(os.path.join(root, "ss-*", "soul-*.json"))
-    if not cands:
-        return None
-    # 优先当前范围（即使它的 mtime 不是最新），避免读串到别的工作区
-    key = current_scope_key(root)
-    if key:
-        short = short_key(key)
-        for c in cands:
-            if f"soul-{short}.json" in c:
-                return c
-    cands.sort(key=os.path.getmtime, reverse=True)
-    return cands[0]
+    p = existing_path(root, "soul")
+    if p and os.path.isfile(p):
+        return p
+    return None
 
 
 def load_soul(root: Optional[str] = None) -> Soul:

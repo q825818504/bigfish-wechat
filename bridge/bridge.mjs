@@ -211,14 +211,27 @@ async function main() {
   const warnings = [];
   const scopeDir = findScope(root, scope);
   // 目录名形如 ws-83ba9d80-ec53-4a24-9245-7ce877a74e70，
-  // 而文件名用的是截短 id：soul-ws-83ba9d80-ec53.json
+  // 而老布局的文件名用的是截短 id：soul-ws-83ba9d80-ec53.json
   // 所以不能拿目录名直接拼，要按目录里实际存在的文件名去匹配。
   const scopeId = scopeDir ? scopeDir.split(/[\\/]/).pop() : (scope || '');
   const shortId = scopeId.startsWith('ws-') ? scopeId.slice(0, 15) : scopeId;
 
+  /* ⭐ 存储布局：新布局一个数据根 = 一份，文件直接住在 <root>/ 下：
+   *      <root>/soul.json   <root>/mood.json   <root>/memory.sqlite3
+   *    老布局是 <root>/<ws-xxx>/soul-ws-xx.json 那套。
+   *    两个都要认 —— 用户的机器上有可能是其中任何一种。
+   *
+   *    优先新布局：那是本程序写入的地方，也是"现在生效"的那份。
+   */
+  const NEW_NAMES = { soul: 'soul.json', mood: 'mood.json', memory: 'memory.sqlite3' };
+
   function findDataFile(prefix, ext) {
+    // ① 新布局
+    const direct = join(root, NEW_NAMES[prefix] || `${prefix}.${ext}`);
+    if (existsSync(direct)) return direct;
+
+    // ② 老布局
     if (!scopeDir) return null;
-    // 先试截短 id（实际布局），再试全 id，最后扫目录
     for (const cand of [`${prefix}-${shortId}.${ext}`, `${prefix}-${scopeId}.${ext}`]) {
       const p = join(scopeDir, cand);
       if (existsSync(p)) return p;
@@ -230,30 +243,35 @@ async function main() {
     } catch { return null; }
   }
 
+  /* ⚠ 以前这里三个块都套着 `if (scopeDir)`。
+     新布局根本没有 ws-* 目录，scopeDir 是 null —— 于是灵魂、心情、记忆
+     全被跳过，静默返回空人格。findDataFile 里已经优先查新路径了，
+     这个门禁却把它挡在门外。
+     现在改成"能找到文件就处理"，布局判断交给 findDataFile。 */
+
   // ---------- soul ----------
   let soul = null;
   let persona = '';
-  if (scopeDir) {
+  {
     const soulFile = findDataFile('soul', 'json');
     soul = soulFile ? readJsonSafe(soulFile) : null;
     if (soul) persona = renderPersona(soul);
-    else warnings.push(`找不到灵魂文件 (dir=${scopeDir})`);
-  } else {
-    warnings.push(`找不到 scope 目录: root=${root} scope=${scope}`);
+    else warnings.push(`找不到灵魂文件 (root=${root}${scopeDir ? `, dir=${scopeDir}` : ''})`);
   }
 
   // ---------- mood ----------
   let mood = null;
-  if (scopeDir) {
+  {
     const moodFile = findDataFile('mood', 'json');
     const moodJson = moodFile ? readJsonSafe(moodFile) : null;
-    mood = extractMood(moodJson, scopeId);
+    // 新布局的 mood.json 是按范围键存 moods 的；取 lastActive 或第一个
+    mood = extractMood(moodJson, scopeId || (moodJson && moodJson.lastActive) || '');
     if (!mood) warnings.push('找不到可用情绪状态');
   }
 
   // ---------- memory ----------
   let memory = null;
-  if (query && scopeDir) {
+  if (query) {
     const MemoryStore = await loadMemoryStore(root, scopeId);
     if (MemoryStore) {
       const dbPath = findDataFile('memory', 'sqlite3');

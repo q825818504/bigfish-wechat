@@ -95,162 +95,74 @@ def write_data_root(path: str) -> Tuple[bool, str]:
 
 
 def scope_store_path(root: str) -> str:
+    """老版本的 scope.json 路径。
+
+    ⚠ 现在**不再读写它**。留着这个函数只为两件事：
+      1. 「数据目录」页提示用户"这个目录里还留着老的 scope.json"；
+      2. 迁移时把它一起清掉。
+    新布局没有"范围"这个概念 —— 一个数据根就是一份。
+    """
     return os.path.join(root, "scope.json") if root else ""
-
-
-def read_scope(root: str) -> Optional[Dict[str, Any]]:
-    """读 scope.json；没有或损坏返回 None。"""
-    p = scope_store_path(root)
-    if not p or not os.path.isfile(p):
-        return None
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            return None
-        mode = raw.get("mode")
-        if mode not in ("workspace", "session"):
-            return None
-        ids = raw.get("sessionIds")
-        ids = [str(x).strip() for x in ids if str(x or "").strip()] if isinstance(ids, list) else []
-        return {
-            "mode": mode,
-            "workspaceId": str(raw.get("workspaceId") or "").strip(),
-            "sessionIds": sorted(set(ids)),
-            "updatedAt": int(raw.get("updatedAt") or 0),
-        }
-    except Exception:
-        return None
-
-
-def write_scope(root: str, mode: str, workspace_id: str = "",
-                session_ids: Optional[List[str]] = None) -> Tuple[bool, str]:
-    if not root:
-        return False, "数据根为空"
-    if mode not in ("workspace", "session"):
-        return False, "mode 只能是 workspace 或 session"
-    wid = str(workspace_id or "").strip()
-    sids = sorted({str(x).strip() for x in (session_ids or []) if str(x or "").strip()})
-    if mode == "workspace" and not wid:
-        return False, "工作区模式需要填工作区 UUID"
-    if mode == "session" and not sids:
-        return False, "会话模式至少要选一个会话"
-    body = {
-        "version": 1,
-        "mode": mode,
-        "workspaceId": wid,
-        "sessionIds": sids,
-        "updatedAt": int(time.time() * 1000),
-    }
-    try:
-        os.makedirs(root, exist_ok=True)
-        _atomic_write_json(scope_store_path(root), body)
-        return True, ""
-    except Exception as exc:
-        return False, str(exc)
 
 
 # ── 范围键 → 文件路径（scope-key.js 的 Python 版） ──────────────────────
 
 
-def scope_key(mode: str, workspace_id: str = "",
-              session_ids: Optional[List[str]] = None) -> str:
-    if mode == "workspace":
-        wid = str(workspace_id or "").strip()
-        return f"ws-{wid}" if wid else ""
-    if mode == "session":
-        ids = sorted({str(x).strip() for x in (session_ids or []) if str(x or "").strip()})
-        return f"ss-{ids[0]}" if ids else ""
-    return ""
+# ── 存储布局：一个数据根 = 一份 ─────────────────────────────────────────
+#
+# 以前这里是「按范围分家」：<数据根>/ws-<uuid>/soul-*.json 之类，
+# 一个数据根下可以有很多份，靠 scope.json 指定当前用哪个。
+#
+# 那是从 DSH 插件那边继承下来的模型 —— 插件要给「不同工作区」配不同的伙伴，
+# 所以必须分家。但微信只有一个身份：她就是她，不该有"这份记忆"和"那份记忆"。
+#
+# 用户说得直接：
+#   「记忆、灵魂、心情都只有一份，选择数据目录在哪，就以哪个为准」
+#
+# 所以现在固定成一个文件组，直接住在数据根下：
+#
+#   <数据根>/soul.json
+#   <数据根>/mood.json
+#   <数据根>/memory.sqlite3
+#
+# ⚠ 兼容：老的 ws-*/ss-* 目录仍然**能读**（老用户升级后不至于"记忆全没了"），
+#   见 legacy_layout()。新写入永远走新的固定路径。
+
+SOUL_NAME = "soul.json"
+MOOD_NAME = "mood.json"
+MEMORY_NAME = "memory.sqlite3"
+LEGACY_MARKER = "__default__"
 
 
-def short_key(key: str) -> str:
-    keep = "".join(c for c in str(key or "") if c.isalnum() or c in "_-")
-    return keep[:16]
+def soul_path(root: Optional[str] = None) -> str:
+    return os.path.join(root or resolve_data_root(), SOUL_NAME)
 
 
-def scope_file_path(root: str, key: str, kind: str) -> str:
-    if not key:
-        return ""
-    d = os.path.join(root, key)
-    short = short_key(key)
-    if kind == "memory":
-        return os.path.join(d, f"memory-{short}.sqlite3")
-    if kind == "mood":
-        return os.path.join(d, f"mood-{short}.json")
+def mood_path(root: Optional[str] = None) -> str:
+    return os.path.join(root or resolve_data_root(), MOOD_NAME)
+
+
+def memory_path(root: Optional[str] = None) -> str:
+    return os.path.join(root or resolve_data_root(), MEMORY_NAME)
+
+
+def layout_path(root: Optional[str], kind: str) -> str:
     if kind == "soul":
-        return os.path.join(d, f"soul-{short}.json")
-    raise ValueError("kind 只能是 memory、mood 或 soul")
+        return soul_path(root)
+    if kind == "mood":
+        return mood_path(root)
+    if kind == "memory":
+        return memory_path(root)
+    raise ValueError("kind 只能是 soul、mood 或 memory")
 
 
-def scope_dir(root: str, key: str) -> str:
-    return os.path.join(root, key) if key else ""
+def legacy_layout(root: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """检测老的分范围布局（<root>/ws-*/ 下那套），返回能用的那一份。
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# 当前范围 —— 与 soul/index.js 的 currentScopeKey() 同一套解析顺序
-# ══════════════════════════════════════════════════════════════════════════
-
-
-def infer_scope_key(root: str) -> str:
-    """scope.json 不存在时的兜底：看 <root>/ 下已有哪些范围目录。
-
-    与插件 inferScopeKey 一致：只有一个就用；有多个优先取带 soul 的，
-    其次带 mood 的，再不行取最新的 —— 绝不凭空造一个新的空范围。
-    """
-    try:
-        names = [
-            n for n in os.listdir(root)
-            if os.path.isdir(os.path.join(root, n))
-            and (n.startswith("ws-") or n.startswith("ss-"))
-        ]
-    except Exception:
-        return ""
-    if not names:
-        return ""
-    if len(names) == 1:
-        return names[0]
-
-    scored = []
-    for n in names:
-        d = os.path.join(root, n)
-        score = 0
-        mtime = 0.0
-        try:
-            files = os.listdir(d)
-            if any(f.startswith("soul-") for f in files):
-                score += 2
-            if any(f.startswith("mood-") for f in files):
-                score += 1
-            for f in files:
-                try:
-                    mtime = max(mtime, os.path.getmtime(os.path.join(d, f)))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        scored.append((score, mtime, n))
-    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    return scored[0][2]
-
-
-def current_scope_key(root: Optional[str] = None) -> str:
-    root = root or resolve_data_root()
-    sc = read_scope(root)
-    if sc:
-        k = scope_key(sc["mode"], sc["workspaceId"], sc["sessionIds"])
-        if k:
-            return k
-    return infer_scope_key(root)
-
-
-def list_scopes(root: Optional[str] = None) -> List[Dict[str, Any]]:
-    """列出数据根下所有范围目录，附带各文件是否存在。
-
-    界面「数据目录」页用它让用户看清：哪个范围有灵魂、有记忆、有多少条。
+    只在**新布局什么都没有**时调用。找到了不迁移、不改动，
+    只是顺着老路径读 —— 迁移是破坏性操作，得由用户在「数据目录」页明确点。
     """
     root = root or resolve_data_root()
-    out: List[Dict[str, Any]] = []
     try:
         names = sorted(
             n for n in os.listdir(root)
@@ -258,44 +170,53 @@ def list_scopes(root: Optional[str] = None) -> List[Dict[str, Any]]:
             and (n.startswith("ws-") or n.startswith("ss-"))
         )
     except Exception:
-        return out
+        return None
+    if not names:
+        return None
 
+    # 有灵魂的那份才算"真正在用"，其余是历史残留
     for n in names:
         d = os.path.join(root, n)
-        row: Dict[str, Any] = {"key": n, "dir": d}
         try:
             files = os.listdir(d)
         except Exception:
-            files = []
+            continue
         soul = next((f for f in files if f.startswith("soul-") and f.endswith(".json")), "")
+        if not soul:
+            continue
         mood = next((f for f in files if f.startswith("mood-") and f.endswith(".json")), "")
         memo = next((f for f in files if f.startswith("memory-") and f.endswith(".sqlite3")), "")
-        row["soul"] = os.path.join(d, soul) if soul else ""
-        row["mood"] = os.path.join(d, mood) if mood else ""
-        row["memory"] = os.path.join(d, memo) if memo else ""
-        row["has_soul"] = bool(soul)
-        row["has_mood"] = bool(mood)
-        row["has_memory"] = bool(memo)
-        # 名字：从灵魂里读，读不到就空（界面显示目录名）
-        row["name"] = ""
-        if soul:
-            try:
-                with open(os.path.join(d, soul), "r", encoding="utf-8") as f:
-                    sd = json.load(f)
-                row["name"] = str((sd.get("identity") or {}).get("name") or "")
-            except Exception:
-                pass
-        # 最近改动时间
-        mtime = 0.0
-        for f in files:
-            try:
-                mtime = max(mtime, os.path.getmtime(os.path.join(d, f)))
-            except Exception:
-                pass
-        row["mtime"] = int(mtime * 1000)
-        out.append(row)
-    out.sort(key=lambda r: r["mtime"], reverse=True)
-    return out
+        return {
+            "key": n,
+            "dir": d,
+            "soul": os.path.join(d, soul),
+            "mood": os.path.join(d, mood) if mood else "",
+            "memory": os.path.join(d, memo) if memo else "",
+        }
+    return None
+
+
+def resolve_legacy(root: Optional[str], kind: str) -> str:
+    """新布局没这个文件时，去老布局里找。返回空串 = 都没有。"""
+    lg = legacy_layout(root)
+    if not lg:
+        return ""
+    p = lg.get(kind) or ""
+    return p if p and os.path.isfile(p) else ""
+
+
+def existing_path(root: Optional[str], kind: str) -> str:
+    """某类数据**实际应该读/写哪里**：
+
+    新布局有 → 用新的；
+    新布局没有但老的有一份 → 用老的（老用户升级后还能看见自己的人和记忆）；
+    都没有 → 返回新路径（写下去会创建）。
+    """
+    new = layout_path(root, kind)
+    if os.path.isfile(new):
+        return new
+    old = resolve_legacy(root, kind)
+    return old or new
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -709,12 +630,9 @@ def write_mood_config(patch: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], str]
 
 
 def read_mood_state() -> Optional[Dict[str, Any]]:
-    """读心情状态文件（每个范围一个 mood-ws-*.json）。"""
+    """读心情状态文件。整个数据根只有一份 <数据根>/mood.json。"""
     root = resolve_data_root()
-    key = current_scope_key(root)
-    if not key:
-        return None
-    p = scope_file_path(root, key, "mood")
+    p = existing_path(root, "mood")
     if not p or not os.path.isfile(p):
         return None
     try:
@@ -726,16 +644,17 @@ def read_mood_state() -> Optional[Dict[str, Any]]:
 
 
 def reset_mood(key: Optional[str] = None, base: Optional[int] = None) -> Tuple[bool, str]:
-    """把某个范围的心情重置到基线。
+    """把心情重置到基线。
 
     与 /reset 路由一致：只把 mood 拉回 base，dims 归零，timeline 保留
     （时间线是历史证据，重置心情不等于抹掉"发生过什么"）。
+
+    ⚠ 老布局的 mood 文件里 `moods` 是按范围键（ws-xxx）存的；
+      新布局只有一个槽位，键名固定 DEFAULT_SLOT。两种都要能处理 ——
+      否则老用户点「重置」会报"找不到这份心情"。
     """
     root = resolve_data_root()
-    key = key or current_scope_key(root)
-    if not key:
-        return False, "范围未确定"
-    p = scope_file_path(root, key, "mood")
+    p = existing_path(root, "mood")
     if not p or not os.path.isfile(p):
         return False, "找不到心情状态文件"
     try:
@@ -744,11 +663,19 @@ def reset_mood(key: Optional[str] = None, base: Optional[int] = None) -> Tuple[b
         if not isinstance(store, dict):
             return False, "心情文件格式不对"
         moods = store.get("moods")
-        if not isinstance(moods, dict):
+        if not isinstance(moods, dict) or not moods:
             return False, "心情文件里没有 moods"
-        slot = moods.get(key)
+
+        # 指定了 key 就用它；没指定就取 lastActive，再不行取第一个
+        if key and key in moods:
+            slot_key = key
+        else:
+            slot_key = str(store.get("lastActive") or "")
+            if slot_key not in moods:
+                slot_key = next(iter(moods))
+        slot = moods.get(slot_key)
         if not isinstance(slot, dict):
-            return False, f"找不到 {key} 这份心情"
+            return False, "心情槽位格式不对"
 
         cfg = read_mood_config()
         b = _clamp(int(base if base is not None else cfg["moodBase"]), 0, 100)
@@ -767,7 +694,7 @@ def reset_mood(key: Optional[str] = None, base: Optional[int] = None) -> Tuple[b
         slot["kind"] = ""
         slot["updatedAt"] = now
         slot["lastDecayAt"] = now
-        moods[key] = slot
+        moods[slot_key] = slot
         store["moods"] = moods
         _atomic_write_json(p, store)
         return True, ""
@@ -781,11 +708,12 @@ def reset_mood(key: Optional[str] = None, base: Optional[int] = None) -> Tuple[b
 
 
 def memory_db_path(root: Optional[str] = None, key: Optional[str] = None) -> str:
+    """记忆库路径。整个数据根只有一份 <数据根>/memory.sqlite3。
+
+    `key` 参数留着只为兼容老调用点，已无意义。
+    """
     root = root or resolve_data_root()
-    key = key or current_scope_key(root)
-    if not key:
-        return ""
-    return scope_file_path(root, key, "memory")
+    return existing_path(root, "memory")
 
 
 def copy_memory_for_read(src: str, workdir: str) -> str:
@@ -1140,3 +1068,201 @@ def apply_move(dst: str, copy: bool = False) -> Tuple[bool, str]:
         except Exception:
             pass  # 改根已经成功，源留着也不影响使用
     return True, ""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 清空 —— 让用户能把"测试期攒的东西"一次性推平
+# ══════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class WipePlan:
+    """清空前的盘点。界面先显示"要删什么"，再让用户确认。"""
+
+    root: str = ""
+    items: List[Dict[str, Any]] = field(default_factory=list)
+    total_bytes: int = 0
+    keep_soul: bool = True
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.error
+
+
+def inspect_wipe(root: Optional[str] = None, keep_soul: bool = True) -> WipePlan:
+    """盘点"清空"会删掉什么。
+
+    ⚠ keep_soul=True 时**不动灵魂** —— 灵魂是"她是谁"，不是"她记得什么"。
+      清空记忆和心情不该把人格一起洗掉，那是两件事。
+    """
+    root = root or resolve_data_root()
+    plan = WipePlan(root=root, keep_soul=keep_soul)
+    if not os.path.isdir(root):
+        plan.error = f"数据根不存在：{root}"
+        return plan
+
+    # 新布局的三个文件
+    for kind, name in (("soul", SOUL_NAME), ("mood", MOOD_NAME), ("memory", MEMORY_NAME)):
+        p = os.path.join(root, name)
+        if not os.path.isfile(p):
+            continue
+        if kind == "soul" and keep_soul:
+            plan.items.append({"name": name, "kind": kind, "bytes": os.path.getsize(p),
+                               "action": "保留"})
+            continue
+        plan.items.append({"name": name, "kind": kind, "bytes": os.path.getsize(p),
+                           "action": "删除"})
+        plan.total_bytes += os.path.getsize(p)
+    # 记忆的 wal/shm
+    for suf in ("-wal", "-shm"):
+        p = os.path.join(root, MEMORY_NAME + suf)
+        if os.path.isfile(p):
+            plan.items.append({"name": MEMORY_NAME + suf, "kind": "memory",
+                               "bytes": os.path.getsize(p), "action": "删除"})
+            plan.total_bytes += os.path.getsize(p)
+
+    # 老布局：整个 ws-* / ss-* 目录（灵魂那部分也一起清，因为清完就该只剩新布局）
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d):
+            continue
+        if not (name.startswith("ws-") or name.startswith("ss-")
+                or name.startswith("__")):
+            continue
+        size = 0
+        count = 0
+        for dirpath, _dn, filenames in os.walk(d):
+            for fn in filenames:
+                try:
+                    size += os.path.getsize(os.path.join(dirpath, fn))
+                    count += 1
+                except Exception:
+                    pass
+        plan.items.append({"name": name + "/", "kind": "legacy", "bytes": size,
+                           "files": count, "action": "删除"})
+        plan.total_bytes += size
+
+    sp = scope_store_path(root)
+    if os.path.isfile(sp):
+        plan.items.append({"name": "scope.json", "kind": "scope",
+                           "bytes": os.path.getsize(sp), "action": "删除"})
+        plan.total_bytes += os.path.getsize(sp)
+    return plan
+
+
+def apply_wipe(root: Optional[str] = None, keep_soul: bool = True,
+               backup_first: bool = True) -> Tuple[bool, str, str]:
+    """执行清空。返回 (ok, error, backup_path)。
+
+    ⚠ 先备份再删。哪怕用户说"测试期数据不重要"，也不该由我替他决定
+      "删了就再也回不来"。备份放数据根外面的兄弟目录，
+      万一删错了还有个地方捞。
+    """
+    root = root or resolve_data_root()
+    plan = inspect_wipe(root, keep_soul)
+    if not plan.ok:
+        return False, plan.error, ""
+
+    backup_dir = ""
+    if backup_first and plan.total_bytes > 0:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        # 备份放数据根的**兄弟目录**：不放进数据根里，
+        # 否则下次清空会把备份也一起扫进去，越清越多。
+        parent = os.path.dirname(os.path.normpath(root))
+        if not parent or parent == os.path.normpath(root):
+            parent = root          # 根目录没有父级，就地放
+        backup_dir = os.path.join(parent, f"bigfish-backup-{stamp}")
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+            # 灵魂先单独存一份（keep_soul 时它本来不删，但留个底更稳）
+            sp = os.path.join(root, SOUL_NAME)
+            if os.path.isfile(sp):
+                shutil.copyfile(sp, os.path.join(backup_dir, SOUL_NAME))
+            # 老布局的 ws-* 目录整体复制
+            for name in sorted(os.listdir(root)):
+                d = os.path.join(root, name)
+                if not os.path.isdir(d):
+                    continue
+                if not (name.startswith("ws-") or name.startswith("ss-")
+                        or name.startswith("__")):
+                    continue
+                shutil.copytree(d, os.path.join(backup_dir, name), dirs_exist_ok=True)
+            # 新布局的 mood / memory
+            for fn in (MOOD_NAME, MEMORY_NAME):
+                p = os.path.join(root, fn)
+                if os.path.isfile(p):
+                    shutil.copyfile(p, os.path.join(backup_dir, fn))
+                    for suf in ("-wal", "-shm"):
+                        if os.path.isfile(p + suf):
+                            shutil.copyfile(p + suf, os.path.join(backup_dir, fn + suf))
+        except Exception as exc:
+            return False, f"备份失败，已中止（什么都没删）：{exc}", ""
+
+    # 真的删
+    errors: List[str] = []
+    for item in plan.items:
+        if item.get("action") != "删除":
+            continue
+        name = item["name"]
+        target = os.path.join(root, name.rstrip("/"))
+        try:
+            if item["kind"] == "legacy":
+                shutil.rmtree(target, ignore_errors=False)
+            elif os.path.isfile(target):
+                os.remove(target)
+        except Exception as exc:
+            errors.append(f"{name}: {exc}")
+
+    if errors:
+        return False, "部分删除失败：" + "；".join(errors), backup_dir
+    return True, "", backup_dir
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 迁移 —— 把老的 ws-*/ 布局收成新布局
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def migrate_legacy(root: Optional[str] = None) -> Tuple[bool, str, List[str]]:
+    """把老的 ws-*/ 那套收成 <root>/soul.json + mood.json + memory.sqlite3。
+
+    返回 (ok, error, 做了什么)。
+
+    ⚠ 只搬**有灵魂的那一份**（那就是"她"），其余残留目录不动 ——
+      它们可能是别的工作区的记忆，删不删由用户决定，见 apply_wipe。
+    ⚠ 目标已存在就不覆盖。宁可让用户看见"已经有一份了"，也不要悄悄盖掉。
+    """
+    root = root or resolve_data_root()
+    lg = legacy_layout(root)
+    if not lg:
+        return False, "没有找到老布局（没有含灵魂的 ws-* 目录）", []
+
+    done: List[str] = []
+    moved: List[Tuple[str, str]] = []
+    try:
+        for kind, src_key in (("soul", "soul"), ("mood", "mood"), ("memory", "memory")):
+            src = lg.get(src_key) or ""
+            if not src or not os.path.isfile(src):
+                continue
+            dst = layout_path(root, kind)
+            if os.path.exists(dst):
+                done.append(f"{os.path.basename(dst)}: 已存在，跳过")
+                continue
+            shutil.copyfile(src, dst)
+            # 记忆库要把 wal 一起带过来，否则最近没 checkpoint 的会丢
+            if kind == "memory":
+                for suf in ("-wal", "-shm"):
+                    if os.path.isfile(src + suf):
+                        try:
+                            shutil.copyfile(src + suf, dst + suf)
+                        except Exception:
+                            pass
+            moved.append((src, dst))
+            done.append(f"{os.path.basename(dst)}: 从 {lg['key']} 搬过来")
+    except Exception as exc:
+        return False, f"迁移失败：{exc}", done
+
+    if not done:
+        return False, "老布局里没有可搬的文件", []
+    return True, "", done

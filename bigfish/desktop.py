@@ -701,7 +701,7 @@ class Backend(QObject):
             from bigfish.soul import soul_file_path
             path = soul_file_path(root)
             if not path:
-                return json.dumps({"error": "范围未确定。请先到「数据目录」页选好数据根与范围。",
+                return json.dumps({"error": "数据目录还没确定。请先到「数据目录」页设置。",
                                    "scopeReady": False}, ensure_ascii=False)
             # 两条数据：
             #   raw  —— 文件原样内容，用来**渲染人格**（缺什么就是什么，不补默认值）
@@ -720,7 +720,7 @@ class Backend(QObject):
                 "exists": exists,
                 "error": err or "",
                 "path": path,
-                "scope": vault.current_scope_key(root),
+                "root": root,
                 "name": s.name,
                 "address": s.address,
                 "aliases": s.aliases,
@@ -770,7 +770,6 @@ class Backend(QObject):
             # ── reset：回到出厂设置 ──
             if body.get("reset") is True:
                 fresh = vault.default_soul()
-                fresh["scope"] = vault.current_scope_key(root)
                 ok, soul_out, err = vault.write_soul_file(path, fresh)
                 if not ok:
                     return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
@@ -806,7 +805,6 @@ class Backend(QObject):
                     }, ensure_ascii=False)
 
             merged = dict(incoming or {})
-            merged["scope"] = vault.current_scope_key(root)
             # 保留磁盘上的 history（V1 不写入，但别人写进去的不能被我抹掉）
             if "history" not in merged:
                 merged["history"] = prev.get("history") or []
@@ -831,8 +829,6 @@ class Backend(QObject):
             out = {
                 "ok": True,
                 "config": cfg,
-                "scopes": vault.list_scopes(),
-                "currentScope": vault.current_scope_key(),
             }
             if not m:
                 out.update({"value": None, "error": "读不到情绪状态"})
@@ -882,10 +878,9 @@ class Backend(QObject):
             from bigfish import vault
 
             root = vault.resolve_data_root()
-            key = vault.current_scope_key(root)
-            db = vault.memory_db_path(root, key)
+            db = vault.memory_db_path(root)
             if not db:
-                return json.dumps({"error": "范围未确定"}, ensure_ascii=False)
+                return json.dumps({"error": "数据目录未确定"}, ensure_ascii=False)
             if not os.path.isfile(db):
                 return json.dumps({"error": "找不到记忆库", "path": db},
                                   ensure_ascii=False)
@@ -1046,36 +1041,93 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
-    # ── 数据目录（根 / 范围 / 搬家） ──
+    # ── 数据目录（就一个，没有"选哪份"） ──
     @Slot(result=str)
     def get_data_root(self) -> str:
+        """当前数据目录的样子。
+
+        ⚠ 这里**没有"范围/份"的概念**。一个数据根就是一份 ——
+          里面的 soul.json / mood.json / memory.sqlite3 就是她的全部。
+        """
         try:
             from bigfish import vault
 
             root = vault.resolve_data_root()
-            sc = vault.read_scope(root)
-            key = vault.current_scope_key(root)
-            # 可写性：灵魂文件所在目录能不能真写进去。
-            # 界面要能提前告诉用户"这里改不了"，而不是等他点了保存才失败。
-            from bigfish.soul import soul_file_path
-            probe_target = soul_file_path(root, key) or os.path.join(root, ".probe")
-            writable, w_err = vault.probe_writable(probe_target)
+            writable, w_err = vault.probe_writable(
+                os.path.join(root, vault.SOUL_NAME))
+
+            def _stat(kind: str) -> dict:
+                p = vault.existing_path(root, kind)
+                exists = bool(p) and os.path.isfile(p)
+                return {
+                    "path": p,
+                    "name": os.path.basename(p) if p else "",
+                    "exists": exists,
+                    "bytes": os.path.getsize(p) if exists else 0,
+                }
+
+            lg = vault.legacy_layout(root)
             return json.dumps({
                 "ok": True,
                 "root": root,
                 "custom": vault.read_data_root(),
                 "defaultRoot": vault.default_data_root(),
                 "rootFile": vault.root_store_path(),
-                "scopeFile": vault.scope_store_path(root),
-                "scope": sc,
-                "currentKey": key,
-                "dshHome": vault.dsh_home(),
-                "scopes": vault.list_scopes(root),
                 "writable": writable,
                 "writeError": w_err,
+                "soul": _stat("soul"),
+                "mood": _stat("mood"),
+                "memory": _stat("memory"),
+                "legacy": {
+                    "found": bool(lg),
+                    "key": (lg or {}).get("key", ""),
+                },
             }, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def inspect_wipe(self) -> str:
+        """盘点"清空记忆+心情"会删什么。不改任何东西。"""
+        try:
+            from bigfish import vault
+
+            plan = vault.inspect_wipe(keep_soul=True)
+            return json.dumps({
+                "ok": plan.ok,
+                "error": plan.error,
+                "root": plan.root,
+                "items": plan.items,
+                "totalBytes": plan.total_bytes,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def apply_wipe(self) -> str:
+        """清空心情 + 记忆（灵魂保留）。删之前先备份。"""
+        try:
+            from bigfish import vault
+
+            ok, err, backup = vault.apply_wipe(keep_soul=True, backup_first=True)
+            if ok:
+                self.log_message.emit(f"[数据] 已清空心情与记忆，备份在 {backup}", "")
+            return json.dumps({"ok": ok, "error": err, "backup": backup},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def migrate_legacy(self) -> str:
+        """把老的 ws-*/ 布局收成新布局。只搬有灵魂的那一份。"""
+        try:
+            from bigfish import vault
+
+            ok, err, done = vault.migrate_legacy()
+            return json.dumps({"ok": ok, "error": err, "done": done},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
     @Slot(str, result=str)
     def set_data_root(self, path: str) -> str:
@@ -1092,34 +1144,6 @@ class Backend(QObject):
                 return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
             self.log_message.emit(f"[数据] 数据根 → {p or '(默认)'}", "")
             return json.dumps({"ok": True, "root": vault.resolve_data_root()},
-                              ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-
-    @Slot(str, str, str, result=str)
-    def set_scope(self, mode: str, workspace_id: str, session_ids_json: str) -> str:
-        """写 scope.json。mode = workspace | session。"""
-        try:
-            from bigfish import vault
-
-            ids = []
-            if session_ids_json:
-                try:
-                    parsed = json.loads(session_ids_json)
-                    if isinstance(parsed, list):
-                        ids = [str(x) for x in parsed]
-                except Exception:
-                    ids = [s.strip() for s in session_ids_json.split(",") if s.strip()]
-
-            root = vault.resolve_data_root()
-            ok, err = vault.write_scope(root, mode, workspace_id, ids)
-            if not ok:
-                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
-            self.log_message.emit(
-                f"[数据] 范围 → {vault.current_scope_key(root)}", "")
-            return json.dumps({"ok": True,
-                               "scope": vault.read_scope(root),
-                               "currentKey": vault.current_scope_key(root)},
                               ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -1204,51 +1228,6 @@ class Backend(QObject):
             return json.dumps({"ok": True}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-
-    @Slot(result=str)
-    def get_scope_candidates(self) -> str:
-        """列出数据根下真实存在的「份」，供「数据目录」页选择。
-
-        ⚠ 这里**不读 DSH 的会话库**。
-
-        以前这个函数会去扫 `<DSH_HOME>/storages/workspace.json` 和
-        `<DSH_HOME>/sessions/`，把 DSH 里的工作区标题和会话 id 全列出来 ——
-        那既越界（EXE 是独立程序，不该看见宿主的所有对话），
-        也自相矛盾（微信端本来就不跟工作区绑，列出来干什么）。
-
-        现在只做一件事：**看数据根里有哪些范围目录，各里住了谁**。
-        判据是目录里那个 soul-*.json 的 identity.name ——
-        她自己叫什么，比 DSH 给工作区起的标题有用得多。
-        """
-        try:
-            from bigfish import vault
-
-            root = vault.resolve_data_root()
-            scopes = vault.list_scopes(root)
-            current = vault.current_scope_key(root)
-
-            out = []
-            for s in scopes:
-                out.append({
-                    "key": s["key"],
-                    "name": s["name"] or "",       # 灵魂里的名字（空 = 还没写人格）
-                    "hasSoul": s["has_soul"],
-                    "hasMood": s["has_mood"],
-                    "hasMemory": s["has_memory"],
-                    "mtime": s["mtime"],
-                    "current": s["key"] == current,
-                })
-
-            return json.dumps({
-                "ok": True,
-                "root": root,
-                "currentKey": current,
-                "scopes": out,
-            }, ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps({"ok": False, "scopes": [], "error": str(exc)},
-                              ensure_ascii=False)
-
 
     def _tmp_copy(self, src: str) -> str:
         """复制记忆库到本地临时文件，避免和 DSH 抢锁。"""
@@ -1738,35 +1717,50 @@ def run_selftest() -> int:
 
     # 2. 心情
     def t_mood():
+        from bigfish import vault as V
         from bigfish.bridge_client import load_mood_only
+
+        # ⚠ 心情可能是空的（刚清空过，或者从没聊过）。空的也是正常状态 ——
+        #   自检要验的是"读路径通不通"，不是"必须有数据"。
+        #   以前这里 assert m and m.value is not None，清空后就永远红。
+        cfg = V.read_mood_config()
+        assert isinstance(cfg.get("moodBase"), int), "心情配置读不出来"
+        assert cfg.get("injectMode") in V.INJECT_MODES, "injectMode 非法"
+
+        p = V.existing_path(V.resolve_data_root(), "mood")
+        if not p or not os.path.isfile(p):
+            return f"还没有心情数据（正常），基线 {cfg['moodBase']}"
+
         m = load_mood_only()
-        assert m and m.value is not None
+        if not m or m.value is None:
+            return f"心情文件在但还没值（正常），基线 {cfg['moodBase']}"
         return f"{m.label} {m.value:.1f}"
     item("心情", t_mood)
 
     # 3. 记忆
     def t_mem():
-        import glob
-        import sqlite3
         import shutil
+        import sqlite3
 
-        from bigfish.bridge_client import _default_data_root, _pick_scope_dir
-        root = _default_data_root()
-        assert root, "找不到 dataRoot"
-        scope = _pick_scope_dir(root)
-        assert scope, "找不到 scope"
-        dbs = glob.glob(os.path.join(scope, "memory-*.sqlite3"))
-        assert dbs, "找不到记忆库"
+        from bigfish import vault as V
+        root = V.resolve_data_root()
+        assert root, "找不到数据根"
+        db = V.existing_path(root, "memory")
+
+        # ⚠ 记忆库可能是空的/不存在的（刚清空过）。那是正常状态。
+        #   自检验的是"路径能解析、库能打开"，不是"必须有一万条记忆"。
+        if not db or not os.path.isfile(db):
+            return "还没有记忆库（正常）"
+
         tmp = os.path.abspath(os.path.join(_APP_DIR, ".tmp",
                                            "exe_selftest.sqlite3"))
         os.makedirs(os.path.dirname(tmp), exist_ok=True)
-        shutil.copyfile(dbs[0], tmp)
+        shutil.copyfile(db, tmp)
         conn = sqlite3.connect(tmp)
         try:
             n = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         finally:
             conn.close()
-        assert n > 0, "记忆库为空"
         return f"库里 {n} 条"
     item("记忆", t_mem)
 
@@ -1852,8 +1846,10 @@ def run_selftest() -> int:
             assert V.trait_sentence("warmth", 40).startswith("温暖：克制")
 
             # 数据根 / 范围键
-            assert V.scope_key("workspace", "abc") == "ws-abc"
-            assert V.short_key("ws-83ba9d80-ec53-4a24") == "ws-83ba9d80-ec53"
+            # 存储布局：一个数据根 = 一份
+            assert V.layout_path(tmpd, "soul") == os.path.join(tmpd, "soul.json")
+            assert V.layout_path(tmpd, "mood") == os.path.join(tmpd, "mood.json")
+            assert V.layout_path(tmpd, "memory") == os.path.join(tmpd, "memory.sqlite3")
 
             # 心情配置：未知字段必须保留
             assert V.INJECT_MODES == ["off", "label", "event"]
@@ -1867,12 +1863,16 @@ def run_selftest() -> int:
         from bigfish import vault as V
         root = V.resolve_data_root()
         assert root, "数据根为空"
-        key = V.current_scope_key(root)
-        writable, werr = V.probe_writable(
-            V.scope_file_path(root, key, "soul") if key
-            else os.path.join(root, ".probe"))
+        writable, werr = V.probe_writable(os.path.join(root, V.SOUL_NAME))
+
+        def mark(kind: str) -> str:
+            p = V.existing_path(root, kind)
+            return f"{kind}={'有' if p and os.path.isfile(p) else '无'}"
+
+        lg = V.legacy_layout(root)
         return (f"{root}"
-                + (f"｜范围 {key}" if key else "｜范围未定")
+                + "｜" + " ".join(mark(k) for k in ("soul", "mood", "memory"))
+                + ("｜老布局残留" if lg else "")
                 + ("｜可写" if writable else f"｜不可写：{werr[:40]}"))
     item("数据根", t_root)
 

@@ -1036,13 +1036,12 @@ async function loadDataRoot() {
     $('#dataRootPath').value = d.root || '';
     setText('#dataRootTag', d.custom ? '自定义' : '默认');
     setText('#dataRootFile', `配置文件：${d.rootFile || '—'}`);
-    setText('#scopeKeyTag', d.currentKey || '未确定');
     $('#dataRootTarget').value = '';
 
     // 可写性：不可写就直接在页面上说清楚，别等用户点保存才失败
     const hint = $('#dataRootHint');
     if (d.writable === false) {
-      hint.innerHTML = '<strong>这个数据根现在写不进去。</strong>' +
+      hint.innerHTML = '<strong>这个数据目录现在写不进去。</strong>' +
         '改人格、改心情参数都会失败。<br>' +
         '可以换一个普通目录（用下面「搬过去」连同数据一起搬），' +
         '或者用管理员身份重新打开本程序。<br>' +
@@ -1053,116 +1052,126 @@ async function loadDataRoot() {
       hint.className = 'hint-line';
     }
 
-    // 范围：只从数据根里真实存在的份里挑，不去问 DSH
-    renderScopeList(d.scopes || [], d.currentKey);
-    await loadScopeCandidates(d.currentKey || '');
+    renderLayout(d);
+    await refreshWipePlan(true);
   } catch (e) { toast('读取数据目录失败'); }
 }
 
-function renderScopeList(scopes, currentKey) {
-  const box = $('#scopeList');
-  if (!scopes.length) {
-    box.innerHTML = '<div class="empty" style="padding:12px 0"><p>这个数据根下还没有任何份。</p></div>';
-    return;
-  }
-  box.innerHTML = scopes.map((s) => {
-    const badges = [];
-    if (s.has_soul) badges.push('<span class="tag ok">灵魂</span>');
-    if (s.has_mood) badges.push('<span class="tag">心情</span>');
-    if (s.has_memory) badges.push('<span class="tag">记忆</span>');
-    return `<div class="session-row${s.key === currentKey ? ' is-current' : ''}"
-                 data-key="${esc(s.key)}" style="cursor:pointer">
-      <span class="session-name" title="${esc(s.dir || s.key)}">${esc(s.key)}</span>
-      ${s.name ? `<span class="session-meta">${esc(s.name)}</span>` : ''}
-      ${badges.join('') || '<span class="tag">空</span>'}
-      ${s.key === currentKey ? '<span class="tag ok">当前</span>' : ''}
+/* 三样东西各在哪、有没有。没有「份」的概念。 */
+function renderLayout(d) {
+  const box = $('#layoutList');
+  const rows = [
+    ['灵魂', d.soul, '她是谁。改这个不会动记忆。'],
+    ['心情', d.mood, '此刻怎样。清空只影响这个。'],
+    ['记忆', d.memory, '她记得的事。'],
+  ];
+
+  const fmt = (n) => {
+    if (!n) return '';
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(1) + ' MB';
+  };
+
+  box.innerHTML = rows.map(([label, info, desc]) => {
+    const ok = info && info.exists;
+    return `<div class="session-row">
+      <span class="session-name" style="font-family:var(--body-font);font-size:12px">${label}</span>
+      <span class="session-meta" style="flex:1;text-align:left;padding-left:10px">${esc(desc)}</span>
+      <span class="session-meta">${ok ? esc(info.name) : '（还没有）'}</span>
+      <span class="session-meta">${ok ? fmt(info.bytes) : '—'}</span>
+      <span class="tag${ok ? ' ok' : ''}">${ok ? '在' : '无'}</span>
     </div>`;
   }).join('');
 
-  // 点一行 → 选中它（不立刻切，让用户看清楚再点「用这一份」）
-  $$('#scopeList .session-row[data-key]').forEach((row) => {
-    row.addEventListener('click', () => {
-      const sel = $('#scopePick');
-      sel.value = row.dataset.key;
-      updateScopePickHint();
+  // 老布局残留提示
+  if (d.legacy && d.legacy.found) {
+    box.innerHTML += `<div class="session-row" style="margin-top:8px">
+      <span class="session-name" style="font-family:var(--body-font);font-size:12px;color:var(--warn)">老布局</span>
+      <span class="session-meta" style="flex:1;text-align:left;padding-left:10px">
+        发现 <code>${esc(d.legacy.key)}</code> 目录，里面还有人格式数据
+      </span>
+      <button class="btn btn-sm" id="btnMigrate">搬进新布局</button>
+    </div>`;
+    const b = $('#btnMigrate');
+    if (b) b.addEventListener('click', async () => {
+      b.disabled = true;
+      try {
+        const r = JSON.parse(await S.bridge.migrate_legacy());
+        if (!r.ok) { toast(r.error || '迁移失败'); return; }
+        toast('已搬过来');
+        S.soul = null;
+        await loadDataRoot();
+      } catch (e) { toast('迁移失败'); }
+      finally { b.disabled = false; }
     });
-  });
+  }
+
+  setText('#layoutTag', d.writable === false ? '不可写' : '正常');
 }
 
-async function loadScopeCandidates(currentKey) {
+/* ── 清空 ── */
+
+async function refreshWipePlan(silent) {
   if (!S.bridge) return;
   try {
-    const d = JSON.parse(await S.bridge.get_scope_candidates());
-    if (!d.ok) return;
-
-    const list = d.scopes || [];
-    const sel = $('#scopePick');
-    if (!list.length) {
-      sel.innerHTML = '<option value="">（数据根下还没有任何份）</option>';
-      setText('#scopePickHint', '');
+    const d = JSON.parse(await S.bridge.inspect_wipe());
+    const el = $('#wipePlan');
+    if (!d.ok) {
+      el.textContent = '盘点失败：' + (d.error || '');
+      el.className = 'card-desc is-err';
       return;
     }
-
-    sel.innerHTML = list.map((s) => {
-      const who = s.name ? s.name : '（还没写人格）';
-      const marks = [
-        s.hasSoul ? '灵魂' : '',
-        s.hasMood ? '心情' : '',
-        s.hasMemory ? '记忆' : '',
-      ].filter(Boolean).join('+') || '空';
-      return `<option value="${esc(s.key)}">${esc(who)} · ${esc(marks)}</option>`;
-    }).join('');
-
-    if (currentKey && list.some((s) => s.key === currentKey)) {
-      sel.value = currentKey;
+    if (!d.items.length) {
+      el.textContent = '没有可清的东西 —— 已经是干净的了。';
+      el.className = 'card-desc';
+      return;
     }
-    updateScopePickHint(list);
-  } catch (e) { /* 静默 */ }
+    const del = d.items.filter((i) => i.action === '删除');
+    const keep = d.items.filter((i) => i.action === '保留');
+    const parts = [];
+    if (keep.length) parts.push('保留：' + keep.map((i) => i.name).join('、'));
+    if (del.length) {
+      const files = del.reduce((n, i) => n + (i.files || 1), 0);
+      parts.push(`删除 ${del.length} 项 / ${files} 个文件 / ${fmtBytes(d.totalBytes)}`);
+    }
+    el.textContent = parts.join('　|　');
+    el.className = 'card-desc';
+  } catch (e) {
+    if (!silent) toast('盘点失败');
+  }
 }
 
-function updateScopePickHint(list) {
-  const list2 = list || S.scopeList || [];
-  const key = $('#scopePick').value;
-  const hit = list2.find((s) => s.key === key);
-  const h = $('#scopePickHint');
-  if (!hit) { h.textContent = ''; return; }
-  const who = hit.name ? `「${hit.name}」` : '（这一份还没写过人格）';
-  h.textContent = `${key} —— 里面住的是 ${who}`;
-}
-
-$('#btnScopeSave').addEventListener('click', async () => {
-  if (!S.bridge) return toast('后端未就绪');
-  const key = $('#scopePick').value;
-  if (!key) return toast('先选一份');
-  if (key === S.data?.currentKey) return toast('已经在用这一份了');
-
-  try {
-    // 只切范围，不碰工作区/会话绑定 —— 微信端不跟 DSH 的工作区绑。
-    // ws-<uuid> 拆成 mode + workspaceId；ss-<id> 拆成 mode + sessionIds。
-    let mode = 'workspace';
-    let wid = '';
-    let sids = [];
-    if (key.startsWith('ws-')) {
-      wid = key.slice(3);
-    } else if (key.startsWith('ss-')) {
-      mode = 'session';
-      sids = [key.slice(3)];
-    } else {
-      return toast('这个目录名看不懂：' + key);
-    }
-
-    const r = JSON.parse(await S.bridge.set_scope(mode, wid, JSON.stringify(sids)));
-    if (!r.ok) return toast(r.error || '切换失败');
-    const h = $('#scopeHint');
-    h.textContent = '已切到 ' + (r.currentKey || '');
-    h.className = 'hint-line is-ok';
-    toast('已切换');
-    S.soul = null;
-    await loadDataRoot();
-  } catch (e) { toast('切换失败'); }
+$('#btnWipePreview').addEventListener('click', () => {
+  refreshWipePlan(false);
+  toast('已重新盘点');
 });
 
-$('#btnScopeRefresh').addEventListener('click', () => loadDataRoot());
+$('#btnWipe').addEventListener('click', async () => {
+  if (!S.bridge) return toast('后端未就绪');
+  if (!confirm('清空心情和全部记忆？\n\n灵魂（她是谁）会保留。\n删之前会自动备份到数据目录旁边。')) return;
+  const btn = $('#btnWipe');
+  btn.disabled = true;
+  const h = $('#wipeHint');
+  try {
+    const r = JSON.parse(await S.bridge.apply_wipe());
+    if (!r.ok) {
+      h.textContent = '清空失败：' + (r.error || '');
+      h.className = 'card-desc is-err';
+      return toast('清空失败');
+    }
+    h.textContent = r.backup ? '已清空。备份在 ' + r.backup : '已清空。';
+    h.className = 'card-desc is-ok';
+    toast('已清空');
+    S.soul = null;
+    await loadDataRoot();
+    await refreshWipePlan(true);
+  } catch (e) {
+    toast('清空失败');
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 /* ── 数据根：打开 / 选择 / 只改指向 / 搬家 ── */
 $('#btnDataRootOpen').addEventListener('click', async () => {

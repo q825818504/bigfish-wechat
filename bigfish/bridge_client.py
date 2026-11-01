@@ -223,14 +223,11 @@ def _default_data_root() -> str:
 
 def _scope_dir_of(root: str, scope: str = "") -> Optional[str]:
     """当前范围的目录。优先按 scope.json 推，推不出再扫。"""
-    from bigfish.vault import current_scope_key, scope_dir
+    _ = scope      # 老参数，新布局没有范围概念
+    from bigfish.vault import legacy_layout
 
-    key = scope or current_scope_key(root)
-    if key:
-        d = scope_dir(root, key)
-        if os.path.isdir(d):
-            return d
-    return _pick_scope_dir(root)
+    lg = legacy_layout(root)
+    return (lg or {}).get("dir") or None
 
 
 def _pick_scope_dir(root: str) -> Optional[str]:
@@ -264,25 +261,15 @@ def load_mood_only(data_root: str = "") -> Optional[Mood]:
     界面上的「心情」页用它——那里不需要检索开销。
     路径解析走 vault，保证和灵魂、记忆是**同一个范围**。
     """
-    from bigfish.vault import current_scope_key, scope_file_path
+    from bigfish.vault import existing_path
 
     root = data_root or _default_data_root()
     if not root:
         return None
 
-    key = current_scope_key(root)
-    path = scope_file_path(root, key, "mood") if key else ""
+    path = existing_path(root, "mood")
     if not path or not os.path.isfile(path):
-        # 兜底：扫这个范围目录里任何 mood-*.json
-        sd = _scope_dir_of(root)
-        if not sd:
-            return None
-        import glob
-
-        cands = sorted(glob.glob(os.path.join(sd, "mood-*.json")))
-        if not cands:
-            return None
-        path = cands[0]
+        return None
 
     try:
         with open(path, "r", encoding="utf-8") as fh:

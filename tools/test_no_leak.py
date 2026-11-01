@@ -72,6 +72,29 @@ def _code_only(src: str) -> str:
     return " ".join(out)
 
 
+def _strip_py(src: str) -> str:
+    """剥掉 Python 注释和所有字符串字面量之外的部分 —— 这里用于全文件扫描。
+
+    只保留字符串字面量（因为路径就写在字符串里）+ 标识符。
+    docstring 也会被算进来，所以调用方要允许"注释里提到过"的情况。
+    """
+    import ast
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src
+    parts: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            parts.append(node.value)
+        elif isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+        elif isinstance(node, ast.Name):
+            parts.append(node.id)
+    return " ".join(parts)
+
+
 def _func_code(path: str, fname: str) -> str | None:
     """取某个函数**真正会执行的代码**（不含 docstring / 注释）。
 
@@ -129,41 +152,42 @@ def main() -> int:
 
     # 用 AST 提取真正的代码（不含注释 / docstring），
     # 否则"注释里说以前读过 workspace.json"会被误判成违规。
-    body = _func_code("bigfish/desktop.py", "get_scope_candidates")
-    if body is None:
-        check("找到 get_scope_candidates", False)
-    else:
-        check("get_scope_candidates 不读 workspace.json",
-              "workspace.json" not in body, "它还在读 DSH 的工作区表")
-        check("get_scope_candidates 不扫 sessions 目录",
-              "sessions" not in body, "它还在扫 DSH 的会话目录")
-        check("get_scope_candidates 不认会话文件",
-              "session.v4" not in body, "它还在识别会话文件")
-        check("get_scope_candidates 只列数据根里的份",
-              "list_scopes" in body, "应改用 vault.list_scopes")
-        check("get_scope_candidates 用了 dsh_home 之外的路径",
-              "dsh_home" not in body, "不该再碰 DSH_HOME")
+    # get_scope_candidates 整个删掉了（那个函数就是越界的来源）。
+    # 现在守的是：**任何**函数都不许碰 DSH 的会话/工作区数据。
+    for fname in ("get_data_root", "get_scope_candidates", "get_persona",
+                  "get_mood", "memory_stats"):
+        body = _func_code("bigfish/desktop.py", fname)
+        if body is None:
+            continue          # 函数已经不存在，那就更没有越界可能
+        check(f"{fname} 不读 workspace.json", "workspace.json" not in body)
+        # ⚠ 只判"路径拼接"，不判 "sessions" 这个词本身：
+        #   memory_stats 返回的 "sessions" 是**记忆库自己的会话计数**，
+        #   和 DSH 的 sessions 目录毫无关系。词面命中会误报。
+        check(f"{fname} 不拼 DSH 的 sessions 路径",
+              "os.path.join" not in body or "sessions" not in body,
+              "疑似还在拼 <DSH_HOME>/sessions")
 
     # 全局：不该出现 DSH 会话/存储目录的拼接
     for pat in ('os.path.join(home, "sessions")',
                 'storages", "workspace.json'):
         check(f"全文件不含 {pat}", pat not in desktop, "残留 DSH 路径拼接")
 
-    # ── 2. 返回结构里不许有 workspaces / sessions ──
-    section("2 · 接口返回值")
-    if body is None:
-        check("找到函数体", False)
-    else:
-        check("返回值没有 workspaces 字段",
-              "workspaces" not in body, "仍在向外暴露工作区清单")
-        check("返回值没有 sessions 字段",
-              "sessions" not in body, "仍在向外暴露会话清单")
+    # ── 2. 整个桌面模块不许出现宿主的会话库路径 ──
+    section("2 · 全模块扫描")
+    code = _strip_py(desktop)
+    for pat, why in (
+        ("workspace.json", "DSH 的工作区登记表"),
+        ("session.v4", "DSH 的会话文件"),
+    ):
+        check(f"代码里没有 {pat}", pat not in code, f"还在碰 {why}")
 
     # ── 3. 界面不许有工作区/会话选择控件 ──
     section("3 · 界面控件")
     html = read("ui/index.html")
     js = read("ui/app.js")
-    for elem in ("scopeWorkspace", "scopeSessions", "scopeMode"):
+    # 不只是不该有工作区/会话控件 —— "选哪一份"这套整体都不该有。
+    for elem in ("scopeWorkspace", "scopeSessions", "scopeMode",
+                 "scopePick", "scopeList", "scopeKeyTag"):
         check(f"index.html 没有 #{elem}",
               f'id="{elem}"' not in html, "控件还在")
         check(f"app.js 没有引用 #{elem}",
@@ -171,18 +195,19 @@ def main() -> int:
 
     # ── 4. 但「选哪一份」这个能力必须在 ──
     section("4 · 该有的还得有")
-    check("有 scopePick 下拉", 'id="scopePick"' in html)
-    check("JS 有 loadScopeCandidates", "loadScopeCandidates" in js)
-    check("JS 有切换逻辑", "set_scope" in js)
+    check("有布局清单", 'id="layoutList"' in html)
+    check("有清空按钮", 'id="btnWipe"' in html)
+    check("JS 有 renderLayout", "renderLayout" in js)
+    check("JS 有清空逻辑", "apply_wipe" in js)
 
     # ── 5. 文案不许再提工作区绑定 ──
     section("5 · 文案")
     check("界面不再说「微信这边不跟工作区绑」这种自相矛盾的话",
           "微信这边不跟工作区绑" not in html,
           "既然不提工作区，就别解释为什么不绑")
-    check("界面说明的是「里面住的是谁」",
-          "里面住的是谁" in html or "住的是" in html,
-          "要用人格名字而不是工作区标题")
+    check("界面说明的是「一个数据目录 = 一份」",
+          "一份灵魂" in html or "数据目录在哪" in html,
+          "要讲清楚没有「选哪一份」")
 
     print()
     print("=" * 58)
