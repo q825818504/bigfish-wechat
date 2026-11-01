@@ -46,3 +46,6 @@ dist/
 release.etag
 *.part
 bigfish_updater_*.cmd
+
+# ---- 安装包产物 ----
+dist/BigFish-*

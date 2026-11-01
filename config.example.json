@@ -1,5 +1,5 @@
 {
-  "_comment": "大肥鱼 × 微信配置。api_key 留空表示走本地 Magpie 网关（不需要 key）。",
+  "_comment": "大肥鱼 × 微信配置。api_key 留空表示走本地 Magpie 网关。",
   "endpoint": "http://127.0.0.1:3425/v1/chat/completions",
   "model": "workbuddy-ai/deepseek-v4.1-flash",
   "api_key": "",
@@ -13,6 +13,17 @@
     "allow_self": true,
     "interval": 1.2,
     "max_reply_chars": 300,
-    "quiet_hours": []
+    "quiet_hours": [],
+
+    "_comment_group": "群聊默认只在被 @ 或叫名字时才回。group_allow_all 里的群无条件回。",
+    "group_reply": true,
+    "group_allow_all": []
+  },
+
+  "update": {
+    "_comment": "填 owner/repo 后启用自动更新。留空则跳过检查。",
+    "repo": "",
+    "enabled": true,
+    "current": "0.1.0"
   }
 }

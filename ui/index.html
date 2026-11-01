@@ -224,16 +224,12 @@
         </div>
 
         <div class="card">
-          <div class="card-head"><h2>回复策略</h2></div>
-          <div class="switch-row">
-            <div class="switch-copy">
-              <strong>处理自己发的消息</strong>
-              <p>打开后，你在文件传输助手里发的内容也会触发回复。日常使用请关闭，否则会自问自答。</p>
-            </div>
-            <label class="switch-control">
-              <input type="checkbox" id="cfgAllowSelf2">
-              <span class="switch-track"></span>
-            </label>
+          <div class="card-head"><h2>说明</h2></div>
+          <div class="card-desc" style="line-height:1.9">
+            勾选的会话会持续监听。私聊每条都回；群聊默认只在被 <b>@</b> 或叫名字时才回，
+            这条策略可以在「设置 → 自动回复」里改。<br>
+            监听列表会同时写入 config.json 的 <code>auto_reply.chats</code>，
+            下次启动自动恢复。
           </div>
         </div>
       </section>
@@ -439,6 +435,21 @@
                 <input type="checkbox" id="cfgAllowSelf">
                 <span class="switch-track"></span>
               </label>
+            </div>
+            <div class="switch-row">
+              <div class="switch-copy">
+                <strong>群聊只在被叫到时回</strong>
+                <p>群里只有 @ 你、或消息开头叫了你的名字才会回。关掉则所有群消息都回。</p>
+              </div>
+              <label class="switch-control">
+                <input type="checkbox" id="cfgGroupReply">
+                <span class="switch-track"></span>
+              </label>
+            </div>
+            <div class="field full" style="margin-top:4px">
+              <label>无条件的群</label>
+              <input type="text" id="cfgGroupAllowAll" placeholder="群名之间用逗号分隔">
+              <small>这里列出的群不受上面那条限制，每条消息都回。留空表示没有。</small>
             </div>
           </div>
         </div>

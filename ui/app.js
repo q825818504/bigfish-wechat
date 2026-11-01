@@ -279,12 +279,15 @@ $('#btnLoadChats').addEventListener('click', async () => {
   }
 });
 
-$('#cfgAllowSelf2').addEventListener('change', saveQuick);
+$('#cfgGroupReply').addEventListener('change', saveQuick);
+$('#cfgGroupAllowAll').addEventListener('change', saveQuick);
 
 async function saveQuick() {
   if (!S.bridge) return;
   const cur = JSON.parse(await S.bridge.get_config());
-  cur.allow_self = $('#cfgAllowSelf2').checked;
+  cur.group_reply = $('#cfgGroupReply').checked;
+  cur.group_allow_all = $('#cfgGroupAllowAll').value
+    .split(',').map((s) => s.trim()).filter(Boolean);
   await S.bridge.save_config(JSON.stringify(cur));
   toast('已保存');
 }
@@ -443,7 +446,8 @@ async function loadSettings() {
     $('#cfgMaxChars').value = c.max_reply_chars ?? 300;
     $('#cfgQuiet').value = (c.quiet_hours || []).join(',');
     $('#cfgAllowSelf').checked = !!c.allow_self;
-    $('#cfgAllowSelf2').checked = !!c.allow_self;
+    $('#cfgGroupReply').checked = c.group_reply !== false;
+    $('#cfgGroupAllowAll').value = (c.group_allow_all || []).join(',');
 
     const tag = $('#modelTag');
     tag.textContent = c.model ? c.model.split('/').pop() : '未配置';
@@ -465,6 +469,9 @@ $('#btnSave').addEventListener('click', async () => {
       .map((s) => parseInt(s.trim(), 10))
       .filter((n) => Number.isInteger(n) && n >= 0 && n <= 23),
     allow_self: $('#cfgAllowSelf').checked,
+    group_reply: $('#cfgGroupReply').checked,
+    group_allow_all: $('#cfgGroupAllowAll').value
+      .split(',').map((s) => s.trim()).filter(Boolean),
   };
   try {
     const r = JSON.parse(await S.bridge.save_config(JSON.stringify(p)));
@@ -474,7 +481,6 @@ $('#btnSave').addEventListener('click', async () => {
       h.textContent = '已保存 ' + hhmmss();
       h.classList.add('show');
       setTimeout(() => h.classList.remove('show'), 2000);
-      $('#cfgAllowSelf2').checked = p.allow_self;
       loadSettings();
     } else toast(r.error || '保存失败');
   } catch (e) { toast('保存失败'); }

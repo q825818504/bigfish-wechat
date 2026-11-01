@@ -203,6 +203,8 @@ class EngineWorker(QThread):
         allow_self = bool(cfg.get("allow_self", False))
         max_chars = int(cfg.get("max_reply_chars", 300))
         quiet = [int(h) for h in (cfg.get("quiet_hours") or [])]
+        allow_all = [str(x) for x in (cfg.get("group_allow_all") or [])]
+        gate = None          # 群聊触发器，首次遇到群消息时构造
 
         self.watcher = MessageWatcher(self.reader._db, interval=interval)
         for uid in self.watching:
@@ -235,7 +237,32 @@ class EngineWorker(QThread):
             hist = convs.setdefault(msg.chat_id, [])
             is_group = msg.chat_id.endswith("@chatroom")
             who = (msg.sender_name if is_group else msg.chat_name) or "对方"
-            hist.append((who, msg.text))
+
+            # ---- 群聊触发判定 ----
+            body = msg.text
+            if is_group:
+                from bigfish.group_gate import GroupGate
+
+                if gate is None:
+                    gate = GroupGate(self.reader._db,
+                                     self.reader._db.wxid,
+                                     enable=bool(cfg.get("group_reply", True)),
+                                     allow_all=msg.chat_name in allow_all
+                                     or msg.chat_id in allow_all)
+                else:
+                    gate.allow_all = (msg.chat_name in allow_all
+                                      or msg.chat_id in allow_all)
+                t = gate.check(msg.chat_id, msg.text, True)
+                if not t.respond:
+                    self._log(f"[不接] {msg.chat_name} / "
+                              f"{msg.sender_name}: {msg.preview(36)}"
+                              f"（{t.reason}）", "")
+                    return
+                body = t.clean_text
+                self._log(f"[触发] {msg.chat_name} / "
+                          f"{msg.sender_name}: {t.reason}", "in")
+
+            hist.append((who, body))
             if len(hist) > 16:
                 del hist[:-16]
 
@@ -243,7 +270,7 @@ class EngineWorker(QThread):
             self.chat_event.emit(msg.chat_name, msg.preview(60), "in")
 
             # ---- 组装上下文 ----
-            ctx = load_context(query=msg.text or "")
+            ctx = load_context(query=body or "")
             sys_parts = [ctx.persona or self.soul.render_persona()]
             if ctx.mood and ctx.mood.injected_text.strip():
                 sys_parts.append("\n## 这会儿的状态\n\n"
@@ -254,7 +281,7 @@ class EngineWorker(QThread):
             if mem:
                 user_parts.append("## 你记得的事\n\n" + mem)
             scene = (f"你在微信群「{msg.chat_name}」里，"
-                     f"{msg.sender_name or '某人'} 刚说了话。" if is_group
+                     f"{msg.sender_name or '某人'} @了你。" if is_group
                      else f"你在微信上和「{msg.chat_name}」聊天。")
             user_parts.append(
                 f"## 这一轮\n\n{scene}\n"
@@ -291,8 +318,13 @@ class EngineWorker(QThread):
                 self._log(f"[预演] {reply}", "think")
                 return
 
+            send_text = reply
+            if is_group and msg.sender_name:
+                # 群里回复时带上 @，不然没人知道在跟谁说话
+                send_text = f"@{msg.sender_name} {reply}"
+
             try:
-                r = self.sender.send(msg.chat_name, reply)
+                r = self.sender.send(msg.chat_name, send_text)
                 if r.ok:
                     self.reply_count += 1
                     self.stats.emit(self.recv_count, self.reply_count)
@@ -794,6 +826,8 @@ class Backend(QObject):
             "max_reply_chars": ar.get("max_reply_chars", 300),
             "quiet_hours": ar.get("quiet_hours", []),
             "allow_self": ar.get("allow_self", False),
+            "group_reply": ar.get("group_reply", True),
+            "group_allow_all": ar.get("group_allow_all", []),
         }, ensure_ascii=False)
 
     @Slot(str, result=str)
@@ -812,6 +846,9 @@ class Backend(QObject):
             ar["max_reply_chars"] = int(d.get("max_reply_chars", 300))
             ar["quiet_hours"] = list(d.get("quiet_hours") or [])
             ar["allow_self"] = bool(d.get("allow_self", False))
+            ar["group_reply"] = bool(d.get("group_reply", True))
+            ar["group_allow_all"] = [str(x) for x in
+                                     (d.get("group_allow_all") or [])]
             ar["chats"] = self.watching or ar.get("chats", [])
 
             save_json_config(c)
