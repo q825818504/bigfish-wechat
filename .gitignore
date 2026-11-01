@@ -50,3 +50,4 @@ bigfish_updater_*.cmd
 # ---- 安装包产物 ----
 dist/BigFish-*
 upgrade_snapshot.json
+.secrets/
