@@ -15,7 +15,8 @@ const S = {
 
 const PAGE_TITLES = {
   overview: '概览', chats: '会话', soul: '灵魂',
-  mood: '心情', memory: '记忆', settings: '设置', logs: '日志',
+  mood: '心情', memory: '记忆', data: '数据目录',
+  settings: '设置', logs: '日志',
 };
 
 /* ────────── 工具 ────────── */
@@ -58,7 +59,8 @@ function go(page) {
 
   if (page === 'soul' && !S.soul) loadSoul();
   if (page === 'mood') loadMood();
-  if (page === 'memory') loadMemory('');
+  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); }
+  if (page === 'data') loadDataRoot();
 }
 
 $$('.nav-item').forEach((b) => b.addEventListener('click', () => go(b.dataset.page)));
@@ -301,73 +303,329 @@ async function saveQuick() {
   toast('已保存');
 }
 
-/* ────────── 灵魂 ────────── */
+/* ────────── 灵魂 ──────────
+   可读写。写入语义与 dsh-bigfish 插件 /dsh-bigfish/soul 的 POST 完全一致：
+   revision 并发检查、locked 价值保护、reset 回出厂。
+   界面上改一项就更新内存草稿，点「保存人格」才落盘 —— 不做自动保存，
+   因为人格是整卡结构，中途自动保存会把写一半的状态推给下一轮对话。
+*/
 
 const TRAIT_DOC = {
-  warmth: ['温暖', v => v < 40 ? '克制，不主动靠近' : v > 60 ? '关心但不黏人' : '明显关心，会主动问候'],
-  assertiveness: ['主见', v => v < 40 ? '顺从，倾向配合' : v > 60 ? '明确表达不同意见' : '有自己的判断，会讲理由'],
-  playfulness: ['顽皮', v => v < 40 ? '正经，少玩笑' : v > 60 ? '爱玩闹，常制造轻松气氛' : '日常爱逗，会起哄'],
-  directness: ['直接', v => v < 40 ? '说话绕，先铺垫' : v > 60 ? '直给结论，少铺垫' : '不绕太远，但顾着分寸'],
+  warmth: { label: '温暖', low: '克制，不主动靠近', mid: '关心，但不黏人', high: '明显关心，会主动问候' },
+  assertiveness: { label: '主见', low: '倾向附和，很少反驳', mid: '有想法，但不硬顶', high: '明确表达不同意见，会讲理由' },
+  playfulness: { label: '顽皮', low: '认真，少开玩笑', mid: '该认真时认真，平时会贫两句', high: '日常爱逗，会起哄' },
+  directness: { label: '直接', low: '含蓄，话留三分', mid: '不绕太远，但会顾着分寸', high: '有话直说，少铺垫' },
+};
+
+/* 精神上对齐 vault.trait_sentence：<40 低档 / >60 高档 / 其余中档 */
+const traitBand = (v) => (v <= 40 ? 'low' : v >= 60 ? 'high' : 'mid');
+const traitSentence = (k, v) => {
+  const d = TRAIT_DOC[k];
+  return d ? `${d.label}：${d[traitBand(v)]}。` : '';
 };
 
 async function loadSoul() {
   if (!S.bridge) return;
   try {
     const d = JSON.parse(await S.bridge.get_persona());
-    if (d.error) return toast(d.error);
+    if (d.error && !d.scopeReady) {
+      toast(d.error);
+      setText('#soulPreview', d.error);
+      return;
+    }
     S.soul = d;
-
-    setText('#soulRev', `rev ${d.revision}`);
-    setText('#soulName', d.name || '—');
-    setText('#soulAddress', d.address || '—');
-    $('#soulValueCount').innerHTML = `${(d.values || []).length}<small>条</small>`;
-
-    // 我是谁
-    const who = $('#soulWhoIAm');
-    who.innerHTML = (d.whoIAm || '（空）')
-      .split(/\n{2,}/).filter(Boolean)
-      .map((p) => `<p>${esc(p)}</p>`).join('');
-
-    // 珍视
-    const vals = $('#soulValues');
-    vals.innerHTML = (d.values || []).map((v) =>
-      `<div class="value-item"><span class="value-key"></span><span>${esc(v)}</span></div>`
-    ).join('') || '<div class="empty" style="padding:12px 0"><p>（空）</p></div>';
-
-    // 性格
-    const traits = d.traits || {};
-    $('#soulTraits').innerHTML = Object.entries(TRAIT_DOC).map(([k, [label, fn]]) => {
-      const v = traits[k];
-      if (typeof v !== 'number') return '';
-      return `<div class="trait-item">
-        <div class="trait-name">${label}</div>
-        <div class="trait-score">${v}<small>/100</small></div>
-        <div class="trait-desc">${esc(fn(v))}</div>
-      </div>`;
-    }).join('') || '<div class="empty"><p>（无）</p></div>';
-
-    // 自知
-    const notes = $('#soulNotes');
-    notes.innerHTML = (d.notes || d.selfNotes || []).map((n) =>
-      `<div class="note-item">${esc(n)}</div>`
-    ).join('') || '<div class="empty" style="padding:12px 0"><p>（空）</p></div>';
+    renderSoul(d);
   } catch (e) {
     toast('读取灵魂失败');
   }
 }
 
+function renderSoul(d) {
+  setText('#soulRev', `rev ${d.revision || 1}`);
+  setText('#soulName', d.name || '—');
+  setText('#soulAddress', d.address || '—');
+  $('#soulValueCount').innerHTML = `${(d.values || []).length}<small>条</small>`;
+  setText('#soulPathTag', d.path ? d.path.split(/[\\/]/).pop() : '—');
+  $('#soulPathTag').title = d.path || '';
+
+  $('#editName').value = d.name || '';
+  $('#editAddress').value = d.address || '';
+  $('#editAliases').value = d.aliases || '';
+  $('#editWhoIAm').value = d.whoIAm || '';
+  setText('#whoCount', String((d.whoIAm || '').length));
+
+  renderValues(d.values || []);
+  renderTraits(d.traits || {});
+  renderNotes(d.selfNotes || []);
+
+  setText('#soulPreview', d.persona || '（空）');
+  $('#soulWhoIAm').innerHTML = (d.whoIAm || '（空）')
+    .split(/\n{2,}/).filter(Boolean)
+    .map((p) => `<p>${esc(p)}</p>`).join('');
+
+  setText('#soulHint', d.exists ? '' : '这个范围还没有人格，正在用默认值。改完保存就会落盘。');
+}
+
+function renderValues(values) {
+  const box = $('#soulValues');
+  if (!values.length) {
+    box.innerHTML = '<div class="empty" style="padding:12px 0"><p>还没有。点右上角「+ 添加」。</p></div>';
+    return;
+  }
+  box.innerHTML = values.map((v, i) => `
+    <div class="value-edit" data-idx="${i}">
+      <input type="text" value="${esc(v.text)}" maxlength="300" data-field="text">
+      <div class="value-actions">
+        <button class="icon-btn${v.locked ? ' is-locked' : ''}" data-act="lock"
+                title="${v.locked ? '已锁定：删除前需先解锁' : '未锁定：可直接删除'}">
+          ${v.locked
+            ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 018 0v3"/></svg>'
+            : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 017-2.6"/></svg>'}
+        </button>
+        <button class="icon-btn" data-act="del" title="删除">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+    </div>`).join('');
+}
+
+function renderTraits(traits) {
+  $('#soulTraits').innerHTML = Object.entries(TRAIT_DOC).map(([k, doc]) => {
+    const v = typeof traits[k] === 'number' ? traits[k] : 50;
+    return `<div class="trait-edit" data-key="${k}">
+      <div class="trait-lbl">${doc.label}</div>
+      <div class="trait-slider-wrap">
+        <input type="range" min="0" max="100" step="1" value="${v}" data-slider>
+        <div class="trait-usage">${esc(traitSentence(k, v))}</div>
+      </div>
+      <div class="trait-num" data-num>${v}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderNotes(notes) {
+  const box = $('#soulNotes');
+  if (!notes.length) {
+    box.innerHTML = '<div class="empty" style="padding:12px 0"><p>还没有。点右上角「+ 添加」。</p></div>';
+    return;
+  }
+  box.innerHTML = notes.map((n, i) => `
+    <div class="note-edit" data-idx="${i}">
+      <input type="text" value="${esc(n)}" maxlength="500">
+      <button class="icon-btn" data-act="del" title="删除">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>`).join('');
+}
+
+/* ── 灵魂：交互 ── */
+
+$('#editWhoIAm').addEventListener('input', (e) => {
+  setText('#whoCount', String(e.target.value.length));
+});
+
+// 性格滑杆：拖动时即时更新数字与那句话，不写盘
+$('#soulTraits').addEventListener('input', (e) => {
+  const slider = e.target.closest('[data-slider]');
+  if (!slider) return;
+  const row = slider.closest('.trait-edit');
+  const v = parseInt(slider.value, 10);
+  row.querySelector('[data-num]').textContent = String(v);
+  row.querySelector('.trait-usage').textContent = traitSentence(row.dataset.key, v);
+});
+
+// 价值：删除 / 解锁 / 添加
+$('#soulValues').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const row = btn.closest('.value-edit');
+  const idx = parseInt(row.dataset.idx, 10);
+  const vals = (S.soul?.values || []).slice();
+
+  if (btn.dataset.act === 'lock') {
+    vals[idx] = { ...vals[idx], locked: !vals[idx].locked };
+    S.soul.values = vals;
+    renderValues(vals);
+    return;
+  }
+  if (btn.dataset.act === 'del') {
+    /* ⚠ locked 的判定要**按当前渲染行**去读，不能读 S.soul.values[idx]。
+       两者在「先删过一条、索引已经错位」时会指向不同条目 ——
+       守卫就会守错对象，把没锁的拦下来、把锁着的删掉。
+       这里直接查被点的那个按钮自己的 class，它才是用户看着的那一行。 */
+    if (btn.closest('.value-edit')?.querySelector('.icon-btn.is-locked')) {
+      toast('这条是锁定的，先点锁图标解锁');
+      return;
+    }
+    if (vals[idx]?.locked) {
+      toast('这条是锁定的，先点锁图标解锁');
+      return;
+    }
+    vals.splice(idx, 1);
+    S.soul.values = vals;
+    renderValues(vals);
+  }
+});
+
+// 价值：编辑文本（用 input 事件同步到内存，不重绘 —— 重绘会丢焦点）
+$('#soulValues').addEventListener('input', (e) => {
+  const input = e.target.closest('[data-field="text"]');
+  if (!input) return;
+  const idx = parseInt(input.closest('.value-edit').dataset.idx, 10);
+  if (S.soul?.values?.[idx]) S.soul.values[idx].text = input.value;
+});
+
+$('#btnAddValue').addEventListener('click', () => {
+  if (!S.soul) return toast('还没读到人格');
+  const vals = (S.soul.values || []).slice();
+  vals.push({ id: 'v' + (vals.length + 1), text: '', locked: false });
+  S.soul.values = vals;
+  renderValues(vals);
+  const last = $('#soulValues').lastElementChild?.querySelector('input');
+  if (last) last.focus();
+});
+
+// 自我认识：删除 / 编辑 / 添加
+$('#soulNotes').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-act="del"]');
+  if (!btn) return;
+  const idx = parseInt(btn.closest('.note-edit').dataset.idx, 10);
+  const notes = (S.soul?.selfNotes || []).slice();
+  notes.splice(idx, 1);
+  S.soul.selfNotes = notes;
+  renderNotes(notes);
+});
+$('#soulNotes').addEventListener('input', (e) => {
+  const idx = parseInt(e.target.closest('.note-edit')?.dataset.idx, 10);
+  if (Number.isInteger(idx) && S.soul?.selfNotes?.[idx] !== undefined) {
+    S.soul.selfNotes[idx] = e.target.value;
+  }
+});
+$('#btnAddNote').addEventListener('click', () => {
+  if (!S.soul) return toast('还没读到人格');
+  const notes = (S.soul.selfNotes || []).slice();
+  notes.push('');
+  S.soul.selfNotes = notes;
+  renderNotes(notes);
+  const last = $('#soulNotes').lastElementChild?.querySelector('input');
+  if (last) last.focus();
+});
+
+/* ── 灵魂：保存 ── */
+
+function collectSoul() {
+  const values = [];
+  $$('#soulValues .value-edit').forEach((row, i) => {
+    const text = row.querySelector('[data-field="text"]')?.value?.trim();
+    if (!text) return;   // 空条目直接丢，服务端也会丢
+    const prev = S.soul?.values || [];
+    // 按位置找原来的 id 和 locked，保持稳定
+    const orig = prev[findOrigIdx(prev, i)];
+    values.push({
+      id: (orig && orig.id) || ('v' + (values.length + 1)),
+      text,
+      locked: !!(orig && orig.locked),
+    });
+  });
+
+  const traits = {};
+  $$('#soulTraits .trait-edit').forEach((row) => {
+    traits[row.dataset.key] = parseInt(
+      row.querySelector('[data-slider]').value, 10);
+  });
+
+  const selfNotes = [];
+  $$('#soulNotes .note-edit input').forEach((inp) => {
+    const t = inp.value.trim();
+    if (t) selfNotes.push(t);
+  });
+
+  return {
+    identity: {
+      name: $('#editName').value.trim() || '大肥鱼',
+      address: $('#editAddress').value.trim() || '爸爸',
+      aliases: $('#editAliases').value.trim(),
+      whoIAm: $('#editWhoIAm').value,
+    },
+    values,
+    traits,
+    selfNotes,
+  };
+}
+
+/* 草稿里删过条目后位置会错位，这里按「文本已存在则复用其 id」找原条目 */
+function findOrigIdx(prev, renderedIdx) {
+  const row = $$('#soulValues .value-edit')[renderedIdx];
+  const text = row?.querySelector('[data-field="text"]')?.value;
+  const hit = prev.findIndex((v) => v.text === text);
+  return hit >= 0 ? hit : renderedIdx;
+}
+
+$('#btnSoulSave').addEventListener('click', async () => {
+  if (!S.bridge || !S.soul) return toast('还没读到人格');
+  const btn = $('#btnSoulSave');
+  btn.disabled = true;
+  const hint = $('#soulHint');
+  hint.className = 'hint-line';
+  try {
+    const payload = {
+      soul: collectSoul(),
+      baseRevision: S.soul.revision || 1,
+    };
+    const r = JSON.parse(await S.bridge.save_persona(JSON.stringify(payload)));
+
+    if (!r.ok) {
+      if (r.code === 'revision-conflict') {
+        toast('这份人格在别处被改过了，正在重新载入');
+        hint.textContent = r.error || '';
+        hint.className = 'hint-line is-err';
+        await loadSoul();
+        return;
+      }
+      // 失败必须留在页面上，不能只弹一个会自己消失的 toast ——
+      // 用户点完保存什么都没变，却不知道是权限、是磁盘、还是别的什么。
+      toast(r.error || '保存失败');
+      hint.textContent = '保存失败：' + (r.error || '未知原因');
+      hint.className = 'hint-line is-err';
+      return;
+    }
+    toast('已保存');
+    hint.textContent = '已保存 ' + hhmmss() + '（rev ' + r.revision + '）';
+    hint.className = 'hint-line is-ok';
+    await loadSoul();
+  } catch (e) {
+    toast('保存失败');
+    hint.textContent = '保存失败：' + (e && e.message ? e.message : String(e));
+    hint.className = 'hint-line is-err';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('#btnSoulReset').addEventListener('click', async () => {
+  if (!S.bridge) return;
+  if (!confirm('把人格恢复成出厂默认？你现在写的内容会被覆盖（revision 会 +1）。')) return;
+  try {
+    const r = JSON.parse(await S.bridge.save_persona(JSON.stringify({ reset: true })));
+    if (!r.ok) return toast(r.error || '恢复失败');
+    toast('已恢复默认');
+    S.soul = null;
+    await loadSoul();
+  } catch (e) { toast('恢复失败'); }
+});
+
 /* ────────── 心情 ────────── */
 
 const DIM_NAMES = {
-  happy: '开心', calm: '平静', sweet: '甜',
-  heartache: '心软', worry: '担心', sad: '难过', jealous: '吃醋',
+  happy: '开心', calm: '踏实', sweet: '甜蜜',
+  heartache: '心疼', worry: '担心', sad: '难过', jealous: '吃醋',
 };
 
 async function loadMood() {
   if (!S.bridge) return;
   try {
     const d = JSON.parse(await S.bridge.get_mood());
-    if (d.error) return toast(d.error);
+    if (d.error && d.value === undefined) return toast(d.error);
 
     const score = Math.round(d.value ?? 0);
     setText('#moodScore', d.value == null ? '—' : score);
@@ -384,67 +642,628 @@ async function loadMood() {
     // 维度
     const dims = d.dims || {};
     const box = $('#moodDims');
-    const rows = Object.entries(DIM_NAMES).map(([k, label]) => {
-      const raw = Number(dims[k] ?? 0);
-      // dims 是 0-1 的小数，展示成百分比
-      const p = Math.max(0, Math.min(1, raw));
+    box.innerHTML = Object.entries(DIM_NAMES).map(([k, label]) => {
+      const p = Math.max(0, Math.min(1, Number(dims[k] ?? 0)));
       return `<div class="dim-row">
         <span class="dim-name">${label}</span>
         <span class="dim-track"><span class="dim-fill" style="width:${(p * 100).toFixed(1)}%"></span></span>
         <span class="dim-val">${(p * 100).toFixed(0)}%</span>
       </div>`;
-    }).join('');
-    box.innerHTML = rows || '<div class="empty"><p>（无数据）</p></div>';
+    }).join('') || '<div class="empty"><p>（无数据）</p></div>';
+
+    fillMoodConfig(d.config || {});
   } catch (e) {
     toast('读取心情失败');
   }
 }
 
+function fillMoodConfig(c) {
+  $('#moodBase').value = c.moodBase ?? 70;
+  $('#moodFloor').value = c.moodFloor ?? 0;
+  $('#moodDecay').value = c.decayHalfHours ?? 12;
+  $('#moodPerDay').value = c.injectPerDay ?? 6;
+  $('#moodConf').value = c.injectConfidence ?? 40;
+  $('#moodSigMood').value = c.sigMood ?? 3;
+  $('#moodSigDim').value = c.sigDim ?? 5;
+  $('#moodInjectMode').value = c.injectMode || 'event';
+  $('#moodAutoJudge').checked = c.autoJudge !== false;
+}
+
+$('#btnMoodSave').addEventListener('click', async () => {
+  if (!S.bridge) return toast('后端未就绪');
+  const patch = {
+    moodBase: parseInt($('#moodBase').value, 10),
+    moodFloor: parseInt($('#moodFloor').value, 10),
+    decayHalfHours: parseInt($('#moodDecay').value, 10),
+    injectPerDay: parseInt($('#moodPerDay').value, 10),
+    injectConfidence: parseInt($('#moodConf').value, 10),
+    sigMood: parseInt($('#moodSigMood').value, 10),
+    sigDim: parseInt($('#moodSigDim').value, 10),
+    injectMode: $('#moodInjectMode').value,
+    autoJudge: $('#moodAutoJudge').checked,
+  };
+  try {
+    const r = JSON.parse(await S.bridge.save_mood_config(JSON.stringify(patch)));
+    const h = $('#moodHint');
+    if (!r.ok) {
+      toast(r.error || '保存失败');
+      h.textContent = '保存失败：' + (r.error || '未知原因');
+      h.className = 'hint-line is-err';
+      return;
+    }
+    toast('已保存');
+    h.textContent = '已保存 ' + hhmmss() + '，下一轮判断生效';
+    h.className = 'hint-line is-ok';
+    fillMoodConfig(r.config || {});
+  } catch (e) {
+    toast('保存失败');
+    const h = $('#moodHint');
+    h.textContent = '保存失败：' + (e && e.message ? e.message : String(e));
+    h.className = 'hint-line is-err';
+  }
+});
+
+$('#btnMoodReset').addEventListener('click', async () => {
+  if (!S.bridge) return;
+  if (!confirm('把心情拉回基线？情绪维度归零，时间线保留（历史证据不删）。')) return;
+  try {
+    const r = JSON.parse(await S.bridge.reset_mood());
+    if (!r.ok) return toast(r.error || '重置失败');
+    toast('已重置');
+    await loadMood();
+  } catch (e) { toast('重置失败'); }
+});
+
 /* ────────── 记忆 ────────── */
 
-async function loadMemory(query) {
+const MEM_PAGE = 40;
+S.mem = { offset: 0, total: 0, selected: new Set(), mode: 'browse' };
+
+const fmtBytes = (n) => {
+  if (!n) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+};
+
+async function loadMemoryStats() {
   if (!S.bridge) return;
   try {
-    const d = JSON.parse(await S.bridge.search_memory(query || '', 40));
+    const d = JSON.parse(await S.bridge.memory_stats());
+    if (d.error) {
+      setText('#memTotal', '—');
+      setText('#memChunks', '—');
+      setText('#memSize', '—');
+      return;
+    }
+    setText('#memTotal', String(d.total ?? '—'));
+    setText('#memChunks', String(d.chunks ?? '—'));
+    setText('#memSize', fmtBytes(d.size));
+    setText('#memDbTag', `共 ${d.total ?? 0} 条 / ${d.sessions ?? 0} 个会话`);
+    setText('#memCount', `库里 ${d.total ?? 0} 条`);
+    S.mem.total = d.total || 0;
+  } catch (e) { /* 静默 */ }
+}
+
+/* 浏览模式：按 id 倒序翻页 */
+async function loadMemory(query) {
+  if (!S.bridge) return;
+
+  if (query) {
+    // 检索模式：走 bridge.mjs → 原版 MemoryStore，分词与衰减一致
+    S.mem.mode = 'search';
+    try {
+      const d = JSON.parse(await S.bridge.search_memory(query, 40));
+      if (d.error) return toast(d.error);
+      const items = d.items || [];
+      setText('#memCount', `命中 ${items.length} 条 / 库里 ${d.total ?? '?'} 条`);
+      setText('#memPageInfo', '检索结果');
+      $('#memPager').style.display = 'none';
+
+      const box = $('#memList');
+      if (!items.length) {
+        box.innerHTML = `<div class="empty">
+          <h3>没有匹配的记忆</h3>
+          <p>换一个词试试。记忆检索用的是中文二元分词，整句也能命中。</p></div>`;
+        return;
+      }
+      box.innerHTML = items.map((m) => `
+        <div class="memory-item">
+          <div class="memory-meta">
+            <span class="memory-role ${m.role === 'assistant' ? 'assistant' : ''}">
+              ${m.role === 'assistant' ? esc(S.soul?.name || '她') : '对方'}
+            </span>
+            <span class="memory-time">${esc(m.time || '')}</span>
+          </div>
+          <div class="memory-text">${esc(m.text)}</div>
+        </div>`).join('');
+    } catch (e) {
+      toast('检索失败');
+    }
+    return;
+  }
+
+  // 浏览模式
+  S.mem.mode = 'browse';
+  $('#memPager').style.display = '';
+  try {
+    const role = $('#memRole').value || '';
+    const filter = $('#memFilter').value.trim();
+    const d = JSON.parse(await S.bridge.browse_memory(
+      S.mem.offset, MEM_PAGE, role, filter));
     if (d.error) return toast(d.error);
 
-    const box = $('#memList');
     const items = d.items || [];
-    // 标题旁标注：有检索词时显示命中数，没有检索词时显示库总量
-    const total = d.total;
-    if (query) {
-      setText('#memCount', `命中 ${items.length} 条 / 库里 ${total ?? '?'} 条`);
-    } else {
-      setText('#memCount', total != null ? `库里 ${total} 条` : '—');
-    }
-    setText('#memDbTag', total != null ? `共 ${total} 条` : '—');
+    S.mem.total = d.total || 0;
+    const from = S.mem.total ? S.mem.offset + 1 : 0;
+    const to = Math.min(S.mem.offset + items.length, S.mem.total);
+    setText('#memPageInfo', `${from}–${to} / ${S.mem.total}`);
+    setText('#memCount', `库里 ${S.mem.total} 条`);
 
+    const box = $('#memList');
     if (!items.length) {
       box.innerHTML = `<div class="empty">
-        <h3>没有匹配的记忆</h3>
-        <p>换一个词试试。记忆检索用的是中文二元分词，整句也能命中。</p></div>`;
+        <h3>没有记忆</h3>
+        <p>${filter ? '这个过滤条件下没有内容' : '这个范围的记忆库是空的'}</p></div>`;
       return;
     }
 
     box.innerHTML = items.map((m) => `
-      <div class="memory-item">
-        <div class="memory-meta">
-          <span class="memory-role ${m.role === 'assistant' ? 'assistant' : ''}">
-            ${m.role === 'assistant' ? esc(S.soul?.name || '她') : '对方'}
-          </span>
-          <span class="memory-time">${esc(m.time || '')}</span>
+      <div class="memory-item selectable">
+        <input type="checkbox" class="mem-check" data-id="${m.id}"
+               ${S.mem.selected.has(m.id) ? 'checked' : ''}>
+        <div class="memory-body">
+          <div class="memory-meta">
+            <span class="memory-role ${m.role === 'assistant' ? 'assistant' : ''}">
+              ${m.role === 'assistant' ? esc(S.soul?.name || '她') : '对方'}
+            </span>
+            <span class="memory-time">${esc(m.time || '')}</span>
+            <button class="icon-btn" data-del="${m.id}" title="删掉这条"
+                    style="margin-left:6px;width:22px;height:22px">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </div>
+          <div class="memory-text">${esc(m.text)}</div>
         </div>
-        <div class="memory-text">${esc(m.text)}</div>
       </div>`).join('');
+
+    // 选中状态同步
+    $$('#memList .mem-check').forEach((cb) => {
+      cb.addEventListener('change', () => {
+        const id = parseInt(cb.dataset.id, 10);
+        if (cb.checked) S.mem.selected.add(id);
+        else S.mem.selected.delete(id);
+        updateMemSelectionUI();
+      });
+    });
+    // 单条删
+    $$('#memList [data-del]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const id = parseInt(btn.dataset.del, 10);
+        if (!confirm(`删掉这条记忆？删了就找不回来了。`)) return;
+        const r = JSON.parse(await S.bridge.delete_memory(JSON.stringify({ ids: [id] })));
+        if (!r.ok) return toast(r.error || '删除失败');
+        toast(`已删除 ${r.deleted} 条`);
+        S.mem.selected.delete(id);
+        await loadMemoryStats();
+        await loadMemory('');
+      });
+    });
+    updateMemSelectionUI();
   } catch (e) {
-    toast('检索失败');
+    toast('读取记忆失败');
   }
 }
 
-$('#btnMemSearch').addEventListener('click', () => loadMemory($('#memQuery').value.trim()));
-$('#memQuery').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') loadMemory($('#memQuery').value.trim());
+function updateMemSelectionUI() {
+  const n = S.mem.selected.size;
+  const tag = $('#memDbTag');
+  if (n > 0) {
+    tag.textContent = `已选 ${n} 条`;
+    tag.className = 'tag';
+    tag.style.cursor = 'pointer';
+    tag.title = '点这里删掉选中的';
+  } else {
+    tag.style.cursor = '';
+    tag.title = '';
+    tag.className = 'tag';
+    const total = S.mem.total;
+    tag.textContent = total ? `共 ${total} 条` : '—';
+  }
+}
+
+$('#memDbTag').addEventListener('click', async () => {
+  const ids = [...S.mem.selected];
+  if (!ids.length) return;
+  if (!confirm(`删掉选中的 ${ids.length} 条记忆？`)) return;
+  const r = JSON.parse(await S.bridge.delete_memory(JSON.stringify({ ids })));
+  if (!r.ok) return toast(r.error || '删除失败');
+  toast(`已删除 ${r.deleted} 条`);
+  S.mem.selected.clear();
+  await loadMemoryStats();
+  await loadMemory('');
 });
+
+$('#btnMemSearch').addEventListener('click', () => {
+  S.mem.offset = 0;
+  loadMemory($('#memQuery').value.trim());
+});
+$('#memQuery').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    S.mem.offset = 0;
+    loadMemory($('#memQuery').value.trim());
+  }
+});
+
+$('#btnMemBrowse').addEventListener('click', () => {
+  S.mem.offset = 0;
+  S.mem.selected.clear();
+  $('#memQuery').value = '';
+  loadMemory('');
+});
+$('#memFilter').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    S.mem.offset = 0;
+    loadMemory('');
+  }
+});
+$('#memRole').addEventListener('change', () => {
+  S.mem.offset = 0;
+  loadMemory('');
+});
+
+$('#btnMemPrev').addEventListener('click', () => {
+  S.mem.offset = Math.max(0, S.mem.offset - MEM_PAGE);
+  loadMemory('');
+});
+$('#btnMemNext').addEventListener('click', () => {
+  if (S.mem.offset + MEM_PAGE < S.mem.total) {
+    S.mem.offset += MEM_PAGE;
+    loadMemory('');
+  }
+});
+
+/* ── 记忆：会话清单 ── */
+async function loadMemorySessions() {
+  if (!S.bridge) return;
+  try {
+    const d = JSON.parse(await S.bridge.list_memory_sessions());
+    const rows = d.sessions || [];
+    const box = $('#memSessions');
+    if (!rows.length) {
+      box.innerHTML = '<div class="empty" style="padding:12px 0"><p>这个范围还没有会话记录。</p></div>';
+      return;
+    }
+    box.innerHTML = rows.map((s) => `
+      <div class="session-row">
+        <span class="session-name" title="${esc(s.session)}">${esc(s.session)}</span>
+        <span class="session-meta">${s.count} 条</span>
+        <span class="session-meta">${esc(s.newestText || '')}</span>
+        <button class="icon-btn" data-session="${esc(s.session)}" title="删掉这个会话的全部记忆">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>`).join('');
+
+    $$('#memSessions [data-session]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const sid = btn.dataset.session;
+        if (!confirm(`删掉会话「${sid.slice(0, 40)}」留下的全部记忆？\n删了就找不回来了。`)) return;
+        const r = JSON.parse(await S.bridge.delete_memory(
+          JSON.stringify({ session: sid, confirm: true })));
+        if (!r.ok) return toast(r.error || '删除失败');
+        toast(`已删除 ${r.deleted} 条`);
+        await loadMemoryStats();
+        await loadMemorySessions();
+        await loadMemory('');
+      });
+    });
+  } catch (e) { /* 静默 */ }
+}
+
+/* ── 记忆：维护 ── */
+$('#btnMemExport').addEventListener('click', async () => {
+  if (!S.bridge) return;
+  try {
+    const r = JSON.parse(await S.bridge.export_memory(''));
+    const h = $('#memMaintainHint');
+    if (!r.ok) {
+      h.textContent = '导出失败：' + (r.error || '');
+      h.className = 'card-desc is-err';
+      return toast('导出失败');
+    }
+    h.textContent = '已导出到 ' + r.path;
+    h.className = 'card-desc is-ok';
+    toast('已导出');
+  } catch (e) { toast('导出失败'); }
+});
+
+$('#btnMemImport').addEventListener('click', async () => {
+  if (!S.bridge) return;
+  let src = '';
+  try {
+    const picked = JSON.parse(await S.bridge.pick_file(''));
+    src = picked.path || '';
+  } catch (e) { src = ''; }
+  if (!src) {
+    src = prompt('输入要导入的 .sqlite3 备份完整路径：') || '';
+  }
+  if (!src) return;
+  if (!confirm('导入会覆盖当前记忆库。现有库会先自动备份成 .bak-时间戳。继续？')) return;
+  try {
+    const r = JSON.parse(await S.bridge.import_memory(src.trim()));
+    const h = $('#memMaintainHint');
+    if (!r.ok) {
+      h.textContent = '导入失败：' + (r.error || '');
+      h.className = 'card-desc is-err';
+      return toast('导入失败');
+    }
+    h.textContent = '已导入到 ' + r.path;
+    h.className = 'card-desc is-ok';
+    toast('已导入');
+    await loadMemoryStats();
+    await loadMemory('');
+    await loadMemorySessions();
+  } catch (e) { toast('导入失败'); }
+});
+
+$('#btnMemVacuum').addEventListener('click', async () => {
+  if (!S.bridge) return;
+  if (!confirm('压缩会短暂独占记忆库，DSH 那边这段时间写不进去。继续？')) return;
+  try {
+    const r = JSON.parse(await S.bridge.vacuum_memory());
+    const h = $('#memMaintainHint');
+    if (!r.ok) {
+      h.textContent = '压缩失败：' + (r.error || '');
+      h.className = 'card-desc is-err';
+      return toast('压缩失败');
+    }
+    h.textContent = '压缩完成';
+    h.className = 'card-desc is-ok';
+    toast('已压缩');
+    await loadMemoryStats();
+  } catch (e) { toast('压缩失败'); }
+});
+
+/* ────────── 数据目录 ────────── */
+
+async function loadDataRoot() {
+  if (!S.bridge) return;
+  try {
+    const d = JSON.parse(await S.bridge.get_data_root());
+    if (d.error) return toast(d.error);
+    S.data = d;
+
+    $('#dataRootPath').value = d.root || '';
+    setText('#dataRootTag', d.custom ? '自定义' : '默认');
+    setText('#dataRootFile', `配置文件：${d.rootFile || '—'}`);
+    setText('#scopeKeyTag', d.currentKey || '未确定');
+    $('#dataRootTarget').value = '';
+
+    // 可写性：不可写就直接在页面上说清楚，别等用户点保存才失败
+    const hint = $('#dataRootHint');
+    if (d.writable === false) {
+      hint.innerHTML = '<strong>这个数据根现在写不进去。</strong>' +
+        '改人格、改心情参数都会失败。<br>' +
+        '可以换一个普通目录（用下面「搬过去」连同数据一起搬），' +
+        '或者用管理员身份重新打开本程序。<br>' +
+        `<span style="opacity:.7">系统返回：${esc(d.writeError || '')}</span>`;
+      hint.className = 'hint-line is-err';
+    } else if (hint.className.includes('is-err')) {
+      hint.textContent = '';
+      hint.className = 'hint-line';
+    }
+
+    // 范围表单
+    const sc = d.scope || {};
+    $('#scopeMode').value = sc.mode || 'workspace';
+    $('#scopeSessions').value = (sc.sessionIds || []).join(', ');
+
+    renderScopeList(d.scopes || [], d.currentKey);
+    await loadScopeCandidates(sc.workspaceId || '');
+    updateScopeFormState();
+  } catch (e) { toast('读取数据目录失败'); }
+}
+
+function renderScopeList(scopes, currentKey) {
+  const box = $('#scopeList');
+  if (!scopes.length) {
+    box.innerHTML = '<div class="empty" style="padding:12px 0"><p>这个数据根下还没有任何范围目录。</p></div>';
+    return;
+  }
+  box.innerHTML = scopes.map((s) => {
+    const badges = [];
+    if (s.has_soul) badges.push('<span class="tag ok">灵魂</span>');
+    if (s.has_mood) badges.push('<span class="tag">心情</span>');
+    if (s.has_memory) badges.push('<span class="tag">记忆</span>');
+    return `<div class="session-row${s.key === currentKey ? ' is-current' : ''}"
+                 data-key="${esc(s.key)}" style="cursor:pointer">
+      <span class="session-name" title="${esc(s.dir)}">${esc(s.key)}</span>
+      ${s.name ? `<span class="session-meta">${esc(s.name)}</span>` : ''}
+      ${badges.join('') || '<span class="tag">空</span>'}
+      ${s.key === currentKey ? '<span class="tag ok">当前</span>' : ''}
+    </div>`;
+  }).join('');
+
+  // 点一行 → 把那行的范围填进表单
+  $$('#scopeList .session-row[data-key]').forEach((row) => {
+    row.addEventListener('click', () => {
+      const key = row.dataset.key;
+      if (key.startsWith('ws-')) {
+        $('#scopeMode').value = 'workspace';
+        const ws = $('#scopeWorkspace');
+        const hit = Array.from(ws.options).find((o) => o.value === key.slice(3));
+        if (hit) ws.value = hit.value;
+        else {
+          // 工作区列表里没有（比如那个工作区已经删了）→ 直接塞进会话框让用户看清
+          toast('这个范围对应的工区不在 workspace.json 里，只能手动指定');
+        }
+      } else if (key.startsWith('ss-')) {
+        $('#scopeMode').value = 'session';
+        $('#scopeSessions').value = key.slice(3);
+      }
+      updateScopeFormState();
+    });
+  });
+}
+
+async function loadScopeCandidates(selectedWs) {
+  if (!S.bridge) return;
+  try {
+    const d = JSON.parse(await S.bridge.get_scope_candidates());
+    if (!d.ok) return;
+    const ws = $('#scopeWorkspace');
+    const list = d.workspaces || [];
+    ws.innerHTML = '<option value="">（未选择）</option>' + list.map((w) => {
+      const key = 'ws-' + w.id;
+      const live = (d.liveScopes || {})[key];
+      const mark = live?.name ? ` · ${live.name}` : (live?.hasSoul ? ' · 有灵魂' : '');
+      const label = w.title || w.path || w.id;
+      return `<option value="${esc(w.id)}">${esc(label)}${esc(mark)}</option>`;
+    }).join('');
+    if (selectedWs) ws.value = selectedWs;
+
+    setText('#scopeWsHint',
+      `读到 ${list.length} 个工作区、${(d.sessions || []).length} 个会话`);
+  } catch (e) { /* 静默 */ }
+}
+
+function updateScopeFormState() {
+  const isWs = $('#scopeMode').value === 'workspace';
+  $('#scopeWorkspace').disabled = !isWs;
+  $('#scopeSessions').disabled = isWs;
+  $('#scopeWorkspace').style.opacity = isWs ? '1' : '.45';
+  $('#scopeSessions').style.opacity = isWs ? '.45' : '1';
+}
+
+$('#scopeMode').addEventListener('change', updateScopeFormState);
+
+$('#btnScopeSave').addEventListener('click', async () => {
+  if (!S.bridge) return toast('后端未就绪');
+  const mode = $('#scopeMode').value;
+  const wid = $('#scopeWorkspace').value;
+  const sids = $('#scopeSessions').value
+    .split(',').map((s) => s.trim()).filter(Boolean);
+
+  if (mode === 'workspace' && !wid) return toast('请先选工作区');
+  if (mode === 'session' && !sids.length) return toast('请填至少一个会话 id');
+
+  try {
+    const r = JSON.parse(await S.bridge.set_scope(
+      mode, mode === 'workspace' ? wid : '', JSON.stringify(sids)));
+    if (!r.ok) return toast(r.error || '保存失败');
+    const h = $('#scopeHint');
+    h.textContent = '已切到 ' + (r.currentKey || '') + '　（DSH 插件那边会读到同一个文件）';
+    h.className = 'hint-line is-ok';
+    toast('范围已保存');
+    S.soul = null;
+    await loadDataRoot();
+  } catch (e) { toast('保存失败'); }
+});
+
+$('#btnScopeRefresh').addEventListener('click', () => loadDataRoot());
+
+/* ── 数据根：打开 / 选择 / 只改指向 / 搬家 ── */
+$('#btnDataRootOpen').addEventListener('click', async () => {
+  const p = $('#dataRootPath').value;
+  if (!p) return;
+  try {
+    await S.bridge.open_path(p);
+  } catch (e) { toast('打不开'); }
+});
+
+$('#btnDataRootPick').addEventListener('click', async () => {
+  try {
+    const r = JSON.parse(await S.bridge.pick_directory($('#dataRootPath').value));
+    if (r.path) $('#dataRootTarget').value = r.path;
+    else if (r.error) toast(r.error);
+  } catch (e) { toast('选择失败'); }
+});
+
+$('#btnDataRootPreview').addEventListener('click', async () => {
+  const target = $('#dataRootTarget').value.trim();
+  if (!target) return toast('先填目标目录');
+  try {
+    const d = JSON.parse(await S.bridge.inspect_move(target));
+    const h = $('#dataRootHint');
+    if (!d.ok) {
+      h.textContent = '检查失败：' + (d.error || '');
+      h.className = 'hint-line is-err';
+      return;
+    }
+    const files = d.items.reduce((n, it) => n + (it.files || 0), 0);
+    let msg = `要搬 ${d.items.length} 项 / ${files} 个文件 / ${fmtBytes(d.totalBytes)}`;
+    if (d.conflicts.length) {
+      msg += `　⚠ 目标里已存在同名项 ${d.conflicts.length} 个：${d.conflicts.slice(0, 5).join(', ')}`;
+    }
+    if (d.dstWritable === false) {
+      msg += `　⚠ 目标目录不能写（${d.dstWriteError}）—— 搬过去也用不了`;
+    }
+    h.textContent = msg;
+    h.className = 'hint-line' + ((d.conflicts.length || d.dstWritable === false) ? ' is-err' : ' is-ok');
+  } catch (e) { toast('检查失败'); }
+});
+
+$('#btnDataRootSave').addEventListener('click', async () => {
+  const target = $('#dataRootTarget').value.trim();
+  if (!target) return toast('先填目标目录');
+  if (!confirm(`把数据根指向 ${target}？\n原有数据不会搬过去 —— 那边没有灵魂记忆就都读不到。\n\n要连同数据一起搬请用「搬过去」。`)) return;
+  try {
+    const r = JSON.parse(await S.bridge.set_data_root(target));
+    const h = $('#dataRootHint');
+    if (!r.ok) {
+      h.textContent = '失败：' + (r.error || '');
+      h.className = 'hint-line is-err';
+      return toast('保存失败');
+    }
+    h.textContent = '数据根已改为 ' + r.root;
+    h.className = 'hint-line is-ok';
+    toast('已保存');
+    S.soul = null;
+    await loadDataRoot();
+  } catch (e) { toast('保存失败'); }
+});
+
+$('#btnDataRootMove').addEventListener('click', async () => {
+  const target = $('#dataRootTarget').value.trim();
+  if (!target) return toast('先填目标目录');
+  try {
+    const d = JSON.parse(await S.bridge.inspect_move(target));
+    if (!d.ok) return toast(d.error || '检查失败');
+    if (d.conflicts.length) {
+      if (!confirm(`目标里已有 ${d.conflicts.length} 个同名项，会被源覆盖：\n` +
+                   d.conflicts.slice(0, 8).join('\n') + '\n\n继续？')) return;
+    }
+    if (!confirm(`连同数据一起搬到 ${target}？\n\n源目录会被改名成 .old-时间戳 留着，不直接删。`)) return;
+
+    const h = $('#dataRootHint');
+    h.textContent = '正在搬…';
+    h.className = 'hint-line';
+
+    const r = JSON.parse(await S.bridge.apply_move(target));
+    if (!r.ok) {
+      h.textContent = '搬家失败：' + (r.error || '') + '（数据根未改动）';
+      h.className = 'hint-line is-err';
+      return toast('搬家失败');
+    }
+    h.textContent = '已搬到 ' + r.root;
+    h.className = 'hint-line is-ok';
+    toast('已搬家');
+    S.soul = null;
+    await loadDataRoot();
+  } catch (e) { toast('搬家失败'); }
+});
+
+$('#btnDataRootDefault').addEventListener('click', async () => {
+  if (!confirm('数据根恢复成默认位置？原来那个目录不会被删。')) return;
+  try {
+    const r = JSON.parse(await S.bridge.set_data_root(''));
+    if (!r.ok) return toast(r.error || '失败');
+    toast('已恢复默认');
+    S.soul = null;
+    await loadDataRoot();
+  } catch (e) { toast('失败'); }
+});
+
 
 /* ────────── 设置 ────────── */
 

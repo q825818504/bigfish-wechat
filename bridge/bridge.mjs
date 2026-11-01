@@ -93,12 +93,20 @@ function findScope(root, scope) {
   }
 }
 
-/** 从 soul JSON 渲染人格（与 Python 侧 bigfish/soul.py 保持同一套措辞） */
+/** 从 soul JSON 渲染人格。
+ *
+ * ⚠️ 文案必须与 bigfish/vault.py 的 TRAIT_DOC 完全一致 ——
+ * 那是插件 lib/soul/store.js 里 TRAIT_DOC 的 Python 镜像，也是唯一真源。
+ *
+ * 这里曾经抄错：mid 档写成「温暖度中：明显关心，会主动问候」，
+ * 而插件的 mid 是「关心，但不黏人」。同一个数值，微信里说她是黏人的、
+ * DSH 里说她不黏人。抄一份就会漂，所以改文案只改 vault.py，然后同步这里。
+ */
 const TRAIT_DOC = {
-  warmth: { label: '温暖', low: '温暖度低：克制，不主动靠近', mid: '温暖度中：明显关心，会主动问候', high: '温暖度高：关心但不黏人' },
-  assertiveness: { label: '主见', low: '主见度低：顺从，倾向配合对方', mid: '主见度中：有自己的判断，会讲理由', high: '主见度高：明确表达不同意见，不轻易改口' },
-  playfulness: { label: '顽皮', low: '顽皮度低：正经，少玩笑', mid: '顽皮度中：日常爱逗，会起哄', high: '顽皮度高：爱玩闹，常主动制造轻松气氛' },
-  directness: { label: '直接', low: '直接度低：说话绕，先铺垫', mid: '直接度中：不绕太远，但会顾着分寸', high: '直接度高：直给结论，少铺垫' },
+  warmth: { label: '温暖', low: '克制，不主动靠近', mid: '关心，但不黏人', high: '明显关心，会主动问候' },
+  assertiveness: { label: '主见', low: '倾向附和，很少反驳', mid: '有想法，但不硬顶', high: '明确表达不同意见，会讲理由' },
+  playfulness: { label: '顽皮', low: '认真，少开玩笑', mid: '该认真时认真，平时会贫两句', high: '日常爱逗，会起哄' },
+  directness: { label: '直接', low: '含蓄，话留三分', mid: '不绕太远，但会顾着分寸', high: '有话直说，少铺垫' },
 };
 
 function renderPersona(soul) {
@@ -107,8 +115,10 @@ function renderPersona(soul) {
   const parts = [];
   const name = (ident.name || '').trim();
   const addr = (ident.address || '').trim();
+  const aliases = (ident.aliases || '').trim();
   let header = name ? `你是「${name}」` : '你是';
   header += addr ? `，称呼对方「${addr}」。` : '。';
+  if (aliases) header += `对方平时也叫你「${aliases}」。`;
   parts.push(header);
 
   if ((ident.whoIAm || '').trim()) {
@@ -120,13 +130,19 @@ function renderPersona(soul) {
   if (values.length) {
     parts.push('\n## 我珍视的\n\n' + values.map(v => `- ${v}`).join('\n'));
   }
+
+  /* ⭐ 性格段**绝不输出数字**。
+     数字对模型没有语义，它会自行脑补「65 算高吗」—— 结果同一份人格，
+     微信里和 DSH 里表现不一样。这里与 bigfish/soul.py 的 trait_lines()
+     以及插件 soul/index.js 的 renderSoulOf 保持同一个口径：只给那句话。
+     分档边界也与插件一致：<=40 低 / >=60 高 / 其余中（不是 <40 和 >60）。 */
   const traits = soul.traits || {};
   const traitLines = [];
   for (const [key, doc] of Object.entries(TRAIT_DOC)) {
     const v = traits[key];
     if (typeof v !== 'number') continue;
-    const band = v < 40 ? 'low' : v > 60 ? 'high' : 'mid';
-    traitLines.push(`- ${doc.label}（${v}/100）：${doc[band]}`);
+    const band = v <= 40 ? 'low' : v >= 60 ? 'high' : 'mid';
+    traitLines.push(`- ${doc.label}：${doc[band]}。`);
   }
   if (traitLines.length) {
     parts.push('\n## 我的性格\n\n' + traitLines.join('\n'));

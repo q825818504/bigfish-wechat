@@ -62,6 +62,7 @@ hiddenimports = [
     "PySide6.QtWebChannel",
     "PySide6.QtNetwork",
     "bigfish.soul",
+    "bigfish.vault",
     "bigfish.render",
     "bigfish.wechat",
     "bigfish.bridge_client",

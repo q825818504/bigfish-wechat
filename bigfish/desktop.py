@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -689,88 +690,584 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
-    # ── 人设 ──
+    # ── 灵魂（可读写） ──
     @Slot(result=str)
     def get_persona(self) -> str:
+        """读当前范围的灵魂。字段与 soul-*.json 一一对应，界面直接拿渲染。"""
         try:
-            from bigfish.soul import load_soul
+            from bigfish import vault
 
-            soul = load_soul()
+            root = vault.resolve_data_root()
+            from bigfish.soul import soul_file_path
+            path = soul_file_path(root)
+            if not path:
+                return json.dumps({"error": "范围未确定。请先到「数据目录」页选好数据根与范围。",
+                                   "scopeReady": False}, ensure_ascii=False)
+            # 两条数据：
+            #   raw  —— 文件原样内容，用来**渲染人格**（缺什么就是什么，不补默认值）
+            #   form —— 归一化结果，用来**填表单**（用户没设过时得有出厂值可编辑）
+            # 只有文件不存在时才让两者合一，因为那时"没设过"就该看到默认人格。
+            raw_soul, exists, err = vault.read_soul_file(path)
+            form_soul = vault.normalize_soul(raw_soul)
+            render_src = form_soul if not exists else raw_soul
+
+            from bigfish.soul import Soul
+            s = Soul.from_dict(form_soul, path)
+            s_render = Soul.from_dict(render_src, path)
             return json.dumps({
-                "name": soul.name,
-                "address": soul.address,
-                "whoIAm": soul.who_i_am,
-                "values": soul.values,
-                "traits": soul.traits,
-                "selfNotes": soul.self_notes,
-                "revision": soul.revision,
-                "persona": soul.render_persona(),
+                "ok": True,
+                "scopeReady": True,
+                "exists": exists,
+                "error": err or "",
+                "path": path,
+                "scope": vault.current_scope_key(root),
+                "name": s.name,
+                "address": s.address,
+                "aliases": s.aliases,
+                "whoIAm": s.who_i_am,
+                "values": s.values_raw,
+                "traits": s.traits,
+                "selfNotes": s.self_notes,
+                "revision": s.revision,
+                "persona": s_render.render_persona(),
+                "traitDoc": vault.TRAIT_DOC,
+                "defaults": {
+                    "traits": vault.DEFAULT_TRAITS,
+                    "address": vault.DEFAULT_ADDRESS,
+                },
             }, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
-    # ── 心情 ──
+    @Slot(str, result=str)
+    def save_persona(self, payload: str) -> str:
+        """写灵魂。
+
+        入参 payload 是 JSON：
+            { soul: {...}, baseRevision?: int, reset?: bool }
+
+        服务的校验与插件 /dsh-bigfish/soul 的 POST 完全一致：
+          · revision 并发检查（带了 baseRevision 且与磁盘不符 → 409）
+          · locked 的价值不许删
+          · reset=true 回到出厂设置
+        """
+        try:
+            from bigfish import vault
+
+            root = vault.resolve_data_root()
+            from bigfish.soul import soul_file_path
+            path = soul_file_path(root)
+            if not path:
+                return json.dumps({"ok": False, "code": "no-scope",
+                                   "error": "范围未确定，无法保存"}, ensure_ascii=False)
+
+            body = json.loads(payload or "{}")
+            # prev 要用归一化结果：revision / locked 校验都得看"磁盘上那一份
+            # 实际生效的人格"，这正是写进去之后别人读到的样子。
+            raw_prev, prev_exists, _err = vault.read_soul_file(path)
+            prev = vault.normalize_soul(raw_prev)
+
+            # ── reset：回到出厂设置 ──
+            if body.get("reset") is True:
+                fresh = vault.default_soul()
+                fresh["scope"] = vault.current_scope_key(root)
+                ok, soul_out, err = vault.write_soul_file(path, fresh)
+                if not ok:
+                    return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
+                return json.dumps({"ok": True, "reset": True, "soul": soul_out,
+                                   "revision": soul_out["revision"]}, ensure_ascii=False)
+
+            # ── revision 并发检查 ──
+            base_rev = body.get("baseRevision")
+            if prev_exists and isinstance(base_rev, (int, float)) and base_rev > 0:
+                cur_rev = int(prev.get("revision") or 1)
+                if int(base_rev) != cur_rev:
+                    return json.dumps({
+                        "ok": False, "code": "revision-conflict",
+                        "error": f"这份人格在别处被改过了（你基于第 {int(base_rev)} 版，"
+                                 f"磁盘是第 {cur_rev} 版）。重新载入后再改。",
+                        "currentRevision": cur_rev,
+                        "soul": prev,
+                    }, ensure_ascii=False)
+
+            incoming = body.get("soul") if isinstance(body.get("soul"), dict) else None
+
+            # ── locked 保护：服务端再挡一次，不信界面 ──
+            if incoming and isinstance(incoming.get("values"), list):
+                locked_texts = [v["text"] for v in (prev.get("values") or []) if v.get("locked")]
+                remaining = {str(v.get("text") or "") for v in incoming["values"]
+                             if isinstance(v, dict)}
+                missing = [t for t in locked_texts if t not in remaining]
+                if missing:
+                    return json.dumps({
+                        "ok": False, "code": "locked",
+                        "error": "这些是锁定的价值，需要先解锁才能删除",
+                        "locked": missing,
+                    }, ensure_ascii=False)
+
+            merged = dict(incoming or {})
+            merged["scope"] = vault.current_scope_key(root)
+            # 保留磁盘上的 history（V1 不写入，但别人写进去的不能被我抹掉）
+            if "history" not in merged:
+                merged["history"] = prev.get("history") or []
+
+            ok, soul_out, err = vault.write_soul_file(path, merged)
+            if not ok:
+                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
+            return json.dumps({"ok": True, "soul": soul_out,
+                               "revision": soul_out["revision"]}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── 心情（可读写） ──
     @Slot(result=str)
     def get_mood(self) -> str:
         try:
+            from bigfish import vault
             from bigfish.bridge_client import load_mood_only
 
             m = load_mood_only()
+            cfg = vault.read_mood_config()
+            out = {
+                "ok": True,
+                "config": cfg,
+                "scopes": vault.list_scopes(),
+                "currentScope": vault.current_scope_key(),
+            }
             if not m:
-                return json.dumps({"error": "读不到情绪状态"},
-                                  ensure_ascii=False)
-            return json.dumps({
+                out.update({"value": None, "error": "读不到情绪状态"})
+                return json.dumps(out, ensure_ascii=False)
+            out.update({
                 "value": m.value,
                 "label": m.label,
                 "reason": m.last_reason,
                 "injected": m.injected_text,
                 "dims": m.dims,
-                "updated": time.strftime(
-                    "%m-%d %H:%M",
-                    time.localtime(m.updated_at / 1000)) if m.updated_at else "",
-            }, ensure_ascii=False)
+                "updated": ts_to_local(m.updated_at) if m.updated_at else "",
+            })
+            return json.dumps(out, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
-    # ── 记忆 ──
+    @Slot(str, result=str)
+    def save_mood_config(self, payload: str) -> str:
+        """改心情判断参数。只认白名单键，其余原样保留。"""
+        try:
+            from bigfish import vault
+
+            patch = json.loads(payload or "{}")
+            ok, cfg, err = vault.write_mood_config(patch)
+            if not ok:
+                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
+            return json.dumps({"ok": True, "config": cfg}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def reset_mood(self) -> str:
+        try:
+            from bigfish import vault
+
+            ok, err = vault.reset_mood()
+            if not ok:
+                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
+            return json.dumps({"ok": True}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── 记忆（可读可删可导出） ──
     @Slot(result=str)
     def memory_stats(self) -> str:
         try:
-            import glob
-            import sqlite3
+            from bigfish import vault
 
-            from bigfish.bridge_client import _default_data_root
-            root = _default_data_root()
-            if not root:
-                return json.dumps({"error": "找不到 dataRoot"},
-                                  ensure_ascii=False)
-            from bigfish.bridge_client import _pick_scope_dir
-            scope_dir = _pick_scope_dir(root)
-            if not scope_dir:
-                return json.dumps({"error": "找不到 scope"},
-                                  ensure_ascii=False)
-            dbs = glob.glob(os.path.join(scope_dir, "memory-*.sqlite3"))
-            if not dbs:
-                return json.dumps({"error": "找不到记忆库"},
+            root = vault.resolve_data_root()
+            key = vault.current_scope_key(root)
+            db = vault.memory_db_path(root, key)
+            if not db:
+                return json.dumps({"error": "范围未确定"}, ensure_ascii=False)
+            if not os.path.isfile(db):
+                return json.dumps({"error": "找不到记忆库", "path": db},
                                   ensure_ascii=False)
 
-            tmp = self._tmp_copy(dbs[0])
-            conn = sqlite3.connect(tmp)
+            st = vault.memory_stats(db)
             try:
-                total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
-                sessions = conn.execute(
-                    "SELECT COUNT(DISTINCT session) FROM messages").fetchone()[0]
-                newest = conn.execute(
-                    "SELECT MAX(source_time) FROM messages").fetchone()[0]
-            finally:
-                conn.close()
+                size = os.path.getsize(db)
+            except Exception:
+                size = 0
             return json.dumps({
-                "total": total,
-                "sessions": sessions,
-                "newest": ts_to_local(newest),
+                "ok": True,
+                "total": st["total"],
+                "sessions": st["sessions"],
+                "chunks": st["chunks"],
+                "anchors": st["anchors"],
+                "newest": ts_to_local(st["newest"]),
+                "path": db,
+                "size": size,
             }, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    @Slot(int, result=str)
+    def get_memory(self, limit: int) -> str:
+        """分页浏览记忆库里的原始消息（不走向量检索，就是按 id 倒序翻）。"""
+        try:
+            from bigfish import vault
+
+            db = vault.memory_db_path()
+            if not db or not os.path.isfile(db):
+                return json.dumps({"cells": [], "total": 0}, ensure_ascii=False)
+
+            page = vault.browse_messages(db, offset=0, limit=max(1, limit or 40))
+            cells = []
+            for it in page["items"]:
+                t = (it["text"] or "").strip().replace("\n", " ")
+                if not t:
+                    continue
+                cells.append({
+                    "id": it["id"],
+                    "role": it["role"],
+                    "text": t,
+                    "session": it["session"],
+                    "time": ts_to_local(it["time"]),
+                    "timeRaw": it["time"],
+                })
+            return json.dumps({"cells": cells, "total": page["total"]},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    @Slot(int, int, str, str, result=str)
+    def browse_memory(self, offset: int, limit: int, role: str, query: str) -> str:
+        try:
+            from bigfish import vault
+
+            db = vault.memory_db_path()
+            if not db or not os.path.isfile(db):
+                return json.dumps({"items": [], "total": 0, "error": "找不到记忆库"},
+                                  ensure_ascii=False)
+            page = vault.browse_messages(
+                db, offset=max(0, offset), limit=max(1, min(200, limit)),
+                role=role or None, query=query or None)
+            for it in page["items"]:
+                it["time"] = ts_to_local(it["time"])
+            return json.dumps(page, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"items": [], "total": 0, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(result=str)
+    def list_memory_sessions(self) -> str:
+        try:
+            from bigfish import vault
+
+            db = vault.memory_db_path()
+            rows = vault.list_sessions(db, 100)
+            for r in rows:
+                r["newestText"] = ts_to_local(r["newest"])
+                r["oldestText"] = ts_to_local(r["oldest"])
+            return json.dumps({"sessions": rows}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"sessions": [], "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def delete_memory(self, payload: str) -> str:
+        """删记忆。payload: {ids: [int]} 或 {session: "..."}。
+
+        ⚠️ 这是在**动数据**，不是改配置。守卫：
+           1. 必须先有库文件；
+           2. 删会话时必须 confirm=true；
+           3. 删完提示条数，不静默。
+        """
+        try:
+            from bigfish import vault
+
+            db = vault.memory_db_path()
+            if not db or not os.path.isfile(db):
+                return json.dumps({"ok": False, "error": "找不到记忆库"},
+                                  ensure_ascii=False)
+            d = json.loads(payload or "{}")
+
+            if d.get("session"):
+                if d.get("confirm") is not True:
+                    return json.dumps({"ok": False, "error": "删整个会话需要显式确认"},
+                                      ensure_ascii=False)
+                ok, n, err = vault.delete_session(db, str(d["session"]))
+                return json.dumps({"ok": ok, "deleted": n, "error": err},
+                                  ensure_ascii=False)
+
+            ids = d.get("ids") or []
+            if not isinstance(ids, list) or not ids:
+                return json.dumps({"ok": False, "error": "没有选中任何记忆"},
+                                  ensure_ascii=False)
+            ok, n, err = vault.delete_messages(db, ids)
+            return json.dumps({"ok": ok, "deleted": n, "error": err},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def export_memory(self, target: str) -> str:
+        try:
+            from bigfish import vault
+
+            db = vault.memory_db_path()
+            if not target:
+                target = os.path.join(
+                    _ROOT, "backup",
+                    "memory-" + time.strftime("%Y%m%d-%H%M%S") + ".sqlite3")
+            ok, err = vault.export_memory(db, target)
+            return json.dumps({"ok": ok, "path": target, "error": err},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def import_memory(self, source: str) -> str:
+        """从备份恢复。覆盖前会自动留一份 .bak。"""
+        try:
+            from bigfish import vault
+
+            db = vault.memory_db_path()
+            ok, err = vault.import_memory(source, db)
+            return json.dumps({"ok": ok, "path": db, "error": err},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def vacuum_memory(self) -> str:
+        try:
+            from bigfish import vault
+
+            db = vault.memory_db_path()
+            ok, err = vault.vacuum(db)
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── 数据目录（根 / 范围 / 搬家） ──
+    @Slot(result=str)
+    def get_data_root(self) -> str:
+        try:
+            from bigfish import vault
+
+            root = vault.resolve_data_root()
+            sc = vault.read_scope(root)
+            key = vault.current_scope_key(root)
+            # 可写性：灵魂文件所在目录能不能真写进去。
+            # 界面要能提前告诉用户"这里改不了"，而不是等他点了保存才失败。
+            from bigfish.soul import soul_file_path
+            probe_target = soul_file_path(root, key) or os.path.join(root, ".probe")
+            writable, w_err = vault.probe_writable(probe_target)
+            return json.dumps({
+                "ok": True,
+                "root": root,
+                "custom": vault.read_data_root(),
+                "defaultRoot": vault.default_data_root(),
+                "rootFile": vault.root_store_path(),
+                "scopeFile": vault.scope_store_path(root),
+                "scope": sc,
+                "currentKey": key,
+                "dshHome": vault.dsh_home(),
+                "scopes": vault.list_scopes(root),
+                "writable": writable,
+                "writeError": w_err,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def set_data_root(self, path: str) -> str:
+        """直接改数据根（不搬数据）。想搬请走 inspect_move/apply_move。"""
+        try:
+            from bigfish import vault
+
+            p = (path or "").strip()
+            if p and not os.path.isdir(p):
+                return json.dumps({"ok": False,
+                                   "error": f"目录不存在：{p}"}, ensure_ascii=False)
+            ok, err = vault.write_data_root(p)
+            if not ok:
+                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
+            self.log_message.emit(f"[数据] 数据根 → {p or '(默认)'}", "")
+            return json.dumps({"ok": True, "root": vault.resolve_data_root()},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, str, result=str)
+    def set_scope(self, mode: str, workspace_id: str, session_ids_json: str) -> str:
+        """写 scope.json。mode = workspace | session。"""
+        try:
+            from bigfish import vault
+
+            ids = []
+            if session_ids_json:
+                try:
+                    parsed = json.loads(session_ids_json)
+                    if isinstance(parsed, list):
+                        ids = [str(x) for x in parsed]
+                except Exception:
+                    ids = [s.strip() for s in session_ids_json.split(",") if s.strip()]
+
+            root = vault.resolve_data_root()
+            ok, err = vault.write_scope(root, mode, workspace_id, ids)
+            if not ok:
+                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
+            self.log_message.emit(
+                f"[数据] 范围 → {vault.current_scope_key(root)}", "")
+            return json.dumps({"ok": True,
+                               "scope": vault.read_scope(root),
+                               "currentKey": vault.current_scope_key(root)},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def inspect_move(self, target: str) -> str:
+        """搬家前盘点。不改任何东西。"""
+        try:
+            from bigfish import vault
+
+            plan = vault.inspect_move(target)
+            return json.dumps({
+                "ok": plan.ok,
+                "error": plan.error,
+                "src": plan.src,
+                "dst": plan.dst,
+                "items": plan.items,
+                "totalBytes": plan.total_bytes,
+                "conflicts": plan.conflicts,
+                "dstWritable": plan.dst_writable,
+                "dstWriteError": plan.dst_write_error,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def apply_move(self, target: str) -> str:
+        """真搬家。复制成功后才改 root.json，失败不动数据根。"""
+        try:
+            from bigfish import vault
+
+            ok, err = vault.apply_move(target)
+            if ok:
+                self.log_message.emit(f"[数据] 已搬到 {target}", "")
+            return json.dumps({"ok": ok, "error": err,
+                               "root": vault.resolve_data_root()},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def pick_directory(self, start: str) -> str:
+        """原生目录选择框。选不了就返回空串，界面用输入框兜底。"""
+        try:
+            from PySide6.QtWidgets import QFileDialog
+
+            d = QFileDialog.getExistingDirectory(
+                self.window, "选择目录", start or os.path.expanduser("~"))
+            return json.dumps({"path": d or ""}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"path": "", "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def pick_file(self, start: str) -> str:
+        """原生文件选择框（记忆备份导入用）。"""
+        try:
+            from PySide6.QtWidgets import QFileDialog
+
+            f, _ = QFileDialog.getOpenFileName(
+                self.window, "选择记忆库备份", start or "",
+                "SQLite 数据库 (*.sqlite3 *.db *.sqlite3.bak-*);;所有文件 (*.*)")
+            return json.dumps({"path": f or ""}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"path": "", "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def open_path(self, path: str) -> str:
+        """在资源管理器里打开一个目录或文件。"""
+        try:
+            p = (path or "").strip()
+            if not p or not os.path.exists(p):
+                return json.dumps({"ok": False, "error": f"路径不存在：{p}"},
+                                  ensure_ascii=False)
+            if sys.platform == "win32":
+                if os.path.isdir(p):
+                    os.startfile(p)  # noqa: S606
+                else:
+                    os.startfile(os.path.dirname(p))  # noqa: S606
+            else:
+                subprocess.Popen(["xdg-open", p if os.path.isdir(p)
+                                  else os.path.dirname(p)])
+            return json.dumps({"ok": True}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def get_scope_candidates(self) -> str:
+        """扫 DSH 里现有的工作区与会话，给「范围」页做下拉。
+
+        只读 DSH 的 storages/workspace.json 和 sessions/ 目录 —— 不改任何东西。
+        """
+        try:
+            from bigfish import vault
+
+            home = vault.dsh_home()
+            workspaces = []
+            sessions = []
+
+            wpath = os.path.join(home, "storages", "workspace.json")
+            try:
+                with open(wpath, "r", encoding="utf-8") as f:
+                    w = json.load(f)
+                table = ((w or {}).get("tables") or {}).get("workspaces") or {}
+                for uuid, v in table.items():
+                    workspaces.append({
+                        "id": str(uuid),
+                        "title": str((v or {}).get("title") or ""),
+                        "path": str((v or {}).get("path") or ""),
+                    })
+            except Exception:
+                pass
+
+            sess_root = os.path.join(home, "sessions")
+            try:
+                for ws in sorted(os.listdir(sess_root)):
+                    wsdir = os.path.join(sess_root, ws)
+                    if not os.path.isdir(wsdir):
+                        continue
+                    for sid in sorted(os.listdir(wsdir)):
+                        # 裸 UUID 形状的是中间层目录，不是会话
+                        if len(sid) >= 8 and sid[8] == "-":
+                            continue
+                        if not os.path.isfile(os.path.join(
+                                wsdir, sid, "session.v4.jsonl.zstd")):
+                            continue
+                        sessions.append({"id": sid, "workspace": ws})
+            except Exception:
+                pass
+
+            # 给工作区补上「有灵魂/记忆」的标记，用户能直接看出哪个是活的
+            scopes = vault.list_scopes()
+            live_dirs = {}
+            for s in scopes:
+                live_dirs[s["key"]] = s
+
+            return json.dumps({
+                "ok": True,
+                "workspaces": workspaces,
+                "sessions": sessions[:500],
+                "liveScopes": {k: {
+                    "hasSoul": v["has_soul"],
+                    "hasMemory": v["has_memory"],
+                    "name": v["name"],
+                } for k, v in live_dirs.items()},
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
 
     def _tmp_copy(self, src: str) -> str:
         """复制记忆库到本地临时文件，避免和 DSH 抢锁。"""
@@ -932,76 +1429,6 @@ class Backend(QObject):
             return json.dumps({"ok": False, "error": str(exc)},
                               ensure_ascii=False)
 
-    # ── 记忆 ──
-    @Slot(int, result=str)
-    def get_memory(self, limit: int) -> str:
-        try:
-            import math
-            import random
-            from bigfish.bridge_client import _default_data_root
-
-            root = _default_data_root()
-            if not root:
-                return json.dumps({"error": "找不到 dataRoot"},
-                                  ensure_ascii=False)
-            import glob
-            from bigfish.bridge_client import _pick_scope_dir
-            scope_dir = _pick_scope_dir(root)
-            if not scope_dir:
-                return json.dumps({"error": "找不到 scope 目录"},
-                                  ensure_ascii=False)
-
-            # 直接读 sqlite，拿最近的消息作为记忆点
-            import sqlite3
-            dbs = glob.glob(os.path.join(scope_dir, "memory-*.sqlite3"))
-            if not dbs:
-                return json.dumps({"cells": []}, ensure_ascii=False)
-
-            # 复制一份再读，避免和 DSH 抢锁
-            import shutil
-            tmpdir = os.path.join(_ROOT, ".tmp")
-            os.makedirs(tmpdir, exist_ok=True)
-            tmp = os.path.join(tmpdir, "mem_ui.sqlite3")
-            shutil.copyfile(dbs[0], tmp)
-            for suf in ("-wal", "-shm"):
-                if os.path.exists(dbs[0] + suf):
-                    try:
-                        shutil.copyfile(dbs[0] + suf, tmp + suf)
-                    except Exception:
-                        pass
-
-            conn = sqlite3.connect(tmp)
-            try:
-                rows = conn.execute(
-                    "SELECT id, role, text, session FROM messages "
-                    "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
-            finally:
-                conn.close()
-
-            cells = []
-            rnd = random.Random(42)
-            for i, (mid, role, text, session) in enumerate(rows):
-                t = (text or "").strip().replace("\n", " ")
-                if not t:
-                    continue
-                # 粗略分级：长文本更可能是「长久」，短问答是「片段」
-                cat = ("durable" if len(t) > 120
-                       else "episodic" if len(t) > 40 else "fleeting")
-                cells.append({
-                    "id": mid,
-                    "title": t[:90],
-                    "category": cat,
-                    "heat": min(8, 1 + len(t) / 40),
-                    "size": min(30, 12 + len(t) / 18),
-                    "ring": 30 + (i % 4) * 11,
-                    "jitter": rnd.uniform(-0.35, 0.35),
-                    "star": session or "",
-                })
-            return json.dumps({"cells": cells}, ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
-
-    # ── 配置 ──
     @Slot(result=str)
     def get_config(self) -> str:
         c = load_json_config()
@@ -1408,6 +1835,65 @@ def run_selftest() -> int:
         assert cur, "读不到当前会话"
         return f"热激活成功，当前 {cur!r}"
     item("UIA 热激活", t_uia)
+
+    # 8. 可写层 —— 打包后这条最容易漏
+    #    外部脚本能 import vault.py 不代表 exe 里也有。
+    #    这里在**临时目录**里跑一遍完整写路径，不碰用户的真实数据。
+    def t_vault():
+        import shutil as _sh
+        import tempfile as _tf
+
+        from bigfish import vault as V
+
+        tmpd = _tf.mkdtemp(prefix="bf-exe-vault-")
+        try:
+            p = os.path.join(tmpd, "ws-t", "soul-ws-t.json")
+            soul = V.normalize_soul({
+                "identity": {"name": "自检", "address": "爸", "whoIAm": "测试"},
+                "values": [{"text": "真诚", "locked": True}],
+                "traits": {"warmth": 40, "directness": 88},
+            })
+            ok, out, err = V.write_soul_file(p, soul)
+            assert ok, err or "写入失败"
+            back, exists, rerr = V.read_soul_file(p)
+            assert exists and not rerr, rerr
+            assert back["identity"]["name"] == "自检"
+            assert back["revision"] == 2, f"revision={back['revision']}"
+
+            # 渲染两侧共用同一份文案表
+            from bigfish.soul import Soul
+            persona = Soul.from_dict(back).render_persona()
+            assert "温暖：克制，不主动靠近。" in persona, persona
+            assert "/100" not in persona, "性格段不该有数字"
+
+            # 分档边界：60 必须是高档
+            assert V.trait_sentence("warmth", 60).startswith("温暖：明显关心")
+            assert V.trait_sentence("warmth", 40).startswith("温暖：克制")
+
+            # 数据根 / 范围键
+            assert V.scope_key("workspace", "abc") == "ws-abc"
+            assert V.short_key("ws-83ba9d80-ec53-4a24") == "ws-83ba9d80-ec53"
+
+            # 心情配置：未知字段必须保留
+            assert V.INJECT_MODES == ["off", "label", "event"]
+            return f"读写/渲染/分档 全部正常（rev {back['revision']}）"
+        finally:
+            _sh.rmtree(tmpd, ignore_errors=True)
+    item("可写层", t_vault)
+
+    # 9. 数据根
+    def t_root():
+        from bigfish import vault as V
+        root = V.resolve_data_root()
+        assert root, "数据根为空"
+        key = V.current_scope_key(root)
+        writable, werr = V.probe_writable(
+            V.scope_file_path(root, key, "soul") if key
+            else os.path.join(root, ".probe"))
+        return (f"{root}"
+                + (f"｜范围 {key}" if key else "｜范围未定")
+                + ("｜可写" if writable else f"｜不可写：{werr[:40]}"))
+    item("数据根", t_root)
 
     # 汇总
     nok = sum(1 for r in results if r[1] == "OK")

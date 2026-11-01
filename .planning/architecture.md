@@ -112,3 +112,49 @@ session scope 过滤。Python 重写必然产生偏差，结果是
 ## 关键设计决策
 
 见 `decisions.md`。
+
+---
+
+## 写层：`bigfish/vault.py`
+
+```
+            读路径                        写路径
+  ┌──────────────────────┐     ┌──────────────────────────┐
+  │  bridge.mjs (Node)   │     │  vault.py (Python)       │
+  │  import 原版 store.js │     │  逐字段复刻 store.js 语义 │
+  └──────────┬───────────┘     └────────────┬─────────────┘
+             │                              │
+             └──────────► 同一批文件 ◄───────┘
+              soul-*.json / mood-*.json / memory-*.sqlite3
+                          scope.json / root.json
+```
+
+**为什么读走 Node、写走 Python**
+读要的是**分词与衰减算法**（中文二元分词、半衰期、FTS5），
+在 Python 里重写必然漂移 —— 会让微信里的大肥鱼和 DSH 里的记得不一样的事。
+写要的是**结构归一与原子性**，那是纯规则，逐条复刻即可，而且必须能在
+没有 Node 的 exe 里跑。
+
+**三条不能破的约束**（全部有测试钉住）
+
+1. **原子写**：同目录 `.tmp` → `os.replace`。
+   跨盘 rename 会抛；写一半断电不能留下半个灵魂文件。
+2. **归一化永不抛错**：任何输入都夹成合法结构。
+   未知 trait 键丢弃；`values: []` 是真实意图，**不能**偷偷补回默认值。
+3. **revision 每次写盘 +1**：面板靠它检测并发。
+
+**删除记忆的级联顺序**（踩过的坑）
+`chunks.message` 是外键，`foreign_keys=ON` 时先删 messages 会抛约束错误。
+正确顺序：FTS → chunks → anchor_sources/activations/groups/replays → messages。
+漏掉 FTS 的表现是「检索命中了已经不存在的内容」—— 比删不掉还难查。
+
+---
+
+## 四页职责
+
+| 页 | 读什么 | 写什么 |
+|---|---|---|
+| 灵魂 | `soul-*.json` | 同上（整卡，含 locked 保护与 revision 并发校验） |
+| 心情 | `mood-*.json` + `bigfish-mood/config.json` | 配置参数 + 状态重置 |
+| 记忆 | `memory-*.sqlite3` | 删消息/删会话/导出/导入/VACUUM |
+| 数据目录 | `root.json` + `scope.json` + 范围目录扫描 | 改数据根、搬家、切范围 |

@@ -49,6 +49,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v16M4 8h16M6.5 17.5l11-11"/><circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/></svg>
         <span>记忆</span>
       </button>
+      <button class="nav-item" data-page="data">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
+        <span>数据目录</span>
+      </button>
 
       <span class="nav-caption">系统</span>
       <button class="nav-item" data-page="settings">
@@ -239,7 +243,7 @@
         <div class="page-heading">
           <div>
             <h1>灵魂</h1>
-            <p>人格的唯一来源。只读，要改请去 DSH 插件里改。</p>
+            <p>人格的唯一来源。改完保存，下一轮对话立即生效。</p>
           </div>
           <div class="heading-side" id="soulRev">—</div>
         </div>
@@ -260,12 +264,50 @@
         </div>
 
         <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>我是谁</h2></div>
-          <div class="soul-quote" id="soulWhoIAm">加载中…</div>
+          <div class="card-head">
+            <h2>身份</h2>
+            <span class="tag" id="soulPathTag">—</span>
+          </div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field">
+                <label>名字</label>
+                <input type="text" id="editName" placeholder="大肥鱼" maxlength="40">
+                <small>她自己叫什么。会写进「你是「X」」。</small>
+              </div>
+              <div class="field">
+                <label>称呼对方</label>
+                <input type="text" id="editAddress" placeholder="爸爸" maxlength="20">
+                <small>她怎么叫你。这是最容易被历史冲掉的一句，单独放。</small>
+              </div>
+              <div class="field full">
+                <label>昵称（你平时怎么叫她）</label>
+                <input type="text" id="editAliases" placeholder="大肥鱼" maxlength="60">
+                <small>逗号分隔。写进「对方平时也叫你「X」」。</small>
+              </div>
+            </div>
+          </div>
         </div>
 
         <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>我珍视的</h2></div>
+          <div class="card-head"><h2>我是谁</h2></div>
+          <div class="form">
+            <div class="field full">
+              <textarea id="editWhoIAm" rows="12" maxlength="6000"
+                placeholder="写成她自己的口吻。空行分段。"></textarea>
+              <small><span id="whoCount">0</span> / 6000 字。这是人格主体，别写成说明文档。</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>我珍视的</h2>
+            <button class="btn btn-sm" id="btnAddValue">+ 添加</button>
+          </div>
+          <div class="card-desc" style="margin-bottom:12px">
+            标着「锁」的条目需要先解锁才能删 —— 防止手滑删掉「真诚」这种最该留的。
+          </div>
           <div class="value-list" id="soulValues">
             <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
           </div>
@@ -273,14 +315,43 @@
 
         <div class="card" style="margin-top:16px">
           <div class="card-head"><h2>我的性格</h2></div>
-          <div class="trait-grid" id="soulTraits"></div>
+          <div class="card-desc" style="margin-bottom:14px">
+            数值不会原样进提示词 —— 每个档位都翻译成一句话给她。<br>
+            拖到左边她更收着，拖到右边她更展开。
+          </div>
+          <div class="trait-edit-list" id="soulTraits"></div>
         </div>
 
         <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>我自己知道的事</h2></div>
+          <div class="card-head">
+            <h2>我自己知道的事</h2>
+            <button class="btn btn-sm" id="btnAddNote">+ 添加</button>
+          </div>
+          <div class="card-desc" style="margin-bottom:12px">
+            行为边界，不是台词。比如「对方忙的时候，安静比关心更合适」。
+          </div>
           <div class="note-list" id="soulNotes">
             <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
           </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>注入预览</h2></div>
+          <div class="card-desc" style="margin-bottom:12px">
+            这是实际会塞进 system prompt 的人格段，按段预算裁剪过。
+          </div>
+          <div class="soul-quote" id="soulPreview" style="font-size:12px;color:var(--muted)">—</div>
+        </div>
+
+        <div class="save-bar">
+          <span class="save-hint" id="soulHint"></span>
+          <button class="btn btn-sm" id="btnSoulReset">恢复默认</button>
+          <button class="btn btn-primary" id="btnSoulSave">保存人格</button>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>渲染效果（只读）</h2></div>
+          <div class="soul-quote" id="soulWhoIAm">加载中…</div>
         </div>
       </section>
 
@@ -289,7 +360,7 @@
         <div class="page-heading">
           <div>
             <h1>心情</h1>
-            <p>来自 DSH 情绪插件。只读，由 DSH 那边每轮对话后更新。</p>
+            <p>此刻怎样。由 DSH 每轮对话后判断，参数在这里改。</p>
           </div>
           <div class="heading-side" id="moodUpdated">—</div>
         </div>
@@ -325,6 +396,77 @@
           </div>
           <div class="soul-quote" id="moodInjected" style="font-size:12px;color:var(--muted)">—</div>
         </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>判断参数</h2></div>
+          <div class="card-desc" style="margin-bottom:14px">
+            这些值决定「她会不会被这件事影响」以及「影响多久」。改完立即写盘。
+          </div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field">
+                <label>心情基线</label>
+                <input type="number" id="moodBase" min="30" max="100" step="1">
+                <small>没事发生时她回到的位置。默认 70。</small>
+              </div>
+              <div class="field">
+                <label>心情下限</label>
+                <input type="number" id="moodFloor" min="0" max="100" step="1">
+                <small>最低能掉到多少。0 = 不限制。</small>
+              </div>
+              <div class="field">
+                <label>平复半衰期（小时）</label>
+                <input type="number" id="moodDecay" min="1" max="168" step="1">
+                <small>12 小时 = 隔一夜还留着余温。</small>
+              </div>
+              <div class="field">
+                <label>每天最多说几次</label>
+                <input type="number" id="moodPerDay" min="0" max="50" step="1">
+                <small>心情进对话的额度上限。防止变成背景音。</small>
+              </div>
+              <div class="field">
+                <label>可信度门槛</label>
+                <input type="number" id="moodConf" min="0" max="100" step="1">
+                <small>判断可信度低于它只记账、不告诉她。</small>
+              </div>
+              <div class="field">
+                <label>显著涨跌（总心情）</label>
+                <input type="number" id="moodSigMood" min="1" max="30" step="1">
+                <small>够不着只记账。默认 3。</small>
+              </div>
+              <div class="field">
+                <label>显著涨跌（单根情绪）</label>
+                <input type="number" id="moodSigDim" min="1" max="100" step="1">
+                <small>某根情绪「突然一下」也算。默认 5。</small>
+              </div>
+              <div class="field">
+                <label>告诉她的方式</label>
+                <select id="moodInjectMode">
+                  <option value="off">off — 不告诉她</option>
+                  <option value="label">label — 只说心情</option>
+                  <option value="event">event — 说底子 + 是什么事</option>
+                </select>
+                <small>event 最像人；off 等于心情不进对话。</small>
+              </div>
+            </div>
+            <div class="switch-row">
+              <div class="switch-copy">
+                <strong>自动判断心情</strong>
+                <p>每轮对话后跑一次判断。关掉后心情只靠自然衰减。</p>
+              </div>
+              <label class="switch-control">
+                <input type="checkbox" id="moodAutoJudge">
+                <span class="switch-track"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="save-bar">
+          <span class="save-hint" id="moodHint"></span>
+          <button class="btn btn-sm" id="btnMoodReset">重置心情到基线</button>
+          <button class="btn btn-primary" id="btnMoodSave">保存参数</button>
+        </div>
       </section>
 
       <!-- ═══════ 记忆 ═══════ -->
@@ -332,12 +474,27 @@
         <div class="page-heading">
           <div>
             <h1>记忆</h1>
-            <p>她记得的事。检索走 DSH 原版的 MemoryStore，分词与衰减逻辑一致。</p>
+            <p>她记得的事。可以检索、翻页、删单条、删整个会话、导出备份。</p>
           </div>
           <div class="heading-side" id="memCount">—</div>
         </div>
 
-        <div class="card">
+        <div class="grid-3">
+          <div class="card">
+            <div class="metric-label">消息</div>
+            <div class="metric-value" id="memTotal">—</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">片段</div>
+            <div class="metric-value" id="memChunks">—</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">库大小</div>
+            <div class="metric-value" id="memSize">—</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
           <div class="card-head"><h2>检索测试</h2></div>
           <div class="card-desc" style="margin-bottom:14px">
             输入一句话，看她能不能翻出相关的记忆。这就是她回复时实际用的检索。
@@ -350,15 +507,149 @@
 
         <div class="card" style="margin-top:16px">
           <div class="card-head">
-            <h2>记忆库</h2>
+            <h2>浏览全部记忆</h2>
             <span class="tag" id="memDbTag">—</span>
+          </div>
+          <div class="memory-toolbar" style="margin-bottom:14px">
+            <select id="memRole">
+              <option value="">全部角色</option>
+              <option value="user">对方说的</option>
+              <option value="assistant">她说的</option>
+            </select>
+            <input class="memory-search" id="memFilter" placeholder="按内容过滤…">
+            <button class="btn btn-sm" id="btnMemBrowse">刷新</button>
           </div>
           <div class="memory-list" id="memList">
             <div class="empty">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 4v16M4 8h16M6.5 17.5l11-11"/></svg>
               <h3>还没有加载记忆</h3>
-              <p>点上面的「检索」看看她能翻出什么</p>
+              <p>点上面的「检索」，或直接「刷新」浏览全部</p>
             </div>
+          </div>
+          <div class="pager" id="memPager">
+            <button class="btn btn-sm" id="btnMemPrev">上一页</button>
+            <span class="pager-info" id="memPageInfo">—</span>
+            <button class="btn btn-sm" id="btnMemNext">下一页</button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>会话</h2></div>
+          <div class="card-desc" style="margin-bottom:12px">
+            每个会话留下多少条记忆。删掉某个会话的记忆后，她就不记得那段对话了。
+          </div>
+          <div class="session-list" id="memSessions">
+            <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>维护</h2></div>
+          <div class="card-desc" style="margin-bottom:14px">
+            导出会生成一份独立 sqlite 文件（用 VACUUM INTO，不会拿到半个事务）。
+            导入前会自动把现有库备份成 <code>.bak-时间戳</code>。
+          </div>
+          <div class="memory-toolbar">
+            <button class="btn btn-sm" id="btnMemExport">导出备份</button>
+            <button class="btn btn-sm" id="btnMemImport">从备份导入</button>
+            <button class="btn btn-sm" id="btnMemVacuum">压缩回收空间</button>
+          </div>
+          <div class="card-desc" style="margin-top:12px" id="memMaintainHint"></div>
+        </div>
+      </section>
+
+      <!-- ═══════ 数据目录 ═══════ -->
+      <section class="page" data-page="data">
+        <div class="page-heading">
+          <div>
+            <h1>数据目录</h1>
+            <p>灵魂、心情、记忆存在哪。改这里等于改 DSH 插件读的那份配置。</p>
+          </div>
+          <div class="heading-side" id="dataRootTag">—</div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>数据根目录</h2></div>
+          <div class="card-desc" style="margin-bottom:14px">
+            这是 <code>root.json</code> 里那个 <code>dataRoot</code>。
+            DSH 插件和本程序读的是同一个文件 —— 改一次，两边同时生效。
+          </div>
+          <div class="form">
+            <div class="field full">
+              <label>当前数据根</label>
+              <div class="path-row">
+                <input type="text" id="dataRootPath" readonly>
+                <button class="btn btn-sm" id="btnDataRootOpen">打开</button>
+              </div>
+              <small id="dataRootFile">—</small>
+            </div>
+            <div class="field full">
+              <label>改成别的目录</label>
+              <div class="path-row">
+                <input type="text" id="dataRootTarget" placeholder="比如 D:\大肥鱼\灵魂">
+                <button class="btn btn-sm" id="btnDataRootPick">浏览…</button>
+                <button class="btn btn-sm" id="btnDataRootPreview">先看看要搬什么</button>
+              </div>
+              <small>只改指向不搬文件，原来的数据会留在那儿读不到。要搬请用下面那节。</small>
+            </div>
+          </div>
+          <div class="memory-toolbar" style="margin-top:14px">
+            <button class="btn btn-primary" id="btnDataRootSave">只改指向</button>
+            <button class="btn btn-sm" id="btnDataRootMove">搬过去（连同数据）</button>
+            <button class="btn btn-sm" id="btnDataRootDefault">恢复默认</button>
+          </div>
+          <div class="card-desc" style="margin-top:12px" id="dataRootHint"></div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>当前范围</h2>
+            <span class="tag" id="scopeKeyTag">—</span>
+          </div>
+          <div class="card-desc" style="margin-bottom:14px">
+            一个范围 = 一个工作区，或一组会话。记忆、心情、灵魂都按它分家 ——
+            换范围就等于换一个人。<br>
+            <strong>微信这边不跟工作区绑</strong>，你只要指定用哪一份就行。
+          </div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field">
+                <label>模式</label>
+                <select id="scopeMode">
+                  <option value="workspace">工作区</option>
+                  <option value="session">会话</option>
+                </select>
+                <small>工作区模式按 UUID 认；会话模式按会话 id 认。</small>
+              </div>
+              <div class="field">
+                <label>工作区</label>
+                <select id="scopeWorkspace">
+                  <option value="">（未选择）</option>
+                </select>
+                <small id="scopeWsHint">从 DSH 的 workspace.json 里读出来的。</small>
+              </div>
+            </div>
+            <div class="field full">
+              <label>会话 id（会话模式下填，逗号分隔）</label>
+              <input type="text" id="scopeSessions" placeholder="session-xxxx, session-yyyy">
+              <small>会话模式取排序后第一个作范围键，和记忆分库的种子规则一致。</small>
+            </div>
+          </div>
+          <div class="memory-toolbar" style="margin-top:14px">
+            <button class="btn btn-primary" id="btnScopeSave">保存范围</button>
+            <button class="btn btn-sm" id="btnScopeRefresh">重新读取</button>
+          </div>
+          <div class="card-desc" style="margin-top:12px" id="scopeHint"></div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>数据根下有哪些范围</h2></div>
+          <div class="card-desc" style="margin-bottom:12px">
+            每个目录是一份独立的「伙伴」。带灵魂的那份才是正在用的。
+            点一行可以切过去。
+          </div>
+          <div class="session-list" id="scopeList">
+            <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
           </div>
         </div>
       </section>

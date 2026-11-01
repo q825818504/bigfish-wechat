@@ -938,3 +938,221 @@ button:focus-visible, input:focus-visible, a:focus-visible {
     transition: none !important;
   }
 }
+
+/* ══════════════════════════════════════════════════════════════
+   灵魂编辑 / 心情参数 / 记忆管理 / 数据目录
+   —— 都是可写控件，沿用同一套台阶：输入白底、卡片浅灰底
+   ══════════════════════════════════════════════════════════════ */
+
+/* ══ 文本域与下拉 ══ */
+.field textarea,
+.field select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font: 12px/1.75 var(--body-font);
+  user-select: text;
+  resize: vertical;
+}
+.field textarea { min-height: 120px; }
+.field textarea:hover,
+.field select:hover { border-color: var(--muted); }
+.field textarea:focus,
+.field select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.field select {
+  height: 36px;
+  padding: 0 10px;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 14px;
+  padding-right: 30px;
+}
+
+/* ══ 路径行：输入 + 按钮并排 ══ */
+.path-row { display: flex; gap: 8px; align-items: center; }
+.path-row input { flex: 1; min-width: 0; }
+.path-row .btn { flex: none; }
+
+/* ══ 可编辑的价值清单 ══ */
+.value-edit {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+.value-edit > input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font: 13px/1.6 var(--body-font);
+  color: var(--text);
+  user-select: text;
+}
+.value-edit > input[type="text"]:hover { background: var(--surface); border-color: var(--border); }
+.value-edit > input[type="text"]:focus {
+  outline: none;
+  background: var(--surface);
+  border-color: var(--accent);
+}
+.value-edit .value-actions { display: flex; gap: 6px; flex: none; align-items: center; }
+
+.icon-btn {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.icon-btn:hover { background: var(--surface); border-color: var(--border); color: var(--text); }
+.icon-btn.is-locked { color: var(--accent-text); background: var(--accent-soft); }
+.icon-btn svg { width: 14px; height: 14px; }
+
+/* ══ 性格滑杆 ══ */
+.trait-edit-list { display: flex; flex-direction: column; gap: 4px; }
+.trait-edit {
+  display: grid;
+  grid-template-columns: 92px 1fr auto;
+  gap: 16px;
+  align-items: center;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.trait-edit:last-child { border-bottom: 0; }
+.trait-edit .trait-lbl { font-size: 12px; font-weight: 500; }
+.trait-edit .trait-slider-wrap { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.trait-edit input[type="range"] {
+  width: 100%;
+  height: 4px;
+  appearance: none;
+  border-radius: 4px;
+  background: var(--surface-3);
+  cursor: pointer;
+}
+.trait-edit input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--surface);
+  box-shadow: 0 1px 4px rgba(31, 42, 55, .22);
+  cursor: grab;
+}
+.trait-edit input[type="range"]:active::-webkit-slider-thumb { cursor: grabbing; }
+.trait-edit .trait-usage { font-size: 11px; color: var(--muted); line-height: 1.6; }
+.trait-edit .trait-num {
+  font: 500 17px/1 var(--mono-font);
+  color: var(--text);
+  min-width: 34px;
+  text-align: right;
+}
+
+/* ══ 可编辑的自我认识 ══ */
+.note-edit {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.note-edit > input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font: 13px/1.6 var(--body-font);
+  color: var(--text);
+  user-select: text;
+}
+.note-edit > input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* ══ 分页条 ══ */
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-soft);
+  margin-top: 6px;
+}
+.pager-info { font: 11px var(--mono-font); color: var(--muted); }
+
+/* ══ 会话清单 ══ */
+.session-list { display: flex; flex-direction: column; gap: 2px; }
+.session-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 4px;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.session-row:last-child { border-bottom: 0; }
+.session-row.is-current { background: var(--accent-soft); border-radius: 8px; padding-left: 10px; }
+.session-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono-font);
+  font-size: 11px;
+  color: var(--text);
+}
+.session-meta { font: 11px var(--mono-font); color: var(--muted); flex: none; }
+.session-row .tag { flex: none; }
+
+/* ══ 记忆多选 ══ */
+.memory-item.selectable { display: flex; gap: 12px; align-items: flex-start; }
+.memory-item.selectable .memory-body { flex: 1; min-width: 0; }
+.memory-item .mem-check {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 3px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+/* ══ 危险动作 ══ */
+.btn-danger {
+  color: var(--error);
+  border-color: var(--error-soft);
+  background: var(--error-soft);
+}
+.btn-danger:hover { background: #f4dcda; border-color: #eabfbb; }
+
+/* ══ 提示条 ══ */
+.hint-line {
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+.hint-line.is-ok { color: var(--ok); }
+.hint-line.is-err { color: var(--error); }

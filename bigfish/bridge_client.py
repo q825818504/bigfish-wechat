@@ -211,39 +211,26 @@ def load_context(query: str = "", data_root: str = "",
 
 
 def _default_data_root() -> str:
-    """读 DSH 的 bigfish root 配置。"""
-    cands = [
-        os.path.expandvars(r"%USERPROFILE%\.dsh\bigfish\root.json"),
-        os.path.expandvars(r"%APPDATA%\dsh\bigfish\root.json"),
-    ]
-    for c in cands:
-        if os.path.isfile(c):
-            try:
-                with open(c, "r", encoding="utf-8") as f:
-                    root = json.load(f).get("dataRoot")
-                if root and os.path.isdir(root):
-                    return root
-            except Exception:
-                continue
-    # 兜底猜测
-    guess = r"D:\大肥鱼\灵魂"
-    return guess if os.path.isdir(guess) else ""
+    """读数据根。统一走 vault.resolve_data_root —— 与插件同一套规则。
+
+    以前这里是"猜 D:\\大肥鱼\\灵魂"，猜不中就返回空串。用户改了数据根之后
+    微信那边就再也读不到灵魂，还以为是插件坏了。
+    """
+    from bigfish.vault import resolve_data_root
+
+    return resolve_data_root()
 
 
-if __name__ == "__main__":
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    q = sys.argv[1] if len(sys.argv) > 1 else "爸爸"
-    c = load_context(query=q)
+def _scope_dir_of(root: str, scope: str = "") -> Optional[str]:
+    """当前范围的目录。优先按 scope.json 推，推不出再扫。"""
+    from bigfish.vault import current_scope_key, scope_dir
 
-    print("=" * 74)
-    print(f"scope: {c.scope_id}")
-    print(f"warnings: {c.warnings}")
-    print("=" * 74)
-    print("---- system ----")
-    print(c.render_system())
-    print()
-    print("---- memory ----")
-    print(c.render_memory() or "（无）")
+    key = scope or current_scope_key(root)
+    if key:
+        d = scope_dir(root, key)
+        if os.path.isdir(d):
+            return d
+    return _pick_scope_dir(root)
 
 
 def _pick_scope_dir(root: str) -> Optional[str]:
@@ -275,45 +262,68 @@ def load_mood_only(data_root: str = "") -> Optional[Mood]:
     """只读情绪状态，不触发记忆检索。
 
     界面上的「心情」页用它——那里不需要检索开销。
+    路径解析走 vault，保证和灵魂、记忆是**同一个范围**。
     """
+    from bigfish.vault import current_scope_key, scope_file_path
+
     root = data_root or _default_data_root()
     if not root:
         return None
 
-    import glob
+    key = current_scope_key(root)
+    path = scope_file_path(root, key, "mood") if key else ""
+    if not path or not os.path.isfile(path):
+        # 兜底：扫这个范围目录里任何 mood-*.json
+        sd = _scope_dir_of(root)
+        if not sd:
+            return None
+        import glob
 
-    scope_dir = _pick_scope_dir(root)
-    if not scope_dir:
+        cands = sorted(glob.glob(os.path.join(sd, "mood-*.json")))
+        if not cands:
+            return None
+        path = cands[0]
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:
         return None
-    scope_id = os.path.basename(scope_dir)
 
-    # 文件名用截短 id：mood-ws-83ba9d80-ec53.json
-    short = scope_id[:15] if scope_id.startswith("ws-") else scope_id
-    cands = [
-        os.path.join(scope_dir, f"mood-{short}.json"),
-        os.path.join(scope_dir, f"mood-{scope_id}.json"),
-    ]
-    for f in glob.glob(os.path.join(scope_dir, "mood-*.json")):
-        cands.append(f)
+    moods = d.get("moods") or {}
+    if not isinstance(moods, dict) or not moods:
+        return None
+    # 先按范围键取，取不到才退回 lastActive，最后才是任意一份
+    m = moods.get(key) or moods.get(str(d.get("lastActive") or "")) \
+        or next(iter(moods.values()), None)
+    if not isinstance(m, dict):
+        return None
+    return Mood(
+        value=m.get("mood"),
+        dims={k: float(v) for k, v in (m.get("dims") or {}).items()
+              if isinstance(v, (int, float))},
+        last_reason=m.get("lastReason") or "",
+        injected_text=m.get("lastInjectedText") or "",
+        updated_at=int(m.get("updatedAt") or 0),
+    )
 
-    for path in cands:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                d = json.load(fh)
-        except Exception:
-            continue
-        moods = d.get("moods") or {}
-        m = moods.get(scope_id) or (next(iter(moods.values()), None))
-        if not m:
-            continue
-        return Mood(
-            value=m.get("mood"),
-            dims={k: float(v) for k, v in (m.get("dims") or {}).items()
-                  if isinstance(v, (int, float))},
-            last_reason=m.get("lastReason") or "",
-            injected_text=m.get("lastInjectedText") or "",
-            updated_at=int(m.get("updatedAt") or 0),
-        )
-    return None
+
+if __name__ == "__main__":
+    for _s in (sys.stdout, sys.stderr):
+        if _s is not None:
+            try:
+                _s.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    q = sys.argv[1] if len(sys.argv) > 1 else "爸爸"
+    c = load_context(query=q)
+
+    print("=" * 74)
+    print(f"scope: {c.scope_id}")
+    print(f"warnings: {c.warnings}")
+    print("=" * 74)
+    print("---- system ----")
+    print(c.render_system())
+    print()
+    print("---- memory ----")
+    print(c.render_memory() or "（无）")

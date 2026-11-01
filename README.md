@@ -144,19 +144,51 @@ BigFish.exe --version       版本号
 
 ## 界面
 
-七个页面：
+八个页面，**灵魂 / 心情 / 记忆 / 数据目录 四个都能写**：
 
-| 页面 | 内容 |
+| 页面 | 做什么 |
 |---|---|
 | 概览 | 运行状态、环境自检、收发达标、最近对话 |
 | 会话 | 微信会话列表，勾选要监听的 |
-| 灵魂 | 人格全文、珍视、性格数值、自知（只读） |
-| 心情 | 环形进度、七维情绪、注入给她的原话 |
-| 记忆 | 检索测试、结果列表 |
+| **灵魂** | 改名字、称呼、昵称、我是谁、珍视条目（可锁）、性格滑杆、自知。带注入预览 |
+| **心情** | 环形进度、七维情绪、注入原文；改基线/下限/半衰期/日额度/可信度门槛/注入方式 |
+| **记忆** | 检索、分页浏览、按角色过滤；删单条、删会话、导出/导入备份、压缩回收 |
+| **数据目录** | 改数据根、连同数据搬家、切范围；启动时探测可写性 |
 | 设置 | 模型、回复策略、版本与更新 |
 | 日志 | 实时输出 |
 
-灵魂、心情、记忆三页的数据来自 `dsh-bigfish` 插件本身，不是副本。
+### 为什么是「改文件」而不是「建一份副本」
+
+灵魂、心情、记忆三页读写的是 `dsh-bigfish` 插件**正在用的那批文件**：
+
+```
+<数据根>/ws-<uuid>/
+  ├── soul-ws-<短键>.json      ← 灵魂页读写
+  ├── mood-ws-<短键>.json      ← 心情页读，重置时写
+  └── memory-ws-<短键>.sqlite3 ← 记忆页读写
+<数据根>/scope.json            ← 数据目录页读写
+<DSH_HOME>/bigfish/root.json   ← 数据目录页读写
+```
+
+所以在微信里改一句「我是谁」，回 DSH 里也是同一句。反过来也一样。
+
+写入语义与插件的 `/dsh-bigfish/soul` 接口**逐字段对齐**：
+revision 并发校验、locked 价值保护、原子写、归一化永不抛错。
+
+### 数据根写不进去怎么办
+
+「数据目录」页启动时会在数据根里真写一个探针文件。
+不可写就红字预警，并给出三条路：换个普通目录搬过去 / 用管理员重开 / 改目录权限。
+
+> ⚠️ 别信 `os.access(W_OK)`。Windows 上它只查 ACL，不查上层策略会不会
+> 在创建文件那一刻拦下来 —— 实测过返回 `True` 但 `open(...,'w')` 照样
+> `Permission denied`。只有真写一次才算数。
+
+### 不跟工作区绑定
+
+微信只有一个账号一个身份，不存在「这个工作区的大肥鱼」和「那个工作区的
+大肥鱼」—— 她只有一个。所以这里不提供工作区/会话的自动绑定，
+只在「数据目录」页让你**手动指定用哪一份**。
 
 ---
 
@@ -233,12 +265,34 @@ BigFish-0.1.0-manifest.json 文件清单与校验
 ## 自检
 
 ```cmd
-tools\selftest.py          11 项模块级实测
-tools\selftest_ui.py       20 项界面数据
-tools\selftest_engine.py   启停流程
-tools\test_loop_guard.py   回环防护
-tools\test_updater.py      更新逻辑
+tools\selftest.py            11 项模块级实测
+tools\selftest_ui.py         46 项界面数据
+tools\selftest_engine.py     启停流程
+tools\test_loop_guard.py     回环防护
+tools\test_updater.py        更新逻辑
+
+tools\selftest_vault.py      129 项可写层（临时目录，不碰真实数据）
+tools\smoke_vault_live.py    39 项真实数据读写（自动备份还原）
+tools\selftest_write_e2e.py  23 项 界面→Slot→磁盘 全链路
+tools\test_persona_parity.py 18 项 两侧人格逐字节一致
 ```
+
+后三个是针对写层的。分层的原因：
+
+- `selftest_vault.py` 证明**归一化规则**对（夹取、默认值、revision、locked）；
+- `smoke_vault_live.py` 证明**你真实那几份文件**读写不坏（4000 字 whoIAm、
+  4 条锁定价值、中文路径）；
+- `selftest_write_e2e.py` 证明**点保存之后磁盘真的变了**。
+
+第三层不能省。曾经有过一次：`list_memory_sessions` 声明成
+`@Slot(str, result=str)` 却只有一个参数，Qt 直接
+`No candidates found`，界面上表现为「加载中…」永远不动。
+前两个测试全绿，界面是坏的。
+
+`test_persona_parity.py` 守的是另一件事：**同一个灵魂文件，
+Python 侧和 Node 侧必须渲染出逐字节相同的人格文本**。
+两侧曾经因为抄错的 trait 文案和"读路径擅自补默认值"而分裂 ——
+682 字 vs 3 字，等于两个不同的人。
 
 ---
 

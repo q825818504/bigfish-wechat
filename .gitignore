@@ -51,3 +51,9 @@ bigfish_updater_*.cmd
 dist/BigFish-*
 upgrade_snapshot.json
 .secrets/
+
+# 测试临时目录（自检脚本在仓库根 mkdtemp 出来的）
+bigfish-vault-*/
+bigfish-smoke-*/
+bigfish-e2e-*/
+bigfish-parity-*/
