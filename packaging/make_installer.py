@@ -165,11 +165,22 @@ def main():
         traceback.print_exc()
         print()
         print(f"安装失败: {exc}")
-        input("按回车退出...")
+        try:
+            input("按回车退出...")
+        except EOFError:
+            pass
         return 1
 
     print()
-    ans = input("现在启动？(Y/n) ").strip().lower()
+    # ⚠ 这里的 input() 必须能容忍 EOF。
+    #   双击 install.bat 时有人守着控制台，没问题；
+    #   但脚本化安装（CI、自动化测试、静默安装）stdin 是空的，
+    #   input() 直接抛 EOFError，安装器带着异常退出 ——
+    #   文件其实装好了，进程却报错，看起来很吓人。
+    try:
+        ans = input("现在启动？(Y/n) ").strip().lower()
+    except EOFError:
+        ans = "n"
     if ans != "n":
         import subprocess
         subprocess.Popen([exe], cwd=os.path.dirname(exe))
@@ -293,6 +304,30 @@ def build_manifest() -> str:
     return out
 
 
+def build_setup_zip(installer_dir: str) -> str:
+    """把安装器文件夹打成 setup.zip —— 用户下载解压后双击 install.bat。
+
+    ⚠ 这一步以前**根本不存在**。`BigFish-0.1.0-setup.zip` 是早期手工打的，
+    之后再打包也不会更新它 —— 结果发布出去的安装包里躺着的是旧 exe、
+    旧图标。icon.ico 换了之后 setup.zip 里还是老的那份，就是这个原因。
+    """
+    out = os.path.join(DIST, f"BigFish-{VERSION}-setup.zip")
+    if os.path.isfile(out):
+        os.unlink(out)
+
+    n = 0
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for base, _dirs, files in os.walk(installer_dir):
+            for f in files:
+                p = os.path.join(base, f)
+                rel = os.path.relpath(p, installer_dir)
+                z.write(p, rel)
+                n += 1
+    size = os.path.getsize(out) / 1024 / 1024
+    print(f"  setup.zip: {n} 个文件, {size:.1f} MB")
+    return out
+
+
 def main() -> int:
     if not os.path.isdir(PAYLOAD):
         print(f"找不到打包产物: {PAYLOAD}")
@@ -303,14 +338,17 @@ def main() -> int:
     print(f"  生成安装包 v{VERSION}")
     print("=" * 60)
 
-    print("\n[1/3] 便携版")
+    print("\n[1/4] 便携版")
     z = build_portable_zip()
 
-    print("\n[2/3] 清单")
+    print("\n[2/4] 清单")
     build_manifest()
 
-    print("\n[3/3] 安装器")
-    exe = build_installer(z)
+    print("\n[3/4] 安装器")
+    installer_dir = build_installer(z)
+
+    print("\n[4/4] 打包 setup.zip")
+    build_setup_zip(installer_dir)
 
     print()
     print("=" * 60)
@@ -318,7 +356,13 @@ def main() -> int:
     for f in sorted(os.listdir(DIST)):
         if f.startswith("BigFish-"):
             p = os.path.join(DIST, f)
-            print(f"    {f:44s} {os.path.getsize(p)/1024/1024:7.1f} MB")
+            if os.path.isdir(p):
+                total = sum(
+                    os.path.getsize(os.path.join(dp, fn))
+                    for dp, _dn, fns in os.walk(p) for fn in fns)
+                print(f"    {f + '/':44s} {total/1024/1024:7.1f} MB")
+            else:
+                print(f"    {f:44s} {os.path.getsize(p)/1024/1024:7.1f} MB")
     print("=" * 60)
     return 0
 
