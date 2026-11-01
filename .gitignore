@@ -60,3 +60,4 @@ bigfish-parity-*/
 
 # 运行期数据（灵魂/心情/记忆），不跟仓库走
 /data/
+/settings.json

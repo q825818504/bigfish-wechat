@@ -563,7 +563,7 @@
         <div class="page-heading">
           <div>
             <h1>数据目录</h1>
-            <p>她住在程序旁边，不动。<code>data\</code> 里三个文件就是她的全部。</p>
+            <p>默认在程序旁边的 <code>data\</code>，想放别处随时能改。</p>
           </div>
           <div class="heading-side" id="dataRootTag">—</div>
         </div>
@@ -571,18 +571,31 @@
         <div class="card">
           <div class="card-head"><h2>所在位置</h2></div>
           <div class="card-desc" style="margin-bottom:14px">
-            固定在安装目录下，不跟 DSH 共用。想带走她，整个 <code>data</code>
-            文件夹拷走就行。
+            默认是安装目录下的 <code>data\</code>。换到别的盘也行 ——
+            改完记得把数据一起搬过去，不然那边是空的新目录。
           </div>
           <div class="form">
             <div class="field full">
-              <label>数据目录</label>
+              <label>当前数据目录</label>
               <div class="path-row">
                 <input type="text" id="dataRootPath" readonly>
                 <button class="btn btn-sm" id="btnDataRootOpen">打开</button>
               </div>
               <small id="dataRootFile">—</small>
             </div>
+            <div class="field full">
+              <label>换成别的目录</label>
+              <div class="path-row">
+                <input type="text" id="dataRootTarget" placeholder="比如 D:\大肥鱼\data">
+                <button class="btn btn-sm" id="btnDataRootPick">浏览…</button>
+              </div>
+              <small>只改指向不会搬文件。要连数据一起过去，用下面「搬过去」。</small>
+            </div>
+          </div>
+          <div class="memory-toolbar" style="margin-top:14px">
+            <button class="btn btn-primary" id="btnDataRootMove">搬过去（连同数据）</button>
+            <button class="btn btn-sm" id="btnDataRootSave">只改指向</button>
+            <button class="btn btn-sm" id="btnDataRootDefault">恢复默认</button>
           </div>
           <div class="card-desc" style="margin-top:12px" id="dataRootHint"></div>
         </div>

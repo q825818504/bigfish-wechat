@@ -1070,7 +1070,11 @@ class Backend(QObject):
             return json.dumps({
                 "ok": True,
                 "root": root,
-                "fixed": True,          # 固定在安装目录，不可改
+                "defaultRoot": vault.default_data_root(),
+                "customRoot": vault.custom_data_root(),
+                "isDefault": vault.normalize_root(root) ==
+                             vault.normalize_root(vault.default_data_root()),
+                "settingsFile": vault.settings_path(),
                 "writable": writable,
                 "writeError": w_err,
                 "soul": _stat("soul"),
@@ -1083,6 +1087,26 @@ class Backend(QObject):
             }, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def set_data_root(self, path: str) -> str:
+        """改数据目录。传空串 = 恢复默认（安装目录下的 data）。
+
+        ⚠ 只改指向，不搬文件。要连数据一起搬用 apply_move()。
+        """
+        try:
+            from bigfish import vault
+
+            ok, err = vault.set_data_root(path)
+            if not ok:
+                return json.dumps({"ok": False, "error": err}, ensure_ascii=False)
+            new_root = vault.install_root()
+            self.log_message.emit(f"[数据] 数据目录 → {new_root}", "")
+            return json.dumps({"ok": True, "root": new_root,
+                               "isDefault": bool(not vault.custom_data_root())},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
     @Slot(result=str)
     def inspect_wipe(self) -> str:

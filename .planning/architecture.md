@@ -186,19 +186,25 @@ session scope 过滤。Python 重写必然产生偏差，结果是
 
 ---
 
-## 数据目录：固定在安装目录
+## 数据目录：默认在安装目录，可改
 
 ```
 <安装目录>/
   ├── BigFish.exe
   ├── ui/  bridge/
   ├── _internal/           ← PyInstaller 运行时（升级会整个替换）
-  └── data/                ← 她的全部
+  ├── settings.json        ← 用户改过的位置（**不放 data/ 里**）
+  └── data/                ← 默认位置，她的全部
        ├── soul.json
        ├── mood.json
        ├── mood-config.json
        └── memory.sqlite3
 ```
+
+解析顺序：`BIGFISH_DATA_ROOT`（测试）→ `settings.json` → `<安装目录>/data`。
+
+**settings.json 为什么不放 data/ 里**：改位置时它会跟着数据搬走，
+程序下次启动就找不到新地址。配置必须待在一个固定位置。
 
 **为什么不用 `_MEIPASS`**：onedir 模式下它是 `_internal/`，
 用户升级时会被整个替换掉 —— 数据放那里等于每次升级清空。必须是 exe 所在目录。

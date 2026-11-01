@@ -1034,8 +1034,11 @@ async function loadDataRoot() {
     S.data = d;
 
     $('#dataRootPath').value = d.root || '';
-    setText('#dataRootTag', d.fixed ? '固定位置' : '可配置');
-    setText('#dataRootFile', '整个 data 文件夹拷走就能带走她');
+    setText('#dataRootTag', d.isDefault ? '默认位置' : '自定义');
+    setText('#dataRootFile',
+      d.isDefault
+        ? `默认位置。想换到别的盘就在下面填。`
+        : `自定义位置。默认是 ${d.defaultRoot || '安装目录/data'}`);
 
     // 可写性：不可写就直接在页面上说清楚，别等用户点保存才失败
     const hint = $('#dataRootHint');
@@ -1172,13 +1175,100 @@ $('#btnWipe').addEventListener('click', async () => {
   }
 });
 
-/* ── 数据根：打开 / 选择 / 只改指向 / 搬家 ── */
+/* ── 数据根：打开 / 选择 / 只改指向 / 搬家 / 恢复默认 ── */
 $('#btnDataRootOpen').addEventListener('click', async () => {
   const p = $('#dataRootPath').value;
   if (!p) return;
   try {
     await S.bridge.open_path(p);
   } catch (e) { toast('打不开'); }
+});
+
+$('#btnDataRootPick').addEventListener('click', async () => {
+  try {
+    const r = JSON.parse(await S.bridge.pick_directory($('#dataRootPath').value));
+    if (r.path) $('#dataRootTarget').value = r.path;
+    else if (r.error) toast(r.error);
+  } catch (e) { toast('选择失败'); }
+});
+
+/* 只改指向：不搬文件。新目录是空的，所以要说清楚。 */
+$('#btnDataRootSave').addEventListener('click', async () => {
+  const target = $('#dataRootTarget').value.trim();
+  if (!target) return toast('先填目标目录');
+  if (!confirm(`把数据目录改到：\n${target}\n\n` +
+               '**只改指向，不搬文件**。如果那个目录是空的，' +
+               '打开会看到一份全新的（出厂）人格。\n\n' +
+               '要带着她一起过去请用「搬过去」。')) return;
+
+  const btn = $('#btnDataRootSave');
+  btn.disabled = true;
+  const h = $('#dataRootHint');
+  try {
+    const r = JSON.parse(await S.bridge.set_data_root(target));
+    if (!r.ok) {
+      h.textContent = '改不了：' + (r.error || '');
+      h.className = 'hint-line is-err';
+      return toast('保存失败');
+    }
+    h.textContent = '已改到 ' + r.root;
+    h.className = 'hint-line is-ok';
+    toast('已保存');
+    S.soul = null;
+    await loadDataRoot();
+  } catch (e) { toast('保存失败'); }
+  finally { btn.disabled = false; }
+});
+
+/* 搬家：先复制，复制成功了才改指向。 */
+$('#btnDataRootMove').addEventListener('click', async () => {
+  const target = $('#dataRootTarget').value.trim();
+  if (!target) return toast('先填目标目录');
+  try {
+    const d = JSON.parse(await S.bridge.inspect_move(target));
+    if (!d.ok) return toast(d.error || '检查失败');
+
+    const files = d.items.reduce((n, it) => n + (it.files || 0), 0);
+    let msg = `把 ${d.items.length} 项 / ${files} 个文件 / ${fmtBytes(d.totalBytes)} ` +
+              `搬到：\n${d.dst}`;
+    if (d.conflicts.length) {
+      msg += `\n\n⚠ 目标里已有 ${d.conflicts.length} 个同名项，会被覆盖：\n` +
+             d.conflicts.slice(0, 8).join('\n');
+    }
+    if (d.dstWritable === false) {
+      msg += `\n\n⚠ 目标目录写不进去（${d.dstWriteError}）—— 搬过去也用不了`;
+    }
+    msg += '\n\n源目录会被改名成 .old-时间戳 留着，不直接删。继续？';
+    if (!confirm(msg)) return;
+
+    const h = $('#dataRootHint');
+    h.textContent = '正在搬…';
+    h.className = 'hint-line';
+
+    const r = JSON.parse(await S.bridge.apply_move(target));
+    if (!r.ok) {
+      h.textContent = '搬家失败：' + (r.error || '') + '（数据目录未改动）';
+      h.className = 'hint-line is-err';
+      return toast('搬家失败');
+    }
+    h.textContent = '已搬到 ' + r.root;
+    h.className = 'hint-line is-ok';
+    toast('已搬家');
+    S.soul = null;
+    await loadDataRoot();
+  } catch (e) { toast('搬家失败'); }
+});
+
+$('#btnDataRootDefault').addEventListener('click', async () => {
+  if (!confirm(`恢复成默认位置：\n${S.data?.defaultRoot || '安装目录/data'}\n\n` +
+               '原来的目录不会被删。')) return;
+  try {
+    const r = JSON.parse(await S.bridge.set_data_root(''));
+    if (!r.ok) return toast(r.error || '失败');
+    toast('已恢复默认');
+    S.soul = null;
+    await loadDataRoot();
+  } catch (e) { toast('失败'); }
 });
 
 /* ────────── 设置 ────────── */

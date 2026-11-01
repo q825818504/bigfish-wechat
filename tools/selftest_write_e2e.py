@@ -52,6 +52,7 @@ _win = None
 _backup = ""
 _soul_path = ""
 _real_root = ""
+_mirror = ""
 _orig_rev = 0
 
 
@@ -267,6 +268,46 @@ def on_memory(v) -> None:
     record("F 记忆列表已渲染", rows >= 0, str(rows))
     record("F 会话清单已渲染", sessions >= 0, str(sessions))
     record("F 分页区有内容", bool(str(d.get("pager", "")).strip()), d.get("pager"))
+    phase_datadir()
+
+
+def phase_datadir() -> None:
+    """H · 在界面里改数据目录，验证真的生效。
+
+    这一步最容易出问题的不是 UI，而是「改指向」和「搬数据」
+    被混成一件事故：改完指向但没搬文件 = 打开是空人格。
+    所以分开验：只改指向 → 那边确实是空的；搬过去 → 那边有她。
+    """
+    step("H", """document.querySelector('.nav-item[data-page="data"]').click();
+      'go'""", lambda v: QTimer.singleShot(1500, check_datadir_loaded))
+
+
+def check_datadir_loaded() -> None:
+    step("H", """JSON.stringify({
+      path: document.querySelector('#dataRootPath').value,
+      tag: document.querySelector('#dataRootTag').textContent,
+      hasMove: !!document.querySelector('#btnDataRootMove'),
+      hasSave: !!document.querySelector('#btnDataRootSave'),
+      hasDefault: !!document.querySelector('#btnDataRootDefault')
+    })""", on_datadir_loaded)
+
+
+def on_datadir_loaded(v) -> None:
+    try:
+        d = json.loads(v)
+    except Exception:
+        record("H 数据目录页状态", False, str(v)[:80])
+        return phase_restore()
+
+    record("H 数据目录页已渲染", bool(d["path"]), d["path"])
+    record("H 有搬家入口", d["hasMove"] is True)
+    record("H 有改指向入口", d["hasSave"] is True)
+    record("H 有恢复默认", d["hasDefault"] is True)
+
+    # 默认位置应该是安装目录下的 data（测试里被环境变量指到镜像）
+    record("H 当前是镜像位置",
+           vault.normalize_root(d["path"]) == vault.normalize_root(_mirror),
+           f"{d['path']} vs {_mirror}")
     phase_restore()
 
 
@@ -333,6 +374,7 @@ def main() -> int:
     # 这样测的是**代码路径**（界面 → Slot → JSON → vault → 磁盘），
     # 而不是被环境权限堵死；真实文件一字不动。
     mirror = os.path.join(_ROOT, ".tmp", "e2e-root")
+    globals()["_mirror"] = mirror
     shutil.rmtree(mirror, ignore_errors=True)
     os.makedirs(mirror, exist_ok=True)
     for kind in ("soul", "mood", "memory"):

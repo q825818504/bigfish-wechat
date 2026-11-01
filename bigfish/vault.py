@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 # ══════════════════════════════════════════════════════════════════════════
-# 路径解析 —— 固定在**安装目录**，与 DSH 完全脱离
+# 路径解析 —— **默认**安装目录，可自定义
 # ══════════════════════════════════════════════════════════════════════════
 #
 # 历史沿革（这段必须留着，否则以后有人会想"为什么不读 DSH 的配置"）：
@@ -48,18 +48,24 @@ from typing import Any, Dict, List, Optional, Tuple
 #           后果：在微信里改一次数据根，DSH 插件那边也跟着变；反过来亦然。
 #           两个程序互相踩，用户根本分不清"我改的是谁"。
 #   第二版  一个数据根 = 一份，但数据根仍由 root.json 决定。
-#   现在    固定在安装目录。**不读 root.json，也不写它。**
+#   第三版  固定在安装目录，**不给改**。矫枉过正了：用户要的是默认在安装目录，
+#           不是不能挪。装在 C 盘、想放 D 盘的人怎么办。
+#   现在    默认 <安装目录>/data，可以改。改的结果记在自己的一份配置里。
 #
-# 这是刻意的取舍：微信这边是独立程序，它的人格应该由它自己管。
-# 想同步到 DSH 就手动拷文件，不做隐式联动 —— 隐式联动是两个程序互相覆盖的根源。
+# 为什么不用 DSH 的 root.json：那是插件的配置文件。用自己的文件，
+# 两个程序各管各的，谁也不覆盖谁。
 #
-# 目录结构：
-#   <安装目录>/data/
-#     ├── soul.json          启动时若不存在，用内置模板创建
-#     ├── mood.json          首次用到时创建
-#     └── memory.sqlite3     首次用到时创建
+# 目录结构（默认位置）：
+#   <安装目录>/
+#     ├── settings.json      ← 用户改过的数据目录记在这（不在 data/ 里，
+#     │                         否则换目录时这份配置会跟着搬走，找不到新地址）
+#     └── data/              ← 她的全部
+#          ├── soul.json
+#          ├── mood.json
+#          └── memory.sqlite3
 
 DATA_DIR_NAME = "data"
+SETTINGS_NAME = "settings.json"
 
 
 def app_dir() -> str:
@@ -67,7 +73,7 @@ def app_dir() -> str:
 
     打包后是 exe 所在目录（dist/BigFish/），开发时是仓库根。
     ⚠ 必须是**exe 所在目录**而不是 _MEIPASS —— onedir 模式下后者是 _internal/，
-      用户升级时可能被整个替换掉，数据放那里等于每次升级清空。
+      用户升级时可能被整个替换掉，配置放那里等于每次升级丢失。
     """
     import sys
 
@@ -81,17 +87,101 @@ def default_data_root() -> str:
     return os.path.join(app_dir(), DATA_DIR_NAME)
 
 
-def install_root() -> str:
-    """数据根。**唯一**的解析：一直是安装目录下的 data/。
+def settings_path() -> str:
+    """<安装目录>/settings.json —— **永远**在安装目录，不跟着数据目录跑。"""
+    return os.path.join(app_dir(), SETTINGS_NAME)
 
-    ⚠ 留了一个测试专用的逃生口 `BIGFISH_DATA_ROOT`。
-      没有它的话，测试会在真实数据目录上跑 —— 那是绝对不行的。
-      这不是"配置项"：界面上没有入口，文档里也不提，只给测试用。
+
+def read_settings() -> Dict[str, Any]:
+    """读安装目录下的 settings.json。读不到返回空 dict（不是错误）。"""
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_settings(patch: Dict[str, Any]) -> Tuple[bool, str]:
+    """合并写 settings.json。未知字段保留。"""
+    cur = read_settings()
+    cur.update(patch or {})
+    try:
+        _atomic_write_json(settings_path(), cur)
+        return True, ""
+    except WriteDenied as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def custom_data_root() -> str:
+    """用户自定义的数据目录；没改过返回空串。"""
+    return str(read_settings().get("dataRoot") or "").strip()
+
+
+def install_root() -> str:
+    """数据根。解析顺序：
+
+      1. 环境变量 BIGFISH_DATA_ROOT（测试专用，界面无入口）
+      2. settings.json 里的 dataRoot（用户自定义）
+      3. <安装目录>/data（默认）
+
+    ⚠ 第 1 条必须留着：没有它，测试会跑在真实数据上。
     """
     override = (os.environ.get("BIGFISH_DATA_ROOT") or "").strip()
     if override:
         return override
+    custom = custom_data_root()
+    if custom:
+        return custom
     return default_data_root()
+
+
+def set_data_root(path: str) -> Tuple[bool, str]:
+    """改数据目录。传空串 = 恢复默认（删掉 settings.json 里那条）。
+
+    ⚠ 只改指向，**不搬文件**。想连数据一起搬用 apply_move()。
+      这是刻意的：改指向和搬数据是两件事，混在一起会让"搬失败但指向已改"
+      变成数据看不见的事故。
+    """
+    p = str(path or "").strip()
+    if p:
+        p = os.path.abspath(os.path.expanduser(p))
+        if not os.path.isdir(p):
+            return False, f"目录不存在：{p}"
+        ok_w, w_err = probe_writable(os.path.join(p, ".probe"))
+        if not ok_w:
+            return False, f"这个目录写不进去：{w_err}"
+
+    cur = read_settings()
+    if p:
+        cur["dataRoot"] = p
+    else:
+        cur.pop("dataRoot", None)
+    try:
+        _atomic_write_json(settings_path(), cur)
+        return True, ""
+    except WriteDenied as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, str(exc)
+
+
+def resolve_data_root() -> str:
+    """历史名字，等价于 install_root()。调用点很多，保留别名。"""
+    return install_root()
+
+
+def normalize_root(path: str) -> str:
+    """路径比较用的规范形式：绝对化、去尾部分隔符、忽略大小写差异。
+
+    Windows 上 D:\\x / d:\\X / D:\\x\\ 都指同一个地方，
+    字符串比较会把它们当成三个不同的目录。
+    """
+    if not path:
+        return ""
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
 
 
 # ── 与 DSH 的关系：只读探测，永不写入 ──────────────────────────────────
@@ -1130,11 +1220,13 @@ def inspect_move(dst: str) -> MovePlan:
 
 
 def apply_move(dst: str, copy: bool = False) -> Tuple[bool, str]:
-    """执行搬家。copy=True 时保留源（先复制再切根，用户确认后自己删）。
+    """执行搬家：把数据根下的东西复制到 dst，然后把数据目录指过去。
 
-    ⚠️ 顺序：先复制全部内容，**复制成功后**才改 root.json。
-       反过来的话复制失败就等于数据根指向一个空目录，
-       DSH 那边会以为"灵魂没了"，是真的会把用户吓到的事故。
+    ⚠ 顺序不能反：**先复制全部内容、复制成功了，才改指向**。
+      反过来的话复制失败就等于"数据目录指向一个空文件夹"，
+      用户打开会以为"灵魂没了"—— 那是最吓人的一种失败。
+
+    copy=True 时保留源目录（只复制不搬走，用户自己决定何时删）。
     """
     plan = inspect_move(dst)
     if not plan.ok:
@@ -1150,19 +1242,19 @@ def apply_move(dst: str, copy: bool = False) -> Tuple[bool, str]:
             else:
                 shutil.copy2(s, d)
     except Exception as exc:
-        return False, f"复制失败（数据根未改动）：{exc}"
+        return False, f"复制失败（数据目录未改动）：{exc}"
 
-    ok, err = write_data_root(plan.dst)
+    ok, err = set_data_root(plan.dst)
     if not ok:
         return False, f"复制完成但写配置失败：{err}"
 
     if not copy:
-        # 源目录保留一份 .old-<时间戳>，不直接删 —— 搬家是不可逆操作里最贵的一种
+        # 源目录留一份 .old-<时间戳>，不直接删 —— 搬家是最不可逆的操作之一
         stamp = time.strftime("%Y%m%d-%H%M%S")
         try:
             os.rename(plan.src, f"{plan.src}.old-{stamp}")
         except Exception:
-            pass  # 改根已经成功，源留着也不影响使用
+            pass  # 改指向已经成功，源留着也不影响使用
     return True, ""
 
 

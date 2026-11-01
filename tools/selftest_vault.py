@@ -538,15 +538,84 @@ def test_memory(tmp: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
+def test_custom_root(tmp: str, home: str) -> None:
+    section("自定义数据目录（默认在安装目录，可改）")
+
+    os.environ["DSH_HOME"] = home
+    os.environ.pop("BIGFISH_DATA_ROOT", None)
+
+    # 默认位置 = <安装目录>/data
+    check("默认根在安装目录下",
+          vault.normalize_root(vault.default_data_root()).endswith(
+              vault.normalize_root(os.path.join(vault.app_dir(), "data"))),
+          vault.default_data_root())
+    check("没改过时 custom 为空", vault.custom_data_root() == "",
+          vault.custom_data_root())
+    check("没改过时用默认",
+          vault.normalize_root(vault.install_root()) ==
+          vault.normalize_root(vault.default_data_root()),
+          vault.install_root())
+    check("settings 在安装目录，不在 data 里",
+          vault.normalize_root(vault.settings_path()).startswith(
+              vault.normalize_root(vault.app_dir())) and
+          "/data/" not in vault.normalize_root(vault.settings_path()),
+          vault.settings_path())
+
+    # 改到一个不存在的目录 → 拒绝
+    ghost = os.path.join(tmp, "ghost-no-such-dir")
+    ok, err = vault.set_data_root(ghost)
+    check("不存在的目录被拒", not ok and "不存在" in err, err)
+
+    # 改到真实目录 → 生效
+    custom = os.path.join(tmp, "custom-data")
+    os.makedirs(custom, exist_ok=True)
+    ok, err = vault.set_data_root(custom)
+    check("改成自定义成功", ok, err)
+    check("custom 记得住", vault.normalize_root(vault.custom_data_root()) ==
+          vault.normalize_root(custom), vault.custom_data_root())
+    check("install_root 跟着变",
+          vault.normalize_root(vault.install_root()) == vault.normalize_root(custom),
+          vault.install_root())
+    check("默认值没变",
+          vault.normalize_root(vault.default_data_root()) !=
+          vault.normalize_root(custom))
+
+    # 设置文件真的落盘了
+    check("settings.json 存在", os.path.isfile(vault.settings_path()))
+    st = json.load(open(vault.settings_path(), encoding="utf-8"))
+    check("settings 里有 dataRoot", st.get("dataRoot") == custom, str(st))
+
+    # 恢复默认
+    ok, err = vault.set_data_root("")
+    check("恢复默认成功", ok, err)
+    check("恢复后 custom 为空", vault.custom_data_root() == "",
+          vault.custom_data_root())
+    check("恢复后回到安装目录",
+          vault.normalize_root(vault.install_root()) ==
+          vault.normalize_root(vault.default_data_root()))
+
+    # 环境变量优先于 settings（测试隔离靠它）
+    vault.set_data_root(custom)
+    os.environ["BIGFISH_DATA_ROOT"] = os.path.join(tmp, "env-wins")
+    check("环境变量优先",
+          vault.normalize_root(vault.install_root()) ==
+          vault.normalize_root(os.path.join(tmp, "env-wins")),
+          vault.install_root())
+    os.environ.pop("BIGFISH_DATA_ROOT", None)
+
+    # 收尾：别把测试路径留在真实 settings 里
+    vault.set_data_root("")
+
+
+# ══════════════════════════════════════════════════════════════════════
 def test_bootstrap(tmp: str, home: str) -> None:
-    section("启动自动创建（固定在安装目录）")
+    section("启动自动创建")
 
     os.environ["DSH_HOME"] = home
     root = os.path.join(tmp, "boot-data")
     os.environ["BIGFISH_DATA_ROOT"] = root
 
-    check("数据根固定读环境变量（测试口）",
-          vault.install_root() == root, vault.install_root())
+    check("数据根跟随设置", vault.install_root() == root, vault.install_root())
 
     # 全空 → 应自己建目录 + 出厂人格
     r = vault.ensure_data_root(import_from_dsh=False)
@@ -631,6 +700,7 @@ def main() -> int:
         ("心情重置", lambda: test_mood_reset(tmp, home)),
         ("清空", lambda: test_wipe(tmp, home)),
         ("记忆库", lambda: test_memory(tmp)),
+        ("自定义目录", lambda: test_custom_root(tmp, home)),
         ("启动创建", lambda: test_bootstrap(tmp, home)),
     ]
 
