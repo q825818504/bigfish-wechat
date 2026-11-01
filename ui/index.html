@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>大肥鱼</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ══ 侧栏 ══ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M3 12c2.2-3.4 4.8-3.4 7 0 2.2-3.4 4.8-3.4 7 0-2.2 3.8-4.8 5.8-7 7.4-2.2-1.6-4.8-3.6-7-7.4z"
+                fill="currentColor" opacity=".9"/>
+        </svg>
+      </div>
+      <div class="brand-text">
+        <strong>大肥鱼</strong>
+        <span>微信</span>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <span class="nav-caption">运行</span>
+      <button class="nav-item is-active" data-page="overview">
+        <svg viewBox="0 0 24 24"><path d="M4 13h6V4H4v9zm10 7h6v-9h-6v9zM4 20h6v-4H4v4zm10-13h6V4h-6v3z" fill="currentColor" stroke="none"/></svg>
+        <span>概览</span>
+      </button>
+      <button class="nav-item" data-page="chats">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M4 6h16v10H8l-4 4V6z"/></svg>
+        <span>会话</span>
+      </button>
+
+      <span class="nav-caption">大肥鱼</span>
+      <button class="nav-item" data-page="soul">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 20s-7-4.4-7-9a4 4 0 017-2.6A4 4 0 0119 11c0 4.6-7 9-7 9z"/></svg>
+        <span>灵魂</span>
+      </button>
+      <button class="nav-item" data-page="mood">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="M9 14.5c.9 1.1 1.9 1.6 3 1.6s2.1-.5 3-1.6M9.5 9.5h.01M14.5 9.5h.01"/></svg>
+        <span>心情</span>
+      </button>
+      <button class="nav-item" data-page="memory">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v16M4 8h16M6.5 17.5l11-11"/><circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/></svg>
+        <span>记忆</span>
+      </button>
+
+      <span class="nav-caption">系统</span>
+      <button class="nav-item" data-page="settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6l1.4 1.4m10 10 1.4 1.4m0-12.8-1.4 1.4m-10 10-1.4 1.4"/></svg>
+        <span>设置</span>
+      </button>
+      <button class="nav-item" data-page="logs">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M5 6h14M5 12h14M5 18h9"/></svg>
+        <span>日志</span>
+      </button>
+    </nav>
+
+    <div class="sidebar-bottom">
+      <div class="status-chip">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">未启动</span>
+      </div>
+      <div class="local-label" id="accountLabel">—</div>
+    </div>
+  </aside>
+
+  <!-- ══ 主区 ══ -->
+  <div class="workspace">
+    <header class="topbar">
+      <div class="breadcrumb">
+        <span>大肥鱼</span>
+        <span class="sep">/</span>
+        <strong id="breadcrumb">概览</strong>
+      </div>
+      <div class="topbar-actions">
+        <button class="icon-btn" id="btnUpdate" title="检查更新" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v10m0 0l-3.2-3.2M12 14l3.2-3.2M5 17v2h14v-2"/></svg>
+        </button>
+        <button class="icon-btn" id="btnRefresh" title="刷新">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M20 11a8 8 0 10-2.3 5.7M20 5v6h-6"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="pages" id="pages">
+
+      <!-- ═══════ 概览 ═══════ -->
+      <section class="page is-active" data-page="overview">
+        <div class="page-heading">
+          <div>
+            <h1>概览</h1>
+            <p>她在微信里的运行情况，一眼看清。</p>
+          </div>
+          <div class="heading-side" id="ovUpdated">—</div>
+        </div>
+
+        <div class="grid-2">
+          <!-- 主控卡 -->
+          <div class="card power-card">
+            <div class="power-top">
+              <div class="power-copy">
+                <div class="power-label">微信助手</div>
+                <div class="power-state" id="ovState">未启动</div>
+                <div class="power-hint" id="ovStateHint">登录并选择会话后，点右侧按钮启动。</div>
+              </div>
+              <button class="power-btn" id="btnPower" title="启动 / 停止">
+                <svg viewBox="0 0 24 24">
+                  <path d="M12 4v7" stroke-linecap="round"/>
+                  <path d="M7.5 6.8a8 8 0 1010 0" stroke-linecap="round"/>
+                </svg>
+              </button>
+            </div>
+            <div class="power-bottom">
+              <span class="tag" id="ovPowerTag">等待启动</span>
+              <div style="display:flex;gap:6px">
+                <button class="btn btn-sm btn-ghost" id="btnOpenWechat">打开微信</button>
+                <button class="btn btn-sm btn-ghost" id="btnDiagnose">重新检测</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 状态摘要 -->
+          <div class="card">
+            <div class="card-head"><h2>当前会话</h2></div>
+            <div class="check-list" id="ovSummary">
+              <div class="empty" style="padding:16px 0">
+                <p>启动后这里会显示正在监听的会话</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 连接检查 -->
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>连接检查</h2>
+            <button class="text-link" id="btnRecheck">重新检测</button>
+          </div>
+          <div class="grid-3" id="checkGrid">
+            <div class="check-item" data-k="admin">
+              <span class="check-icon"></span>
+              <div>
+                <div class="check-name">管理员权限</div>
+                <div class="check-val">检测中…</div>
+              </div>
+              <span></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 指标 -->
+        <div class="grid-3" style="margin-top:16px">
+          <div class="card">
+            <div class="metric-label">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 17l5-5 3 3 7-8"/></svg>
+              收到消息
+            </div>
+            <div class="metric-value" id="ovRecv">0<small>条</small></div>
+            <div class="metric-note">本次运行累计</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16v10H8l-4 4V7z"/></svg>
+              已回复
+            </div>
+            <div class="metric-value" id="ovReply">0<small>条</small></div>
+            <div class="metric-note">成功投递到微信</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l2.5 2.5" stroke-linecap="round"/></svg>
+              运行时长
+            </div>
+            <div class="metric-value" id="ovUptime">—</div>
+            <div class="metric-note">距本次启动</div>
+          </div>
+        </div>
+
+        <!-- 最近对话 -->
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>最近对话</h2>
+            <button class="text-link" data-goto="logs">查看全部</button>
+          </div>
+          <div id="ovRecent">
+            <div class="empty">
+              <h3>还没有对话</h3>
+              <p>启动之后，微信里来消息就会显示在这里</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════ 会话 ═══════ -->
+      <section class="page" data-page="chats">
+        <div class="page-heading">
+          <div>
+            <h1>会话</h1>
+            <p>打开右侧开关，只有打开的会话才会自动回复。</p>
+          </div>
+          <div class="heading-side">
+            <button class="btn btn-sm" id="btnLoadChats">加载会话</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>微信会话</h2>
+            <span class="tag" id="chatCount">0 个</span>
+          </div>
+          <div class="chat-list" id="chatList">
+            <div class="empty">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 6h16v10H8l-4 4V6z"/></svg>
+              <h3>还没有加载会话</h3>
+              <p>点右上角「加载会话」，从你的微信里读取列表</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>回复策略</h2></div>
+          <div class="switch-row">
+            <div class="switch-copy">
+              <strong>处理自己发的消息</strong>
+              <p>打开后，你在文件传输助手里发的内容也会触发回复。日常使用请关闭，否则会自问自答。</p>
+            </div>
+            <label class="switch-control">
+              <input type="checkbox" id="cfgAllowSelf2">
+              <span class="switch-track"></span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════ 灵魂 ═══════ -->
+      <section class="page" data-page="soul">
+        <div class="page-heading">
+          <div>
+            <h1>灵魂</h1>
+            <p>人格的唯一来源。只读，要改请去 DSH 插件里改。</p>
+          </div>
+          <div class="heading-side" id="soulRev">—</div>
+        </div>
+
+        <div class="grid-3">
+          <div class="card">
+            <div class="metric-label">名字</div>
+            <div class="metric-value" id="soulName" style="font-family:var(--body-font);font-size:20px;letter-spacing:0">—</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">称呼对方</div>
+            <div class="metric-value" id="soulAddress" style="font-family:var(--body-font);font-size:20px;letter-spacing:0">—</div>
+          </div>
+          <div class="card">
+            <div class="metric-label">珍视</div>
+            <div class="metric-value" id="soulValueCount">0<small>条</small></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>我是谁</h2></div>
+          <div class="soul-quote" id="soulWhoIAm">加载中…</div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>我珍视的</h2></div>
+          <div class="value-list" id="soulValues">
+            <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>我的性格</h2></div>
+          <div class="trait-grid" id="soulTraits"></div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>我自己知道的事</h2></div>
+          <div class="note-list" id="soulNotes">
+            <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════ 心情 ═══════ -->
+      <section class="page" data-page="mood">
+        <div class="page-heading">
+          <div>
+            <h1>心情</h1>
+            <p>来自 DSH 情绪插件。只读，由 DSH 那边每轮对话后更新。</p>
+          </div>
+          <div class="heading-side" id="moodUpdated">—</div>
+        </div>
+
+        <div class="card">
+          <div class="mood-hero">
+            <div class="mood-dial">
+              <svg viewBox="0 0 100 100">
+                <circle class="ring-bg" cx="50" cy="50" r="42"/>
+                <circle class="ring-fg" id="moodRing" cx="50" cy="50" r="42"
+                        stroke-dasharray="264" stroke-dashoffset="264"/>
+              </svg>
+              <div class="mood-value"><span id="moodScore">—</span></div>
+            </div>
+            <div class="mood-copy">
+              <div class="mood-title" id="moodLabel">加载中…</div>
+              <div class="mood-reason" id="moodReason"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>情绪维度</h2></div>
+          <div class="dim-list" id="moodDims">
+            <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head"><h2>注入给她的原话</h2></div>
+          <div class="card-desc" style="margin-bottom:12px">
+            这段话会随每轮对话塞进 system prompt，是情绪真正影响她说话的地方。
+          </div>
+          <div class="soul-quote" id="moodInjected" style="font-size:12px;color:var(--muted)">—</div>
+        </div>
+      </section>
+
+      <!-- ═══════ 记忆 ═══════ -->
+      <section class="page" data-page="memory">
+        <div class="page-heading">
+          <div>
+            <h1>记忆</h1>
+            <p>她记得的事。检索走 DSH 原版的 MemoryStore，分词与衰减逻辑一致。</p>
+          </div>
+          <div class="heading-side" id="memCount">—</div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>检索测试</h2></div>
+          <div class="card-desc" style="margin-bottom:14px">
+            输入一句话，看她能不能翻出相关的记忆。这就是她回复时实际用的检索。
+          </div>
+          <div class="memory-toolbar">
+            <input class="memory-search" id="memQuery" placeholder="比如：困、爸爸、大肥鱼…">
+            <button class="btn btn-primary" id="btnMemSearch">检索</button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>记忆库</h2>
+            <span class="tag" id="memDbTag">—</span>
+          </div>
+          <div class="memory-list" id="memList">
+            <div class="empty">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 4v16M4 8h16M6.5 17.5l11-11"/></svg>
+              <h3>还没有加载记忆</h3>
+              <p>点上面的「检索」看看她能翻出什么</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════ 设置 ═══════ -->
+      <section class="page" data-page="settings">
+        <div class="page-heading">
+          <div>
+            <h1>设置</h1>
+            <p>改完点底部保存。</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>模型</h2>
+            <span class="tag" id="modelTag">—</span>
+          </div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field full">
+                <label>接口地址</label>
+                <input type="text" id="cfgEndpoint" placeholder="http://127.0.0.1:3425/v1/chat/completions">
+                <small>任何 OpenAI 兼容接口都可以。本地 Magpie 网关默认就是这个地址。</small>
+              </div>
+              <div class="field">
+                <label>模型 ID</label>
+                <input type="text" id="cfgModel" placeholder="workbuddy-ai/deepseek-v4.1-flash">
+              </div>
+              <div class="field">
+                <label>API Key</label>
+                <input type="password" id="cfgApiKey" placeholder="本地网关留空">
+                <small>连本地网关时不需要填写。</small>
+              </div>
+              <div class="field">
+                <label>温度</label>
+                <input type="number" id="cfgTemp" step="0.1" min="0" max="2">
+                <small>越高越活泼，越低越稳定。1.0 适合日常聊天。</small>
+              </div>
+              <div class="field">
+                <label>最大 token</label>
+                <input type="number" id="cfgMaxTokens" step="100" min="100">
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>自动回复</h2></div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field">
+                <label>轮询间隔（秒）</label>
+                <input type="number" id="cfgInterval" step="0.1" min="0.5" max="10">
+                <small>越小越灵敏，越费 CPU。1.2 秒比较平衡。</small>
+              </div>
+              <div class="field">
+                <label>回复长度上限</label>
+                <input type="number" id="cfgMaxChars" step="10" min="20" max="2000">
+                <small>微信聊天宜短。300 字足够。</small>
+              </div>
+              <div class="field full">
+                <label>安静时段</label>
+                <input type="text" id="cfgQuiet" placeholder="留空表示不启用；填 0,1,2,3,4,5,6 表示凌晨不回复">
+                <small>逗号分隔的整点（0-23）。</small>
+              </div>
+            </div>
+            <div class="switch-row">
+              <div class="switch-copy">
+                <strong>处理自己发的消息</strong>
+                <p>仅用于文件传输助手自测。日常使用请关闭。</p>
+              </div>
+              <label class="switch-control">
+                <input type="checkbox" id="cfgAllowSelf">
+                <span class="switch-track"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+
+        <div class="save-bar">
+          <span class="save-hint" id="saveHint"></span>
+          <button class="btn btn-primary" id="btnSave">保存设置</button>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>关于</h2>
+            <span class="tag" id="aboutVersion">—</span>
+          </div>
+          <div class="switch-row">
+            <div class="switch-copy">
+              <strong>检查更新</strong>
+              <p>从 GitHub Releases 读取最新版本。发现新版可以一键下载并静默安装。</p>
+            </div>
+            <button class="btn btn-sm" id="btnCheckUpdate">检查</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════ 日志 ═══════ -->
+      <section class="page" data-page="logs">
+        <div class="page-heading">
+          <div>
+            <h1>日志</h1>
+            <p>运行时的实时输出。</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>运行日志</h2>
+            <div class="log-toolbar">
+              <label><input type="checkbox" id="logAutoScroll" checked>自动滚动</label>
+              <button class="btn btn-sm btn-ghost" id="btnClearLog">清空</button>
+            </div>
+          </div>
+          <div class="log-view" id="logView"></div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script src="qwebchannel.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

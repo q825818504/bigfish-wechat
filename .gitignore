@@ -36,3 +36,13 @@ _weixin_image.bin
 .idea/
 .DS_Store
 Thumbs.db
+
+# ---- 打包产物 ----
+build/
+dist/
+*.spec.bak
+
+# ---- 自动更新临时 ----
+release.etag
+*.part
+bigfish_updater_*.cmd

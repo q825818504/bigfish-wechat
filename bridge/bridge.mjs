@@ -68,17 +68,26 @@ function findScope(root, scope) {
     const alt = join(root, `ws-${scope}`);
     if (existsSync(alt)) return alt;
   }
-  // 没指定或找不到时，取最新的 ws-* 目录
+  // 没指定或找不到时，取**真正有灵魂文件**的那个 ws-* 目录。
+  // 实测：dataRoot 下常有多个历史工作区，大多是空目录；
+  // 只按 mtime 或字典序挑会挑到空的。
   try {
     const dirs = readdirSync(root)
       .filter((n) => n.startsWith('ws-') && !n.includes('.'))
       .map((n) => join(root, n))
       .filter((p) => existsSync(p));
     if (!dirs.length) return null;
-    dirs.sort((a, b) => {
+
+    const withSoul = dirs.filter((d) => {
+      try {
+        return readdirSync(d).some((f) => f.startsWith('soul-') && f.endsWith('.json'));
+      } catch { return false; }
+    });
+    const pool = withSoul.length ? withSoul : dirs;
+    pool.sort((a, b) => {
       try { return statSync(b).mtimeMs - statSync(a).mtimeMs; } catch { return 0; }
     });
-    return dirs[0];
+    return pool[0];
   } catch {
     return null;
   }

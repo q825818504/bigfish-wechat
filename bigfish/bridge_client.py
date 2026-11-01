@@ -20,7 +20,22 @@ from typing import Any, Dict, List, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-_BRIDGE = os.path.join(_ROOT, "bridge", "bridge.mjs")
+
+# 打包后 bridge/ 在 exe 同级目录，不在包内。
+# 依次尝试：安装目录 / 仓库根 / 包目录。
+def _find_bridge() -> str:
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(os.path.dirname(sys.executable))
+    cands += [_ROOT, _HERE]
+    for base in cands:
+        p = os.path.join(base, "bridge", "bridge.mjs")
+        if os.path.isfile(p):
+            return p
+    return os.path.join(_ROOT, "bridge", "bridge.mjs")
+
+
+_BRIDGE = _find_bridge()
 
 
 @dataclass
@@ -229,3 +244,76 @@ if __name__ == "__main__":
     print()
     print("---- memory ----")
     print(c.render_memory() or "（无）")
+
+
+def _pick_scope_dir(root: str) -> Optional[str]:
+    """在 dataRoot 下挑出真正有数据的 workspace 目录。
+
+    实测：dataRoot 里可能有多个 ws-* 目录（历史工作区），大多数是空的。
+    判据是**有没有 soul-*.json** —— 灵魂是唯一必存的文件，
+    有灵魂的才是正在用的工作区。
+    """
+    import glob
+
+    dirs = sorted(glob.glob(os.path.join(root, "ws-*")))
+    dirs = [d for d in dirs if os.path.isdir(d)]
+    if not dirs:
+        return None
+
+    with_soul = [d for d in dirs if glob.glob(os.path.join(d, "soul-*.json"))]
+    if with_soul:
+        # 多个都有灵魂时取最近修改的那个
+        with_soul.sort(
+            key=lambda d: max(
+                (os.path.getmtime(f) for f in glob.glob(os.path.join(d, "*"))),
+                default=0), reverse=True)
+        return with_soul[0]
+    return dirs[0]
+
+
+def load_mood_only(data_root: str = "") -> Optional[Mood]:
+    """只读情绪状态，不触发记忆检索。
+
+    界面上的「心情」页用它——那里不需要检索开销。
+    """
+    root = data_root or _default_data_root()
+    if not root:
+        return None
+
+    import glob
+
+    scope_dir = _pick_scope_dir(root)
+    if not scope_dir:
+        return None
+    scope_id = os.path.basename(scope_dir)
+
+    # 文件名用截短 id：mood-ws-83ba9d80-ec53.json
+    short = scope_id[:15] if scope_id.startswith("ws-") else scope_id
+    cands = [
+        os.path.join(scope_dir, f"mood-{short}.json"),
+        os.path.join(scope_dir, f"mood-{scope_id}.json"),
+    ]
+    for f in glob.glob(os.path.join(scope_dir, "mood-*.json")):
+        cands.append(f)
+
+    for path in cands:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        moods = d.get("moods") or {}
+        m = moods.get(scope_id) or (next(iter(moods.values()), None))
+        if not m:
+            continue
+        return Mood(
+            value=m.get("mood"),
+            dims={k: float(v) for k, v in (m.get("dims") or {}).items()
+                  if isinstance(v, (int, float))},
+            last_reason=m.get("lastReason") or "",
+            injected_text=m.get("lastInjectedText") or "",
+            updated_at=int(m.get("updatedAt") or 0),
+        )
+    return None
