@@ -505,6 +505,10 @@ class UiaSender:
             time.sleep(0.2)
 
             # 基准指纹 —— 最后一次截图，之后到粘贴完成前不再截。
+            # ⚠ 必须传 box：早先这里漏传，直接
+            #   "missing 1 required positional argument: 'box'"，
+            #   而异常被上层兜住变成了"媒体没能发出去"，
+            #   看起来像发送失败，实际是我自己的调用写错了。
             before = self._input_region_signature(gui, box)
 
             # ── 阶段 ②：写剪贴板 ──
@@ -649,19 +653,24 @@ class UiaSender:
 
     # ── 草稿判据 ────────────────────────────────────────────────────
 
-    def _input_region_signature(self, gui, box):
-        """给输入框（含上方一小条）拍个"指纹"，用来比前后。
+    @staticmethod
+    def _input_region_signature(gui, box):
+        """给输入框拍个"指纹"，用来比前后。
 
-        没有 gui/box 时返回 None —— 调用方会退回到只看 Value。
+        只看输入框**本体**，不往上看。早先 vendor 那个判据扫的是
+        输入框上方 150px，那个位置是消息区底部 —— 上一条消息气泡就在
+        那儿，于是恒报"有草稿"。这里刻意把小一圈：
+        (x0+4, y0+4, x1-4, y1-4)。
+
+        没有 gui/box 时返回 None —— 调用方退回到只看 Value。
         """
         if gui is None or not box:
             return None
         try:
             x0, y0, x1, y1 = box
-            # 只看输入框本体，不往上看 150px ——
-            # 上方是消息区，那里的变化跟草稿无关，是噪音源。
-            rel = (x0 + 4, max(y0, y0), max(y0 + 4, y1 - 4), y1)
-            rel = (rel[0], rel[1], x1 - 4, rel[3])
+            if x1 - x0 < 16 or y1 - y0 < 16:
+                return None
+            rel = (x0 + 4, y0 + 4, x1 - 4, y1 - 4)
             shot = gui._grab_screen(gui._rel_to_screen(rel))
             return shot.convert("L").resize((48, 16))
         except Exception:

@@ -1,33 +1,20 @@
-剪贴板少写一半格式 —— 这才是真正的原因
+修漏传参数：_input_region_signature 少给 box
 
-把两种写法的剪贴板内容全读出来对比（tools/diagnose_clipboard.py）：
+    UiaSender._input_region_signature() missing 1 required
+    positional argument: 'box'
 
-    我们写的  格式 = [CF_HDROP]
-    系统写的  格式 = [DataObject, CF_HDROP, FileNameW,
-                      FileName, Ole Private Data]
+方法改成 @staticmethod 之后签名是 (gui, box)，调用点还是老样子。
+纯手误。
 
-两边 CF_HDROP 的内容**完全一样**，路径都正确，
-IsClipboardFormatAvailable(CF_HDROP) 也返回 true ——
-所以我之前所有"格式正常"的验证都是无效的。
+顺带说明一个"好"现象：这个异常被 send_media 的兜底捕获，
+最后报成「媒体没能发出去（数据库 10 秒内没有新增）。原因：UIA 路线异常: ...」
+—— 用户在测试里看到的是红色 ✗，不是假的 ✓。
 
-微信是 Qt 应用，粘贴文件走 OLE，认的是 DataObject / FileNameW。
-只写 CF_HDROP 时它的表现是：什么都收不到，粘贴前后一个像素都不变。
+前面几轮最严重的问题恰恰是相反的：send_media 无条件 return True，
+"发送成功"和"用户什么都没收到"能同时成立，还往上记了 [表情] 已发。
+现在错就是错，能被看见。
 
-用户手动验证的最后一刀：
-    Set-Clipboard -Path "xxx.gif" → 微信能贴进去
-    copy_files_to_clipboard()     → 不能
-同一张图、同一个路径、同一套 Ctrl+V。差别只有剪贴板格式。
-
-改 _write_clipboard_files：
-  首选 PowerShell Set-Clipboard（和资源管理器 Ctrl+C 同源，
-    写出来就是那五个格式）
-  退路才是旧的 copy_files_to_clipboard
-
-为什么不自己用 ctypes 拼 IDataObject：要写 COM 接口、实现
-IEnumFORMATETC、管引用计数，纯 ctypes 里是几百行容易崩的代码，
-换来的只是省一次进程启动（约 1 秒）。表情不是高频操作，不值。
-
-代价：每次发表情多 ~1 秒（起一个 powershell -STA）。
-
-这条教训写进代码注释了：**格式存在 ≠ 别人读得懂**。
-前面四轮的判断（判据错 / 队列错 / 截图吃剪贴板）全都被这句话推翻。
+顺手加固 _input_region_signature：
+  · 改成 staticmethod（不再依赖实例，语义更准）
+  · 区域小于 16×16 直接返回 None，避免把异常坐标传进 ImageGrab
+  · 注释写清为什么不往上看 150px —— 那是 vendor 那个判据假阳性的根源
