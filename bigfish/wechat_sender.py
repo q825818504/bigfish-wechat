@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -507,8 +508,17 @@ class UiaSender:
             before = self._input_region_signature(gui, box)
 
             # ── 阶段 ②：写剪贴板 ──
-            if not WeChatGUI.copy_files_to_clipboard([os.path.abspath(path)]):
-                self._warn("写剪贴板失败（CF_HDROP 没进去）")
+            #
+            # ⚠ 这一步必须**写全格式**，不能只写 CF_HDROP。
+            #   2026-11-02 实测对比（tools/diagnose_clipboard.py）：
+            #       我们写的  = [CF_HDROP]
+            #       系统写的  = [DataObject, CF_HDROP, FileNameW,
+            #                    FileName, Ole Private Data]
+            #   两边 CF_HDROP 内容完全一样、路径都正确，但微信是 Qt 应用，
+            #   粘贴文件走 OLE，认的是 DataObject / FileNameW。
+            #   只写 CF_HDROP 的表现是：格式存在、路径正确、粘贴时
+            #   一个像素都不变 —— 我为此查了四轮都查错了方向。
+            if not self._write_clipboard_files(path):
                 return False
 
             # ── 阶段 ③：立刻粘贴。这一段里**不许有任何截图或探测** ──
@@ -538,6 +548,90 @@ class UiaSender:
             f"粘贴 {attempts} 次都没让输入框发生变化，判定失败："
             f"{os.path.basename(path)}")
         return False
+
+    # ── 写剪贴板 ────────────────────────────────────────────────────
+
+    def _write_clipboard_files(self, path: str) -> bool:
+        """把文件写进剪贴板，让微信读得懂。
+
+        ═══════════════════════════════════════════════════════════════
+        为什么不能只用 copy_files_to_clipboard
+        ═══════════════════════════════════════════════════════════════
+
+        2026-11-02 实测（tools/diagnose_clipboard.py，把剪贴板内容全读出来比）：
+
+            我们写的  格式 = [CF_HDROP]
+            系统写的  格式 = [DataObject, CF_HDROP, FileNameW,
+                              FileName, Ole Private Data]
+
+        两边 CF_HDROP 的**内容完全一样**，路径都正确。
+        但微信是 Qt 应用，粘贴文件走 OLE，认的是 DataObject / FileNameW。
+
+        所以旧写法的表现是：格式存在、路径正确、
+        `IsClipboardFormatAvailable(CF_HDROP)` 返回 true，
+        然后粘贴时**一个像素都不变**。
+
+        我据此查了四轮 —— 判据错、队列错、截图吃剪贴板 —— 全都不对。
+        真正的原因只有一个：**写少了一半格式**。
+        这也是「格式存在 ≠ 别人读得懂」的教训。
+
+        ═══════════════════════════════════════════════════════════════
+        为什么直接用 PowerShell 的 Set-Clipboard
+        ═══════════════════════════════════════════════════════════════
+
+        它和资源管理器的 Ctrl+C 同源（Windows 自己的 OLE 实现），
+        写出来的就是上面那五个格式。用户手动验证过：这条路微信认。
+
+        自己用 ctypes 拼 IDataObject 也行，但要写 COM 接口、
+        实现 IEnumFORMATETC、管引用计数 —— 纯 ctypes 里是几百行
+        容易崩的代码，换来的是省一次进程启动（约 1 秒）。不值。
+
+        代价：每次发表情多 ~1 秒。表情不是高频操作，可以接受。
+        """
+        p = os.path.abspath(path)
+        if not os.path.isfile(p):
+            self._warn(f"剪贴板要写的文件不存在：{p}")
+            return False
+
+        if self._set_clipboard_via_powershell(p):
+            return True
+
+        # 退路：旧写法。格式不全，微信大概率读不懂，
+        # 但在没有 PowerShell / 被策略禁的环境里，总比什么都不写好。
+        self._warn("Set-Clipboard 不可用，退回 CF_HDROP（多半贴不进去）")
+        try:
+            from wechatauto.guia import WeChatGUI
+
+            return bool(WeChatGUI.copy_files_to_clipboard([p]))
+        except Exception as exc:
+            self._warn(f"写剪贴板失败：{exc}")
+            return False
+
+    def _set_clipboard_via_powershell(self, path: str) -> bool:
+        """用 Set-Clipboard 写文件列表。
+
+        为什么在 `powershell -STA` 里跑：剪贴板/OLE 需要单线程套间，
+        没有 STA 的 PowerShell 会抛
+        "Current thread must be set to STA mode"。
+
+        路径里的单引号要加倍转义 —— 文件名带 ' 不是罕见事。
+        """
+        try:
+            safe = path.replace("'", "''")
+            ps = ("$ErrorActionPreference='Stop';"
+                  f"Set-Clipboard -Path '{safe}'")
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-Command", ps],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if r.returncode != 0:
+                self._warn(f"Set-Clipboard 返回 {r.returncode}："
+                           f"{(r.stderr or r.stdout or '')[:200]}")
+                return False
+            return True
+        except Exception as exc:
+            self._warn(f"Set-Clipboard 异常：{exc}")
+            return False
 
     # ── 真实键盘 ────────────────────────────────────────────────────
 
