@@ -55,6 +55,49 @@ def section(title: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# v5 起 remember() 默认校验来源：fact.source_chunks 必须指向真实存在的片段。
+# 这是「任何记忆都要有来源」的执行点，所以测试里也必须真的造原文，
+# 而不是传 verify_sources=False 绕过去 —— 绕过去就测不到那条校验了。
+# ══════════════════════════════════════════════════════════════════════
+
+_SEED_DB = ""
+
+
+def seed_source(session: str, text: str = "测试原文") -> int:
+    """在临时库里造一条消息 + 一个 chunk，返回 chunk id。
+
+    每个用例的 db 不同，所以第一次调用时记下路径；调用方用 use_db() 切换。
+    """
+    conn = sqlite3.connect(_SEED_DB)
+    try:
+        cur = conn.execute(
+            "INSERT INTO messages(bank,session,event_key,role,text,content_json,recorded_at) "
+            "VALUES('dafeiyu',?,?, 'user',?, '[]', 1)",
+            (session, f"e{os.urandom(6).hex()}", text))
+        mid = int(cur.lastrowid)
+        cur2 = conn.execute(
+            "INSERT INTO chunks(message,start,end,text,activated) VALUES(?,?,?,?,1)",
+            (mid, 0, len(text), text))
+        conn.commit()
+        return int(cur2.lastrowid)
+    finally:
+        conn.close()
+
+
+def use_db(path: str) -> None:
+    """声明后续 seed_source 往哪个库造数据。"""
+    global _SEED_DB
+    _SEED_DB = path
+
+
+def remember(db: str, bank: str, fact, **kw):
+    """造好来源再写 —— 等价于真实链路（reflect 从原文切片拿 chunk id）。"""
+    if not fact.source_chunks:
+        fact.source_chunks = [seed_source("s")]
+    return M.remember(db, bank or "dafeiyu", fact, **kw)
+
+
+# ══════════════════════════════════════════════════════════════════════
 def t_terms() -> None:
     section("分词：与插件 store.js 同一套")
     t = M.terms("老爸今天加班")
@@ -139,15 +182,16 @@ def t_facts(tmp: str) -> None:
     section("事实：新增 / 加固 / 纠正 / 遗忘")
     db = os.path.join(tmp, "facts.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
 
-    ok, fid, err = M.remember(db, "dafeiyu", M.Fact(
+    ok, fid, err = remember(db, "dafeiyu", M.Fact(
         predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7,
         owner=OWNER))
     check("新增一条", ok and fid, err)
     got = M.list_facts(db, "dafeiyu")["items"]
     check("列表里有一条 active", len(got) == 1 and got[0]["status"] == "active", str(got))
 
-    ok, fid2, err = M.remember(db, "dafeiyu", M.Fact(
+    ok, fid2, err = remember(db, "dafeiyu", M.Fact(
         predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7,
         owner=OWNER))
     check("重复提及是幂等（同 id）", ok and fid2 == fid, f"{fid} vs {fid2}")
@@ -155,7 +199,7 @@ def t_facts(tmp: str) -> None:
     check("重复提及不新增行", len(got) == 1, str(len(got)))
     check("重复提及提高置信度", got[0]["confidence"] > 0.7, got[0]["confidence"])
 
-    ok, fid3, err = M.remember(db, "dafeiyu", M.Fact(
+    ok, fid3, err = remember(db, "dafeiyu", M.Fact(
         predicate="饮食偏好", object="改喝无糖豆浆", anchor="老爸", confidence=0.85,
         owner=OWNER))
     check("不同 object → 纠正，产生新行", ok and fid3 != fid, f"{fid} {fid3}")
@@ -183,9 +227,9 @@ def t_facts(tmp: str) -> None:
           {"add", "correct", "forget"} <= kinds, str(kinds))
 
     # 空谓词/空对象必须被拒
-    ok, _f, err = M.remember(db, "dafeiyu", M.Fact(predicate="", object="x", owner=OWNER))
+    ok, _f, err = remember(db, "dafeiyu", M.Fact(predicate="", object="x", owner=OWNER))
     check("空 predicate 被拒", not ok, err)
-    ok, _f, err = M.remember(db, "dafeiyu", M.Fact(predicate="x", object="", owner=OWNER))
+    ok, _f, err = remember(db, "dafeiyu", M.Fact(predicate="x", object="", owner=OWNER))
     check("空 object 被拒", not ok, err)
 
 
@@ -193,6 +237,7 @@ def t_search(tmp: str) -> None:
     section("检索：中文命得中、按分数排、去冗余")
     db = os.path.join(tmp, "search.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     cases = [
         "老爸今天加班到十点，说不喝咖啡了",
         "我喜欢下雨天待在窗边发呆",
@@ -224,6 +269,7 @@ def t_cascade(tmp: str) -> None:
     section("级联：删消息不能留幽灵")
     db = os.path.join(tmp, "cascade.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     for i in range(3):
         V.capture_message("wechat:dad", f"c{i}", "user", f"第{i}句话测试级联", db_path=db)
 
@@ -264,6 +310,7 @@ def t_session_delete(tmp: str) -> None:
     section("删会话：chunk / FTS / meta 一起清")
     db = os.path.join(tmp, "sess.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     V.capture_message("wechat:a", "a1", "user", "会话A的第一句", db_path=db)
     V.capture_message("wechat:a", "a2", "user", "会话A的第二句", db_path=db)
     V.capture_message("wechat:b", "b1", "user", "会话B的唯一一句", db_path=db)
@@ -277,6 +324,7 @@ def t_anchor(tmp: str) -> None:
     section("锚点：别名归一，检索能认出同一个人")
     db = os.path.join(tmp, "anchor.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     conn = M.connect(db)
     aid = M.ensure_anchor(conn, "dafeiyu", "老爸", ["爸爸", "爸"])
     conn.commit()
@@ -300,6 +348,7 @@ def t_reflect(tmp: str) -> None:
     section("反思：从原文沉淀事实，幂等且可重复")
     db = os.path.join(tmp, "reflect.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     V.capture_message("wechat:dad", "r1", "user", "我不喝咖啡，改喝无糖豆浆了", db_path=db)
     V.capture_message("wechat:dad", "r2", "assistant", "好，那下次给你带豆浆", db_path=db)
 
@@ -328,16 +377,24 @@ def t_reflect(tmp: str) -> None:
     #   下一条 remember（另开连接）拿到 "database is locked"，
     #   而错误被丢掉 —— 表现是"模型给了 N 条，库里只多 1 条"，全程无声。
     #   用三条带锚点的事实压住它。
+    #
+    #   v5 起 chunks 必须是真的：以前这里故意给 []，因为旧代码会用
+    #   `or chunk_ids[:1]` 替模型补一个来源 —— 那正是"凭空捏造来源"。
+    #   现在空 chunks 一律拒收（见 t_source_required），所以这里要给出
+    #   本批原文里真实存在的 chunk 编号。
     V.capture_message("wechat:dad", "r-multi", "user", "又说了一句", db_path=db)
+    real_chunk = sqlite3.connect(db).execute(
+        "SELECT c.id FROM chunks c JOIN messages m ON m.id=c.message "
+        "WHERE m.session='wechat:dad' ORDER BY c.id DESC LIMIT 1").fetchone()[0]
 
     def many(system, user):
         return json.dumps({"facts": [
             {"anchor": "我", "predicate": "多A", "object": "甲", "confidence": 0.8,
-             "chunks": [], "evidence": ""},
+             "chunks": [real_chunk], "evidence": ""},
             {"anchor": "我", "predicate": "多B", "object": "乙", "confidence": 0.8,
-             "chunks": [], "evidence": ""},
+             "chunks": [real_chunk], "evidence": ""},
             {"anchor": "老爸", "predicate": "多C", "object": "丙", "confidence": 0.8,
-             "chunks": [], "evidence": ""},
+             "chunks": [real_chunk], "evidence": ""},
         ]}, ensure_ascii=False)
 
     rm = M.reflect_on_session(db, "dafeiyu", "wechat:dad", many,
@@ -388,6 +445,7 @@ def t_cli(tmp: str) -> None:
     section("CLI：bridge.mjs 靠这条拿检索结果")
     db = os.path.join(tmp, "cli.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     V.capture_message("wechat:dad", "c1", "user", "她说周末去爬山", db_path=db)
     import io as _io
     from contextlib import redirect_stdout
@@ -405,29 +463,30 @@ def t_isolation(tmp: str) -> None:
     section("隔离：主人 vs 陌生人，私密永不外泄")
     db = os.path.join(tmp, "iso.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
 
     me = M.owner_of_private("owner-wxid")
     other = M.owner_of_private("stranger-wxid")
 
     # 主人两条：一条私密、一条可共享
-    M.remember(db, "dafeiyu", M.Fact(
+    remember(db, "dafeiyu", M.Fact(
         predicate="身体状况", object="上个月做了个小手术", anchor="我",
-        confidence=0.9, owner=me, visibility=M.VIS_PRIVATE))
-    M.remember(db, "dafeiyu", M.Fact(
+        confidence=0.9, owner=me, visibility=M.VIS_PRIVATE, topic="身体"))
+    remember(db, "dafeiyu", M.Fact(
         predicate="饮食偏好", object="爱吃辣", anchor="我",
-        confidence=0.8, owner=me, visibility=M.VIS_SHARED))
+        confidence=0.8, owner=me, visibility=M.VIS_SHARED, topic="食物"))
     # 陌生人自己一条
-    M.remember(db, "dafeiyu", M.Fact(
+    remember(db, "dafeiyu", M.Fact(
         predicate="职业", object="做设计的", anchor="对方",
-        confidence=0.8, owner=other, visibility=M.VIS_PRIVATE))
+        confidence=0.8, owner=other, visibility=M.VIS_PRIVATE, topic="工作"))
 
-    # 主人看自己：能看私密与共享；**但看不到别人的 private**
-    # （主人权限管的是"我的东西给不给别人看"，不是"我能不能翻别人的"）
+    # 主人看自己：全部可见（v5 起主人能看所有人的内容 —— 数据在主人硬盘上）。
+    # ⚠ 「看得见」≠「说得出口」：后者由 open_facts_for 与 guard 插件管。
     own_view = M.list_facts(db, "dafeiyu", owner=me, tier=M.TIER_OWNER)["items"]
     objs = {f["object"] for f in own_view}
     check("主人看得到自己的私密", "上个月做了个小手术" in objs, str(objs))
     check("主人看得到自己的共享", "爱吃辣" in objs, str(objs))
-    check("主人也看不到别人的私密", "做设计的" not in objs, str(objs))
+    check("主人也看得到别人的（v5）", "做设计的" in objs, str(objs))
 
     # 陌生人看：只能拿到 shared，拿不到主人的 private
     other_view = M.list_facts(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)["items"]
@@ -455,27 +514,70 @@ def t_isolation(tmp: str) -> None:
     except ValueError:
         check("空 owner 被拒", True)
 
-    # 升级 visibility 是显式动作，且会留痕
+    # 升级 visibility 是显式动作，且会留痕。
+    # v5 起还必须打 topic 才算"开放信息" —— 两个条件是与的关系。
     fid = [f["id"] for f in M.list_facts(db, "dafeiyu", query="手术")["items"]][0]
     ok, err = M.set_visibility(db, "dafeiyu", fid, M.VIS_SHARED, by="owner")
     check("可以显式改成共享", ok, err)
+    no_topic = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
+    check("只改 shared、没打话题 → 仍然不外传", "手术" not in no_topic, no_topic)
+    # ⚠ 「身体」是**黑名单**话题：即使标了 shared + 打了话题，也不外传。
+    #   这正是"B 问主人住哪 / 生了什么病 → 她拒绝"的实现。
+    ok, err = M.set_topic(db, "dafeiyu", fid, "身体", by="owner")
+    check("可以打话题标签", ok, err)
     after = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
-    check("改共享后陌生人可见", "手术" in after, after)
+    check("shared + 黑名单话题（身体）→ 仍不外传", "手术" not in after, after)
+
+    # 换成白名单话题「食物」，同一 visibility 下就外传了
+    fid3 = [f["id"] for f in M.list_facts(db, "dafeiyu", query="爱吃辣")["items"]][0]
+    after2 = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
+    check("shared + 白名单话题（食物）→ 陌生人可见", "爱吃辣" in after2, after2)
     ev = [e["kind"] for e in M.fact_events(db, "dafeiyu")]
     check("改可见性留了事件", "visibility" in ev, str(ev))
+
+    # ⚠ 关键边界：话题在白名单里，但 visibility 还是 private → 不外传。
+    #   这是"你标了话题但没授权"，两个条件缺一不可。
+    ok, err = M.set_visibility(db, "dafeiyu", fid, M.VIS_PRIVATE, by="owner")
+    check("改回 private", ok, err)
+    again = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
+    check("话题对但没授权 → 不外传", "手术" not in again, again)
+
+    # 黑名单话题：即使标了 shared，也不外传
+    remember(db, "dafeiyu", M.Fact(
+        predicate="住址", object="住在朝阳区", anchor="我",
+        confidence=0.9, owner=me, visibility=M.VIS_SHARED, topic="住址"))
+    black = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
+    check("shared + 黑名单话题 → 不外传", "朝阳" not in black, black)
+
+    # 撤回开放：一次把 visibility 和 topic 都清掉
+    fid2 = [f["id"] for f in M.list_facts(db, "dafeiyu", query="朝阳")["items"]][0]
+    ok, err = M.revoke_open(db, "dafeiyu", fid2)
+    check("撤回开放", ok, err)
+    row = {f["id"]: f for f in M.list_facts(db, "dafeiyu")["items"]}[fid2]
+    check("撤回后变回 private", row["visibility"] == M.VIS_PRIVATE, row["visibility"])
+    check("撤回后话题清空", row["topic"] == "", row["topic"])
+    check("撤回不是忘掉", row["status"] == "active", row["status"])
+
+    # topic_allowed：空话题一律不外传
+    check("空话题不外传", M.topic_allowed("") is False)
+    check("白名单话题可外传", M.topic_allowed("食物") is True)
+    check("黑名单话题不外传", M.topic_allowed("住址") is False)
+    check("灰区话题不外传（年龄）", M.topic_allowed("年龄") is False)
+    check("乱写的话题不外传", M.topic_allowed("随便什么") is False)
 
 
 def t_pinned(tmp: str) -> None:
     section("置顶：独立预算，不被普通检索挤掉")
     db = os.path.join(tmp, "pin.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     me = M.owner_of_private("p")
-    ok, fid, _ = M.remember(db, "dafeiyu", M.Fact(
+    ok, fid, _ = remember(db, "dafeiyu", M.Fact(
         predicate="称呼", object="要叫她爸爸", anchor="我", confidence=0.9, owner=me))
     check("写入一条", ok and fid)
     # 再塞一堆普通事实
     for i in range(20):
-        M.remember(db, "dafeiyu", M.Fact(
+        remember(db, "dafeiyu", M.Fact(
             predicate=f"杂项{i}", object=f"随便什么{i}", confidence=0.5, owner=me))
     ok, err = M.pin_fact(db, "dafeiyu", fid, pinned=True)
     check("置顶成功", ok, err)
@@ -495,6 +597,7 @@ def t_habits(tmp: str) -> None:
     section("习惯：说够三次且在三个不同日期才算")
     db = os.path.join(tmp, "habit.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
     me = M.owner_of_private("h")
 
     # 同一天说三次：不够格（这就是"今天说了三遍好困"不应该变习惯）
@@ -535,6 +638,7 @@ def t_person(tmp: str) -> None:
     section("person：跨平台同一个人，只能由人认领")
     db = os.path.join(tmp, "person.sqlite3")
     M.ensure_schema(db)
+    use_db(db)
 
     wx = M.owner_of_private("wxid_me")
     bl = M.owner_of_private("12345", platform="bilibili")
@@ -545,11 +649,11 @@ def t_person(tmp: str) -> None:
     M.ensure_owner(db, "dafeiyu", bl, display_name="B站的老爸", tier=M.TIER_OWNER,
                    platform="bilibili")
     M.ensure_owner(db, "dafeiyu", st, display_name="路人", tier=M.TIER_GUEST)
-    M.remember(db, "dafeiyu", M.Fact(predicate="微信里说的", object="最近失眠",
+    remember(db, "dafeiyu", M.Fact(predicate="微信里说的", object="最近失眠",
                                      owner=wx))
-    M.remember(db, "dafeiyu", M.Fact(predicate="B站里说的", object="在追某部番",
+    remember(db, "dafeiyu", M.Fact(predicate="B站里说的", object="在追某部番",
                                      owner=bl, platform="bilibili"))
-    M.remember(db, "dafeiyu", M.Fact(predicate="路人的事", object="他开了家店",
+    remember(db, "dafeiyu", M.Fact(predicate="路人的事", object="他开了家店",
                                      owner=st))
 
     # 认领前：两个平台互相看不见
@@ -608,6 +712,237 @@ def t_person(tmp: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
+def t_source_required(tmp: str) -> None:
+    section("v5 来源校验：没有真来源就不许入库")
+    db = os.path.join(tmp, "src.sqlite3")
+    M.ensure_schema(db)
+    use_db(db)
+    me = M.owner_of_private("src-user")
+
+    # ① chunks 为空 → 拒收
+    ok, fid, err = M.remember(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="爱吃辣", owner=me))
+    check("空来源拒收", not ok and "来源" in err, err)
+    check("空来源没有写进库", M.list_facts(db, "dafeiyu")["total"] == 0)
+
+    # ② chunks 指向不存在的 id → 拒收
+    ok, fid, err = M.remember(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="爱吃辣", owner=me, source_chunks=[99999]))
+    check("假来源拒收", not ok and "99999" in err, err)
+
+    # ③ 真来源 → 通过
+    cid = seed_source("wechat:src", "我特别爱吃辣")
+    ok, fid, err = M.remember(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="爱吃辣", owner=me, source_chunks=[cid]))
+    check("真来源通过", ok and fid, err)
+
+    # ④ allowed_sessions 限制：别处的 chunk 不能拿来当来源
+    other_cid = seed_source("wechat:other-guy", "别的会话里的话")
+    ok, fid2, err = M.remember(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="也爱吃辣", owner=me, source_chunks=[other_cid]),
+        allowed_sessions=["wechat:src"])
+    check("跨会话的来源被拒（防嫁接）", not ok, err)
+
+    # ⑤ 反思链路里模型乱指来源 → 那条被丢掉，其余照常
+    V.capture_message("wechat:src", "r1", "user", "我特别爱吃辣", db_path=db)
+
+    def bad_chunks(system, user):
+        return json.dumps({"facts": [
+            {"predicate": "A", "object": "甲", "chunks": [99999], "confidence": 0.8},
+            {"predicate": "B", "object": "乙", "chunks": [1], "confidence": 0.8},
+        ], "skip_reason": ""}, ensure_ascii=False)
+
+    r = M.reflect_on_session(db, "dafeiyu", "wechat:src", bad_chunks,
+                             owner=me, tier=M.TIER_OWNER, self_names=["大肥鱼"])
+    check("反思：坏来源那条被拒", any("来源编号无效" in x for x in r.get("failed") or []),
+          str(r))
+    check("反思：好来源那条入库", r.get("added") == 1, str(r))
+
+    # ⑥ 模型的空 chunks 不再被自动补来源
+    def empty_chunks(system, user):
+        return json.dumps({"facts": [
+            {"predicate": "C", "object": "丙", "chunks": [], "confidence": 0.8}],
+            "skip_reason": ""}, ensure_ascii=False)
+
+    V.capture_message("wechat:src", "r2", "user", "随便说点什么", db_path=db)
+    r2 = M.reflect_on_session(db, "dafeiyu", "wechat:src", empty_chunks,
+                              owner=me, tier=M.TIER_OWNER, self_names=["大肥鱼"])
+    check("反思：空来源不自动补（旧行为是 or chunk_ids[:1]）",
+          r2.get("added") == 0 and r2.get("failed"), str(r2))
+
+
+def t_dual_write(tmp: str) -> None:
+    section("v5 群聊双写：说话人的池 + 群的池")
+    db = os.path.join(tmp, "dual.sqlite3")
+    M.ensure_schema(db)
+    use_db(db)
+    a = M.owner_of_private("owner-a")
+    gp = M.owner_of_group("group-c")
+
+    # ① 私密内容：只进 A 池，群池不收
+    V.capture_message("group-c", "g1", "user", "我明天去医院", db_path=db)
+    cid = sqlite3.connect(db).execute(
+        "SELECT c.id FROM chunks c JOIN messages m ON m.id=c.message "
+        "WHERE m.session='group-c' ORDER BY c.id DESC LIMIT 1").fetchone()[0]
+
+    res = M.remember_both(db, "dafeiyu", M.Fact(
+        predicate="行程", object="明天去医院", owner=a,
+        visibility=M.VIS_PRIVATE, topic="行程", origin="group:group-c",
+        source_chunks=[cid]), group_owner=gp, allowed_sessions=["group-c"])
+    check("人池写入成功", res.get("ok") and res.get("personal"), str(res))
+    check("私密内容不进群池", res.get("group") is None, str(res))
+    check("并且说明了原因", "私密" in str(res.get("skipped_group")), str(res))
+
+    # ② 公开内容：两边都写
+    res2 = M.remember_both(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="爱吃烧烤", owner=a,
+        visibility=M.VIS_SHARED, topic="食物", origin="group:group-c",
+        source_chunks=[cid]), group_owner=gp, allowed_sessions=["group-c"])
+    check("公开内容两边都写", res2.get("personal") and res2.get("group"), str(res2))
+
+    # ③ 两份的 owner 不同、origin 相同
+    #    ⚠ 这里必须传 tier，否则 list_facts 走"管理视角"（不过滤 owner），
+    #      会把全库都返回 —— 测试里踩过一次，看着像双写写多了。
+    a_facts = M.list_facts(db, "dafeiyu", owner=a, tier=M.TIER_OWNER, strict=True,
+                           status="active")["items"]
+    g_facts = M.list_facts(db, "dafeiyu", owner=gp, tier=M.TIER_OWNER, strict=True,
+                           status="active")["items"]
+    check("A 池有两条", len(a_facts) == 2, str(len(a_facts)))
+    check("群池有一条", len(g_facts) == 1, str(len(g_facts)))
+    check("群池那份 owner 是群",
+          all(f["owner"] == gp for f in g_facts), str(g_facts))
+    check("两份 origin 都是 group:group-c",
+          g_facts[0]["origin"] == "group:group-c", g_facts[0]["origin"])
+    check("群池那份 topic 保留", g_facts[0]["topic"] == "食物", g_facts[0]["topic"])
+
+    # ④ 注入时标出"群里说的"
+    txt = M.facts_for_prompt(db, "dafeiyu", owner=a, tier=M.TIER_OWNER)
+    check("注入标出群里说的", "群里说的" in txt, txt)
+
+    # ⑤ 删一条，连带删副本
+    gid = g_facts[0]["id"]
+    res3 = M.delete_fact_pair(db, "dafeiyu", gid)
+    check("删群池那条", res3.get("ok"), str(res3))
+    check("连带删了 A 池的副本（2 条）", len(res3.get("deleted") or []) == 2, str(res3))
+    left_a = M.list_facts(db, "dafeiyu", owner=a, tier=M.TIER_OWNER, strict=True, status="active")["items"]
+    check("A 池只剩私密那条", len(left_a) == 1, str(left_a))
+    left_g = M.list_facts(db, "dafeiyu", owner=gp, tier=M.TIER_OWNER, strict=True, status="active")["items"]
+    check("群池已空", len(left_g) == 0, str(left_g))
+
+    # ⑥ 私聊写入没有副本，删除只删一条
+    cid2 = seed_source("wechat:a", "私聊里说的")
+    ok, fid = M.remember(db, "dafeiyu", M.Fact(
+        predicate="爱好", object="打游戏", owner=a, origin="private",
+        source_chunks=[cid2]))[:2]
+    res4 = M.delete_fact_pair(db, "dafeiyu", fid)
+    check("私聊删除只删自己一条", len(res4.get("deleted") or []) == 1, str(res4))
+
+
+def t_open_info(tmp: str) -> None:
+    section("v5 开放信息：B 能问主人爱吃什么，问不出主人住哪")
+    db = os.path.join(tmp, "open.sqlite3")
+    M.ensure_schema(db)
+    use_db(db)
+    a = M.owner_of_private("owner-a")
+    b = M.owner_of_private("owner-b")
+
+    cid = seed_source("wechat:a", "主人说过一些事")
+    # 主人的四条：食物（白）、住址（黑）、身体（黑）、没打标签的 shared
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="爱吃烧烤", owner=a, visibility=M.VIS_SHARED,
+        topic="食物", source_chunks=[cid]))
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="住址", object="住在朝阳区", owner=a, visibility=M.VIS_SHARED,
+        topic="住址", source_chunks=[cid]))
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="身体状况", object="上个月做了手术", owner=a,
+        visibility=M.VIS_SHARED, topic="身体", source_chunks=[cid]))
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="爱好", object="周末钓鱼", owner=a, visibility=M.VIS_SHARED,
+        topic="", source_chunks=[cid]))      # 没打标签
+
+    opens = M.open_facts_for(db, "dafeiyu", a)
+    objs = {o["object"] for o in opens}
+    check("爱吃烧烤 进开放信息", "爱吃烧烤" in objs, str(objs))
+    check("住址 不进", "住在朝阳区" not in objs, str(objs))
+    check("手术 不进", "上个月做了手术" not in objs, str(objs))
+    check("没打标签 不进", "周末钓鱼" not in objs, str(objs))
+
+    # B 的注入里能看到主人的食物偏好，看不到其余
+    txt = M.facts_for_prompt(db, "dafeiyu", owner=b, tier=M.TIER_GUEST)
+    check("B 能看到主人的食物偏好", "爱吃烧烤" in txt, txt)
+    check("B 看不到主人的住址", "朝阳" not in txt, txt)
+    check("B 看不到主人的身体状况", "手术" not in txt, txt)
+    check("B 看不到没打标签的 shared", "钓鱼" not in txt, txt)
+    check("标出了「可以告诉别人」", "可以告诉别人" in txt, txt)
+
+    # owner_said_about：专门回答"关于第三个人"的问题
+    about = M.owner_said_about(db, "dafeiyu", b, a, "你主人喜欢吃什么呀")
+    check("关于主人的问答：能拿到食物偏好", "爱吃烧烤" in about, about)
+    check("关于主人的问答：拿不到住址", "朝阳" not in about, about)
+    check("问自己时返回空", M.owner_said_about(db, "dafeiyu", b, b, "我吃啥") == "")
+
+    # 主人自己注入：能看到自己的全部，但看不到 B 的私密
+    cid_b = seed_source("wechat:b", "B 说的事")
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="秘密", object="B 的秘密", owner=b,
+        visibility=M.VIS_PRIVATE, source_chunks=[cid_b]))
+    own = M.facts_for_prompt(db, "dafeiyu", owner=a, tier=M.TIER_OWNER)
+    check("主人注入：有自己的食物偏好", "爱吃烧烤" in own, own)
+    check("主人注入：有自己的住址", "朝阳" in own, own)
+    check("主人注入：没有别人的私密", "B 的秘密" not in own, own)
+
+
+def t_impression(tmp: str) -> None:
+    section("v5 角色印象页：一格一人 + 开放信息清单")
+    db = os.path.join(tmp, "imp.sqlite3")
+    M.ensure_schema(db)
+    use_db(db)
+    a = M.owner_of_private("owner-a")
+    b = M.owner_of_private("owner-b")
+    M.ensure_owner(db, "dafeiyu", a, display_name="主人")
+    M.ensure_owner(db, "dafeiyu", b, display_name="小李")
+
+    cid = seed_source("wechat:a", "一些事")
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="爱吃烧烤", owner=a, visibility=M.VIS_SHARED,
+        topic="食物", source_chunks=[cid]))
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="住址", object="住在朝阳区", owner=a, visibility=M.VIS_PRIVATE,
+        source_chunks=[cid]))
+
+    board = M.impression_board(db, "dafeiyu")
+    people = {p["owner"]: p for p in board["people"]}
+    check("印象页包含两个人", len(people) == 2, str(list(people)))
+    check("主人格里有开放信息", any(
+        o["object"] == "爱吃烧烤" for o in people[a]["open"]), str(people[a]["open"]))
+    check("住址不在开放信息里", all(
+        o["object"] != "住在朝阳区" for o in people[a]["open"]), str(people[a]["open"]))
+    check("统计了事实总数", people[a]["facts"] == 2, str(people[a]["facts"]))
+    check("统计了私密条数", people[a]["private"] == 1, str(people[a]["private"]))
+
+    ok, err = M.set_impression(db, "dafeiyu", a, "这是个话不多但心细的人")
+    check("能写印象评语", ok, err)
+    board2 = M.impression_board(db, "dafeiyu")
+    got = {p["owner"]: p for p in board2["people"]}
+    check("印象评语读得回来", got[a]["note"] == "这是个话不多但心细的人",
+          got[a]["note"])
+    ok, err = M.set_impression(db, "dafeiyu", a, "改一下")
+    check("能改印象评语", ok, err)
+    board3 = {p["owner"]: p for p in M.impression_board(db, "dafeiyu")["people"]}
+    check("改完读回来是新值", board3[a]["note"] == "改一下", board3[a]["note"])
+
+    # 池总览：只给数量，不给内容
+    ps = M.pool_summary(db, "dafeiyu", main_owner=a)
+    check("池总览列出两个池", ps["total"] >= 2, str(ps["total"]))
+    main = [p for p in ps["pools"] if p["isMain"]]
+    check("标出了主人的池", len(main) == 1, str(ps["pools"]))
+    check("池总览里有条数", main[0]["facts"] == 2, str(main[0]))
+    check("池总览不返回任何事实内容",
+          all("object" not in p and "predicate" not in p for p in ps["pools"]),
+          str(ps["pools"]))
+
+
 def main() -> int:
     print("=" * 66)
     print("记忆层自检")
@@ -629,6 +964,10 @@ def main() -> int:
         t_pinned(tmp)
         t_habits(tmp)
         t_person(tmp)
+        t_source_required(tmp)
+        t_dual_write(tmp)
+        t_open_info(tmp)
+        t_impression(tmp)
         t_health(tmp)
         t_cli(tmp)
     finally:

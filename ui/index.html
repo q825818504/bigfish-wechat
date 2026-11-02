@@ -46,6 +46,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v16M4 8h16M6.5 17.5l11-11"/><circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/></svg>
         <span>记忆</span>
       </button>
+      <button class="nav-item" data-page="impression">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l2.3 4.7 5.2.7-3.8 3.6.9 5.1-4.6-2.5-4.6 2.5.9-5.1L4.5 8.9l5.2-.7z"/></svg>
+        <span>印象</span>
+      </button>
       <button class="nav-item" data-page="stickers">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="5"/><path d="M8.5 10h.01M15.5 10h.01" stroke-linecap="round"/><path d="M8.5 14.5c1 1.2 2.1 1.8 3.5 1.8s2.5-.6 3.5-1.8" stroke-linecap="round"/></svg>
         <span>表情包</span>
@@ -496,6 +500,15 @@
           <div class="heading-side" id="memCount">—</div>
         </div>
 
+        <!-- 记忆池分栏：默认永远是「主人池」。
+             其他池只给占位 —— 别人的记忆不该在你没主动点开时铺在屏幕上。 -->
+        <div class="subtabs" id="memTabs">
+          <button class="subtab is-active" data-memtab="main">主人</button>
+          <button class="subtab" data-memtab="others">其他人 <span class="subtab-num" id="poolNum">—</span></button>
+        </div>
+
+        <div class="subpage is-active" data-mempane="main">
+
         <div class="grid-3">
           <div class="card">
             <div class="metric-label">消息</div>
@@ -720,6 +733,57 @@
             <button class="btn btn-sm" id="btnMemVacuum">压缩回收空间</button>
           </div>
           <div class="card-desc" style="margin-top:12px" id="memMaintainHint"></div>
+        </div>
+        </div><!-- /主人池 -->
+
+        <!-- 其他人的池：**只给数量，不给内容**。
+             以后做到「点进去看」时，从这里展开；现在只摆一个占位。 -->
+        <div class="subpage" data-mempane="others">
+          <div class="card">
+            <div class="card-head">
+              <h2>其他记忆池</h2>
+              <span class="tag" id="poolTag">—</span>
+            </div>
+            <div class="card-desc" style="margin-bottom:14px">
+              <strong>每个人、每个群，都有自己的一池。</strong>
+              你这里看到的只是「有几池、各多少条」——
+              内容不铺出来，是因为别人的私事不该在你没主动点开时摆在屏幕上。
+              <br><br>
+              这一部分是占位，还没有做「点进去看」。<br>
+              已经做好的是隔离本身：<b>别人问起你的私事，她一个字都不会说</b>，
+              除了你亲手标成「开放信息」的那几条。
+            </div>
+            <div class="pools" id="poolList">
+              <div class="empty"><p>读取中…</p></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ═══════ 印象 ═══════ -->
+      <section class="page" data-page="impression">
+        <div class="page-heading">
+          <div>
+            <h1>印象</h1>
+            <p>她怎么看你，以及她准备替你对外说哪些事。</p>
+          </div>
+          <div class="heading-side" id="imprCount">—</div>
+        </div>
+
+        <div class="card-desc" style="margin:0 0 14px">
+          <strong>这一页是给你审的。</strong>
+          右边那些「开放信息」，是她在别人问起你时<b>可以</b>说出口的内容。
+          觉得哪条不该外传，点删除 —— 那条会退回私密，原文和认识都还在，
+          只是她不再对别人提。
+          <br><br>
+          每个人的评语是<b>你手写的</b>，模型不参与。她不会自己往里写东西。
+        </div>
+
+        <!-- 横向分页：一人一页，主人永远第一页。
+             不是把所有人挤在一屏里 —— 那样一多就没法看了。 -->
+        <div class="subtabs" id="imprTabs"></div>
+        <div id="imprPanes">
+          <div class="empty"><p>读取中…</p></div>
         </div>
       </section>
 

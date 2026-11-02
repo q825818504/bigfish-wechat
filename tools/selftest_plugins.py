@@ -118,7 +118,11 @@ def main() -> int:
     check("两个都默认开启", clock["enabled"] and guard["enabled"])
     check("clock 有 2 个可调参数", len(clock["configFields"]) == 2,
           str([f["key"] for f in clock["configFields"]]))
-    check("guard 有 1 个可调参数", len(guard["configFields"]) == 1,
+    # v5：guard 多了一个「保护主人的私事」开关（被追问时守边界的那一段）。
+    check("guard 有 2 个可调参数", len(guard["configFields"]) == 2,
+          str([f["key"] for f in guard["configFields"]]))
+    check("guard 的开关里有 protect_owner",
+          {f["key"] for f in guard["configFields"]} == {"protect_owner", "extra_rule"},
           str([f["key"] for f in guard["configFields"]]))
     check("清单按座位升序",
           [p["order"] for p in inv["plugins"] if p["order"]] ==

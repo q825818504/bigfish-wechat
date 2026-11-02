@@ -178,7 +178,8 @@ def _source_ms(msg) -> "int | None":
     return v * 1000 if v < 10_000_000_000 else v
 
 
-def _facts_block(owner: str, tier: str, *, limit: int = 8, pinned_limit: int = 4) -> str:
+def _facts_block(owner: str, tier: str, *, limit: int = 8, pinned_limit: int = 4,
+                 question: str = "") -> str:
     """取「她认定的事」渲染成注入段。失败返回空串，绝不中断对话。
 
     和 `## 你记得的事`（原话切片）分开：原话是逐句、带时间的；
@@ -187,6 +188,9 @@ def _facts_block(owner: str, tier: str, *, limit: int = 8, pinned_limit: int = 4
 
     ⚠ owner 和 tier 是**必填** —— 不知道"面前是谁"就不知道该给他看什么。
       没传就直接返回空串，宁可这次不注入。
+
+    `question`（v5）：对方这一轮说了什么。往下传是为了让
+    facts_for_prompt 能判断"要不要把主人的开放信息捎上"。
     """
     try:
         from bigfish import memory as M, vault as V
@@ -195,9 +199,49 @@ def _facts_block(owner: str, tier: str, *, limit: int = 8, pinned_limit: int = 4
         if not db or not os.path.isfile(db):
             return ""
         return M.facts_for_prompt(db, "dafeiyu", owner=owner, tier=tier,
-                                  limit=limit, pinned_limit=pinned_limit)
+                                  limit=limit, pinned_limit=pinned_limit,
+                                  question=question)
     except Exception:
         return ""
+
+
+def _open_block(owner: str, tier: str, question: str) -> str:
+    """「关于别人、但可以说」的那一小段。
+
+    场景：B 问「你主人喜欢吃什么呀」。
+    这时候 owner 是 B（当前会话），但要回答的是**主人**的事，
+    所以不能从 B 的池里找，要去主人的开放信息里找。
+
+    实现上走 owner_said_about：只给 shared + 白名单话题，
+    其余一条都不给。判定在 memory 层做完了，这里只负责"问的是谁"。
+
+    谁是"主人"由调用方给（self.owner_id）；没绑定主人时这段整体跳过 ——
+    没有主人就无所谓"关于主人"，凭空塞一段反而是错的。
+    """
+    try:
+        from bigfish import memory as M, vault as V
+
+        db = V.memory_db_path()
+        main = getattr(_OWNER_STATE, "owner_id", "")
+        if not (db and os.path.isfile(db) and main):
+            return ""
+        if owner == main:
+            # 跟自己主人说话，"关于主人"就是他自己，已经在上面那段里了
+            return ""
+        txt = M.owner_said_about(db, "dafeiyu", owner, main, question)
+        return txt
+    except Exception:
+        return ""
+
+
+class _OwnerState:
+    """引擎当前绑定的主人 owner 键。
+
+    单独放一个模块级小对象，是因为 _open_block 是模块函数，
+    拿不到引擎实例；而它需要"主人是谁"这个事实。
+    引擎启动/绑定主人时写一次，之后只读。
+    """
+    owner_id = ""
 
 
 def _habits_block(owner: str, tier: str, *, limit: int = 6) -> str:
@@ -374,6 +418,9 @@ class EngineWorker(QThread):
             self._log(f"[表情] 未成功：{r.detail}", "err")
             return
 
+        # ⚠ 走到这里才说明 send_media **验过数据库**了。
+        #   以前这里之前有个无声的谎：函数无条件返回成功，
+        #   于是日志写「已发」，实际上对方什么都没收到。
         self._sticker_sent.setdefault(msg.chat_id, []).append(time.time())
         self._log(f"[表情] 已发 {label}：{name}", "out")
         self.chat_event.emit(msg.chat_name, f"[{label}]", "out")
@@ -431,7 +478,8 @@ class EngineWorker(QThread):
                              name=f"mood-{getattr(msg, 'local_id', 0)}")
         t.start()
 
-    def _reflect_async(self, chat_id: str, msg, owner: str = "", tier: str = "") -> None:
+    def _reflect_async(self, chat_id: str, msg, owner: str = "", tier: str = "",
+                       *, origin: str = "", group_owner: str = "") -> None:
         """后台把这一轮之后的原文沉淀成「事实」。
 
         为什么单独一个线程、还要限频：
@@ -442,6 +490,11 @@ class EngineWorker(QThread):
         为什么失败什么都不说：
           反思是"变得更好"，不是"能用"的前提。它失败不该在日志里
           刷红；只在真正产出事实时记一行，让用户看得见它在长。
+
+        `origin` / `group_owner`（v5）：群聊里说话时传进来。
+          origin      "group:<群 id>"，写进事实，标出"这话是在群里说的"
+          group_owner 群的 owner 键，传了就会双写（说话人的池 + 群的池）
+        私聊时两个都留空 = 只写一份，和以前完全一样。
         """
         import threading
         import time as _t
@@ -473,11 +526,19 @@ class EngineWorker(QThread):
                     lambda system, user: call_model(self.mcfg, system, user),
                     owner=owner or getattr(self, "owner_id", ""),
                     tier=tier or _M.TIER_GUEST,
-                    batch=40, self_names=mine)
+                    batch=40, self_names=mine,
+                    origin=origin, group_owner=group_owner)
                 if r.get("ok") and (r.get("added") or r.get("reason")):
-                    self._log(f"[记] 提炼 {r.get('added', 0)} 条认识", "")
-            except Exception:
-                pass
+                    extra = ""
+                    if r.get("mirrored"):
+                        extra = f"，{r['mirrored']} 条同步进群池"
+                    self._log(f"[记] 提炼 {r.get('added', 0)} 条认识{extra}", "")
+                # 失败要说出来 —— 静默失败等于"她学不会"却不知道为什么
+                if r.get("failed"):
+                    self._log(f"[记] {len(r['failed'])} 条被拒："
+                              + "；".join(r["failed"][:2]), "err")
+            except Exception as exc:
+                self._log(f"[记] 反思异常：{exc}", "err")
 
         threading.Thread(target=work, daemon=True,
                          name="reflect").start()
@@ -539,6 +600,15 @@ class EngineWorker(QThread):
         except Exception:
             owner_id = ""
         self.owner_id = owner_id          # 供 _reflect_async 等后台线程使用
+        _OWNER_STATE.owner_id = owner_id  # 供模块级 _open_block 使用
+        # 自己的 wxid：群里判断"这条消息是不是我自己发的"。
+        # watcher 的 sender_name 里装的是 wxid，拿不到就留空，
+        # 留空时群消息一律当"别人说的"，退回群池 —— 认不出就别猜。
+        try:
+            self._me_wxid = str(getattr(getattr(self, "reader", None),
+                                        "wxid", "") or "")
+        except Exception:
+            self._me_wxid = ""
         if owner_id:
             self._log(f"主人：{owner_raw}（记忆可看 private）", "")
             # 顺手把主人登记进 owners 表。
@@ -807,11 +877,48 @@ class EngineWorker(QThread):
             # 昵称会改、会重名，用它做 key 等于把两个人的记忆混一起。
             from bigfish import memory as _M
 
+            _origin = ""          # 这条记忆是在哪儿说出来的
+            _group_owner = ""     # 群里说话时，这个群的池（触发双写）
+
             if is_group:
-                _owner = _M.owner_of_group(msg.chat_id)
-                _tier = _M.TIER_GUEST          # 群里所有人一律按陌生处理
+                # ⚠ v5 的关键改动：群里的记忆**归说话的人**，不归群。
+                #
+                #   以前：群里任何人说话 → 全记到 group:<群id> 的池里。
+                #   后果：A 在群里说「我明天去医院」，记的是"这个群里有个人
+                #         要去医院"，而不是"A 要去医院"。等以后接抖音、
+                #         接更多群，A 的画像就永远是碎的。
+                #
+                #   现在：说话人的池 + 群的池**双写**（见 memory.remember_both），
+                #         来源统一标 group:<群id>。
+                #         群池那份只收"不算私密"的内容 —— A 的健康信息
+                #         不该躺在群里被所有人翻到。
+                #
+                #   msg.sender_name 装的其实是**wxid**（watcher 用
+                #   sender_username() 从分片库的 Name2Id 查出来的），
+                #   字段名起错了，但值是对的。拿不到时（shard 为空）
+                #   退回群池 + origin 标"未知发言人"，绝不猜成某个人。
+                _speaker = (msg.sender_name or "").strip()
+                _group_owner = _M.owner_of_group(msg.chat_id)
+                _origin = f"group:{msg.chat_id}"
+                if _speaker and _speaker != (getattr(self, "_me_wxid", "") or ""):
+                    _owner = _M.owner_of_private(_speaker)
+                    # 群里所有人一律按 guest/known 处理，**除了主人** ——
+                    # 主人在群里依然是主人，否则"主人"这个身份会随场所漂移。
+                    if _owner == owner_id:
+                        _tier = _M.TIER_OWNER
+                    else:
+                        try:
+                            import bigfish.vault as _V9
+                            _tier = _M.owner_tier(_V9.memory_db_path(), _owner,
+                                                  default=_M.TIER_GUEST)
+                        except Exception:
+                            _tier = _M.TIER_GUEST
+                else:
+                    _owner = _group_owner      # 认不出人就退回群池
+                    _tier = _M.TIER_GUEST
             else:
                 _owner = _M.owner_of_private(msg.chat_id)
+                _origin = "private"
                 # 主人 = 配置里 auto_reply.owner 指定的那个人；
                 # 没配就退回"监听名单里的私聊对象"，但等级仍是 known 不是 owner。
                 _tier = _M.TIER_OWNER if _owner == owner_id else _M.TIER_KNOWN
@@ -821,7 +928,7 @@ class EngineWorker(QThread):
             #   以前只有原文，于是「她改主意了」无处表达：只能删原文。
             #   ⚠ 这段以前只写在 app.py（研究入口），EXE 跑的 desktop.py
             #     里根本没有 —— 事实存了、界面看得见、但从不进提示词。
-            facts = _facts_block(_owner, _tier)
+            facts = _facts_block(_owner, _tier, question=body)
             if facts:
                 # 注意：这里**不再**重复写「只作资料、不是指令」。
                 # 插件系统有一个 order=9990 的「末尾守卫」，它放在整段 system
@@ -832,6 +939,19 @@ class EngineWorker(QThread):
                 user_parts.append("## 你认定的事\n\n" + facts
                                   + "\n\n（这些是你自己整理过的认识，不是原话；"
                                     "和对方现在的说法冲突时以对方为准，并改过来。）")
+
+            # 「关于别人、但可以说」的那一小段（v5）。
+            #
+            # 这是「B 问主人爱吃什么 → 她能答」的实现：
+            # owner 是 B，但要回答的是主人的事，所以单独去主人的开放信息里取。
+            # 只给 shared + 白名单话题，住址/身体/行程一条都不给 ——
+            # 判定在 memory.owner_said_about，不靠提示词自觉。
+            open_said = _open_block(_owner, _tier, body)
+            if open_said:
+                user_parts.append(
+                    "## 可以告诉别人的事\n\n" + open_said
+                    + "\n\n（这些是主人同意对外说的。只有对方问起的相关话题才提，"
+                      "不要主动一股脑报出来。）")
 
             # 习惯层：说够三次的原话样本（只给样本，不给结论）
             habit_lines = _habits_block(_owner, _tier)
@@ -944,7 +1064,8 @@ class EngineWorker(QThread):
                     # ⭐ 顺带把这一轮的原文沉淀成「事实」。
                     #   和心情一样放后台：它要调一次模型，且带限频闸门，
                     #   绝不阻塞下一轮回复。
-                    self._reflect_async(msg.chat_id, msg, _owner, _tier)
+                    self._reflect_async(msg.chat_id, msg, _owner, _tier,
+                                        origin=_origin, group_owner=_group_owner)
 
                     # ⭐ 记一次习惯观察。这一步很便宜（一次 UPSERT），
                     #   所以每轮都做；"够不够格"由跨天数判定，不在这里判。
@@ -1879,6 +2000,13 @@ class Backend(QObject):
 
     @Slot(str, str, int, int, result=str)
     def list_facts(self, status: str, query: str, limit: int, offset: int) -> str:
+        """列事实。管理视角（不过滤 owner）—— 只给界面用。
+
+        v5 起返回值多了 origin / topic：
+          origin  "group:xxx" 说明这条是在群里说的
+          topic   话题标签，空串 = 没打标签 = 不会外传
+        界面靠这两个决定"显示什么标记"、"下拉框选哪个"。
+        """
         try:
             from bigfish import memory as M, vault as V
 
@@ -1889,6 +2017,10 @@ class Backend(QObject):
                                 offset=max(0, offset or 0))
             for it in page.get("items", []):
                 it["createdText"] = ts_to_local(it.get("createdAt") or 0)
+                # 界面上要显示"能不能外传"，判定只做一次，别让 JS 自己算
+                it["openable"] = bool(
+                    it.get("visibility") in ("shared", "public")
+                    and M.topic_allowed(it.get("topic") or ""))
             return json.dumps(page, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"items": [], "total": 0, "error": str(exc)},
@@ -1902,6 +2034,117 @@ class Backend(QObject):
 
             db = V.memory_db_path()
             ok, err = M.pin_fact(db or "", "dafeiyu", int(fact_id), pinned=bool(pinned))
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── v5：话题 / 撤回 / 池总览 / 印象页 ─────────────────────────────
+    #
+    # 这四个槽是「开放信息」那套判定在界面上的手。规则很清楚：
+    #   谁能改 visibility / topic → **只有主人**（界面上点）
+    #   模型能不能提议          → **不能**，反思只自动打保守标签
+    # 所以这里没有任何"让 AI 决定"的入口，全部是人点按钮。
+
+    @Slot(int, str, result=str)
+    def set_fact_topic(self, fact_id: int, topic: str) -> str:
+        """给一条事实打话题。话题决定"这条能不能说给外人听"。
+
+        ⚠ 话题和 visibility 是**与**的关系：两个都满足才外传。
+          所以打错话题最多是"这条不给外人看"，不会反向泄露。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            ok, err = M.set_topic(db or "", "dafeiyu", int(fact_id),
+                                  topic or "", by="owner")
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(int, result=str)
+    def revoke_open(self, fact_id: int) -> str:
+        """把一条开放信息撤回成私密。
+
+        ⚠ 这**不是忘掉**：事实还在，她照样拿它当结论，只是不再说给外人。
+          和 forget_fact 是两件事，界面上必须分开写清楚。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            ok, err = M.revoke_open(db or "", "dafeiyu", int(fact_id))
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(int, result=str)
+    def delete_fact(self, fact_id: int) -> str:
+        """删一条事实，连带删群聊双写的副本（用户选的"两份一起删"）。"""
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            r = M.delete_fact_pair(db or "", "dafeiyu", int(fact_id))
+            return json.dumps(r, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc),
+                               "deleted": []}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def pool_summary(self) -> str:
+        """「其他记忆池」副页：**只给数量，不给内容**。
+
+        列出每个池的名字和条数，一条事实内容都不返回。
+        理由：别人的池不该在主人没主动点开时被铺开在屏幕上；
+        而且这个页面现在是占位，以后才做进去看。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            data = M.pool_summary(db or "", "dafeiyu",
+                                  main_owner=getattr(self, "owner_id", ""))
+            return json.dumps(data, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"pools": [], "total": 0,
+                               "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def impression_board(self) -> str:
+        """「角色印象」页：一人一格，格子里是她的评语 + 开放信息清单。
+
+        主人那一格永远排第一（界面上第一个横向分页）。
+        排序在这里做一次，不让前端猜。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            data = M.impression_board(db or "", "dafeiyu")
+            me = getattr(self, "owner_id", "")
+            people = data.get("people") or []
+            for p in people:
+                p["isOwner"] = (p["owner"] == me)
+            # 主人置顶，其余按事实数排 —— 聊得多的人排前面
+            people.sort(key=lambda p: (0 if p.get("isOwner") else 1,
+                                       -int(p.get("facts") or 0)))
+            data["people"] = people
+            data["mainOwner"] = me
+            return json.dumps(data, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"people": [], "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, str, result=str)
+    def set_impression(self, owner: str, note: str) -> str:
+        """写「我对这个人的印象」。主人手写，模型不参与。"""
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            ok, err = M.set_impression(db or "", "dafeiyu", owner or "",
+                                       note or "")
             return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -3493,15 +3736,37 @@ def _run_selftest_inner() -> int:
             assert ok, err or "建库失败"
 
             TF = M.owner_of_private("selftest")    # 自检用的 owner
+            # v5 起 remember 默认校验来源：先造一条真原文，拿它的 chunk 当证据。
+            # 以前这里是"先写事实、后写原文"，来源列里塞的是空数组 ——
+            # 那正是"没有来源也算记忆"，已经被校验挡住了。
+            V.capture_message("wechat:selftest", "src1", "user",
+                              "老爸说他不喝咖啡，改喝豆浆了", db_path=db)
+            import sqlite3 as _sq
+
+            _c = _sq.connect(db)
+            try:
+                SRC = int(_c.execute(
+                    "SELECT c.id FROM chunks c JOIN messages m ON m.id=c.message "
+                    "WHERE m.session='wechat:selftest' ORDER BY c.id DESC LIMIT 1"
+                ).fetchone()[0])
+            finally:
+                _c.close()
+
             ok, fid, err = M.remember(db, "dafeiyu", M.Fact(
                 predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7,
-                owner=TF))
+                owner=TF, source_chunks=[SRC]))
             assert ok and fid, err or "事实写入失败"
+
+            # v5：没有真来源必须被拒 —— 这是"任何记忆都要有来源"的执行点
+            bad_ok, _bad, bad_err = M.remember(db, "dafeiyu", M.Fact(
+                predicate="住址", object="编出来的地址", owner=TF))
+            assert not bad_ok, "无来源的事实居然写进去了"
+            assert "来源" in (bad_err or ""), f"拒绝理由不清楚：{bad_err}"
 
             # 纠正：旧的标 superseded、新的 active、两行都在
             ok, fid2, err = M.remember(db, "dafeiyu", M.Fact(
                 predicate="饮食偏好", object="改喝豆浆", anchor="老爸", confidence=0.85,
-                owner=TF))
+                owner=TF, source_chunks=[SRC]))
             assert ok and fid2 != fid, "纠正没产生新行"
             items = {f["id"]: f for f in M.list_facts(db, "dafeiyu")["items"]}
             assert len(items) == 2, f"应为 2 行，实际 {len(items)}"
@@ -3549,6 +3814,100 @@ def _run_selftest_inner() -> int:
         finally:
             _sh.rmtree(tmpd, ignore_errors=True)
     item("事实层", t_fact_layer)
+
+    # 10b. 开放信息与印象（v5）
+    def t_open_and_impression():
+        """验证「B 能问主人爱吃什么 / 问不出主人住哪」这条线。
+
+        这是整个 v5 里最该被测的一条 —— 它直接决定"她会不会说漏"。
+        """
+        import shutil as _sh
+        import tempfile as _tf
+
+        from bigfish import memory as M, vault as V
+
+        tmpd = _tf.mkdtemp(prefix="bf-open-")
+        db = os.path.join(tmpd, V.MEMORY_NAME)
+        try:
+            ok, err = M.ensure_schema(db)
+            assert ok, err or "建库失败"
+            ME = M.owner_of_private("the-owner")
+            GUEST = M.owner_of_private("some-guest")
+            M.ensure_owner(db, "dafeiyu", ME, display_name="主人")
+            M.ensure_owner(db, "dafeiyu", GUEST, display_name="路人")
+
+            V.capture_message("wechat:the-owner", "o1", "user",
+                              "我爱吃烧烤，住在朝阳区，上月做了个手术", db_path=db)
+            import sqlite3 as _sq
+
+            _c = _sq.connect(db)
+            try:
+                SRC = int(_c.execute(
+                    "SELECT c.id FROM chunks c JOIN messages m ON m.id=c.message "
+                    "WHERE m.session='wechat:the-owner' ORDER BY c.id DESC LIMIT 1"
+                ).fetchone()[0])
+            finally:
+                _c.close()
+
+            # 三条：一条真的可以外传，两条看着像 shared 但话题是禁区
+            M.remember(db, "dafeiyu", M.Fact(
+                predicate="饮食偏好", object="爱吃烧烤", owner=ME,
+                visibility=M.VIS_SHARED, topic="食物", source_chunks=[SRC]))
+            M.remember(db, "dafeiyu", M.Fact(
+                predicate="住址", object="住在朝阳区", owner=ME,
+                visibility=M.VIS_SHARED, topic="住址", source_chunks=[SRC]))
+            M.remember(db, "dafeiyu", M.Fact(
+                predicate="身体状况", object="做了个手术", owner=ME,
+                visibility=M.VIS_PRIVATE, topic="身体", source_chunks=[SRC]))
+
+            # 路人问：只有"爱吃烧烤"能拿到
+            said = M.owner_said_about(db, "dafeiyu", GUEST, ME, "你主人喜欢吃什么呀")
+            assert "烧烤" in said, f"开放信息没给出去：{said!r}"
+            assert "朝阳" not in said, "住址漏了"
+            assert "手术" not in said, "身体状况漏了"
+
+            # 注入层：路人自己的提示词里也不许有禁区内容
+            blk = M.facts_for_prompt(db, "dafeiyu", owner=GUEST, tier=M.TIER_GUEST)
+            assert "烧烤" in blk, "路人拿不到开放信息"
+            assert "朝阳" not in blk, "路人注入里有住址"
+            assert "手术" not in blk, "路人注入里有身体状况"
+
+            # 主人自己：全都能看见（数据在他硬盘上），但也只是"看见"
+            own = M.facts_for_prompt(db, "dafeiyu", owner=ME, tier=M.TIER_OWNER)
+            assert "烧烤" in own and "朝阳" in own, "主人看不到自己的东西"
+
+            # 印象页：一格一人、评语能存能读、开放清单只列能外传的
+            board = M.impression_board(db, "dafeiyu")
+            people = {p["owner"]: p for p in board.get("people") or []}
+            assert ME in people and GUEST in people, str(list(people))
+            opens = {o["object"] for o in people[ME]["open"]}
+            assert "爱吃烧烤" in opens, opens
+            assert "住在朝阳区" not in opens, opens
+            ok, err = M.set_impression(db, "dafeiyu", ME, "话不多")
+            assert ok, err
+            board2 = {p["owner"]: p for p in M.impression_board(db, "dafeiyu")["people"]}
+            assert board2[ME]["note"] == "话不多", board2[ME]["note"]
+
+            # 池总览：只给数量，一条内容都不返回
+            ps = M.pool_summary(db, "dafeiyu", main_owner=ME)
+            assert ps.get("total", 0) >= 2, str(ps)
+            for p in ps.get("pools") or []:
+                assert "object" not in p and "predicate" not in p, p
+
+            # 撤回开放：不是忘掉
+            fid = [o["id"] for o in people[ME]["open"]][0]
+            ok, err = M.revoke_open(db, "dafeiyu", fid)
+            assert ok, err
+            after = {f["id"]: f for f in M.list_facts(db, "dafeiyu")["items"]}[fid]
+            assert after["visibility"] == M.VIS_PRIVATE, after["visibility"]
+            assert after["status"] == "active", "撤回不该把事实作废"
+            assert "烧烤" not in M.owner_said_about(db, "dafeiyu", GUEST, ME, "吃啥"), \
+                "撤回之后还在外传"
+
+            return "开放信息/禁区/印象页/池总览/撤回正常"
+        finally:
+            _sh.rmtree(tmpd, ignore_errors=True)
+    item("开放信息", t_open_and_impression)
 
     # 11. 心情写入链路
     def t_mood_write():

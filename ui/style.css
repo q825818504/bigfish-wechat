@@ -1791,3 +1791,138 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   border: 1px dashed var(--border);
   border-radius: var(--radius-sm);
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   v5：记忆池分栏 / 话题选择 / 印象页
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ── 分栏（子标签页）──
+   记忆页在「主人 / 其他人」之间切；印象页用它做一人一页的横向分页。
+   两处共用一套，因为长得一样、行为也一样：一排小按钮 + 一块内容。 */
+.subtabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 2px 0 14px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.subtab {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.subtab:hover { background: var(--surface-3); color: var(--text); }
+.subtab.is-active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 500;
+}
+.subtab-num {
+  display: inline-block;
+  min-width: 16px;
+  padding: 0 5px;
+  margin-left: 4px;
+  border-radius: 8px;
+  background: var(--surface-3);
+  color: var(--muted);
+  font: 10px var(--mono-font);
+  line-height: 16px;
+  text-align: center;
+}
+.subtab.is-active .subtab-num { background: rgba(0,0,0,.08); color: var(--accent-text); }
+
+/* 子页：不激活就整块不占位。
+   用 display:none 而不是 visibility/opacity —— 后者会在页面上留一片空白。 */
+.subpage { display: none; }
+.subpage.is-active { display: block; }
+
+/* ── 话题下拉 ──
+   它直接决定"能不能说给别人听"，所以做得比普通文字按钮明显一点，
+   但也不能太抢眼 —— 记忆列表的主角色是内容，不是操作。 */
+.topic-select {
+  appearance: none;
+  border: 1px solid var(--border-soft);
+  background: var(--surface-2);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 20px 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M3 5l3 3 3-3' fill='none' stroke='%23888' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 5px center;
+  background-size: 10px;
+}
+.topic-select:hover { border-color: var(--border); color: var(--text); }
+.topic-select:focus { outline: none; border-color: var(--accent); }
+
+/* ── 其他记忆池（占位）──
+   只列名字和条数。不铺内容 —— 这是刻意的留白，不是没做完。 */
+.pools {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pool-item {
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.pool-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 7px;
+}
+.pool-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.pool-meta .memory-time { margin-left: 0; }
+
+/* ── 印象页：开放信息清单 ──
+   一条一行，右边一个删除。删除 = 撤回开放，不是忘掉 ——
+   文案在 JS 里写清楚了，这里只管排版。 */
+.open-list { display: flex; flex-direction: column; }
+.open-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.open-item:last-child { border-bottom: 0; }
+.open-body {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.open-text {
+  font-size: 13px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.open-item .btn { flex: none; }
+
+/* 印象页的评语框：跟着卡片宽度走，不许撑破 */
+#imprPanes textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 76px;
+}
+#imprPanes .field.full { max-width: none; }

@@ -366,6 +366,9 @@ class UiaSender:
 
         kind = classify_media(path)
 
+        # 发送前记基线 —— 后面要靠它判断"到底发没发出去"
+        before_seq = self._target_seq(who)
+
         # ① 先试 UIA 控件路线（不吃前台焦点，最稳）
         err = ""
         try:
@@ -373,57 +376,81 @@ class UiaSender:
             if edit is not None:
                 ok = self._paste_media_uia(edit, path)
                 if ok:
-                    return SendResult(ok=True, who=who, path=path,
-                                      kind=kind, text=f"[{kind}]")
-                err = "UIA 粘贴未出现草稿"
+                    # ⚠ 不在这里返回成功。回车是按下去了，
+                    #   发没发出去只有数据库知道。下面统一验。
+                    pass
+                else:
+                    err = "UIA 粘贴没让输入框发生变化"
         except Exception as exc:
             err = f"UIA 路线异常: {exc}"
 
-        # ② 草稿检测不可信，合并走 vendor 的混合路线。
+        # ② UIA 没成 → 交给 guia 的完整路线。
         #
-        #    guia.send_file 内部有两条判据：
-        #      UIA 可用 → UIA 草稿（Value 里的 U+FFFC）
-        #      否则     → 像素检测（输入框上方有没有彩色缩略图）
-        #    实测（2026-11-02，4.1.15.53）UIA 那条会连试 3 次都判"没有草稿"，
-        #    但**粘贴可能已经成功了** —— 判据不看，不能据此断定失败。
-        #    所以这里不再自己实现一遍，直接把整件交给 guia：
-        #    它的 PasteFile 路径更全（真键盘 Ctrl+V、剪贴板文件列表）。
-        try:
-            gui = self._gui()
-            res = gui.send_file(path, who=None)
-            ok = bool(getattr(res, "is_success", None)) if hasattr(
-                res, "is_success") else bool(res)
-            if ok:
-                return SendResult(ok=True, who=who, path=path, kind=kind,
-                                  text=f"[{kind}]")
-            err = err or f"guia.send_file 返回失败: {res!r}"
-        except Exception as exc:
-            err = err or f"坐标路线异常: {exc}"
+        #    guia.send_file 有自己一套判据和会话复用逻辑，比我在外面
+        #    猜"谁成功了"靠谱。但它返回 True 也只代表"动作做完了"，
+        #    同样不代表对方收到了 —— 所以仍然走下面统一验证。
+        if not err or err.startswith("UIA 粘贴没"):
+            try:
+                gui = self._gui()
+                res = gui.send_file(path, who=None)
+                gui_ok = bool(getattr(res, "is_success", None)) if hasattr(
+                    res, "is_success") else bool(res)
+                if not gui_ok:
+                    err = err or f"guia.send_file 返回失败: {res!r}"
+            except Exception as exc:
+                err = err or f"坐标路线异常: {exc}"
 
-        raise SendError(f"媒体发送失败：{err}", kind="send")
+        # ③ 唯一判据：数据库里有没有多出一条。
+        #
+        #    这条路的教训：上一版 `return True` 是无条件的，
+        #    于是"发送成功 3.3 秒"和"用户什么都没收到"同时成立。
+        #    从那以后，这里只信数据库。
+        if self.verify_media_sent(who, path, before_seq=before_seq,
+                                  timeout=10.0):
+            return SendResult(ok=True, who=who, path=path, kind=kind,
+                              text=f"[{kind}]")
+
+        raise SendError(
+            f"媒体没能发出去（数据库 10 秒内没有新增）。"
+            f"{('原因：' + err) if err else ''}",
+            kind="send")
 
     def _paste_media_uia(self, edit, path: str, attempts: int = 3) -> bool:
         """UIA 路线：CF_HDROP 写剪贴板 → 控件级 Ctrl+V → 判草稿 → 回车。
 
         ═══════════════════════════════════════════════════════════════
-        判据为什么不能用 Value 里的 U+FFFC
+        返回值的含义：**真的发出去了**，不是"我按了回车"
         ═══════════════════════════════════════════════════════════════
 
-        2026-11-02 在本机 4.1.15.53 上实测（tools/diagnose_paste.py）：
+        这里踩过一个很贵的坑。早先这版是：
 
-            文本粘贴后 Value : '诊断文本ABC'   ← 文本会进 Value
-            文件粘贴后 Value : ''              ← 文件**不进** Value，5 秒 9 次都是空
-            像素检测         : True            ← 但缩略图真的渲染出来了
+            edit.SendKeys("{Enter}")
+            return True          # ← 无条件
 
-        也就是说：微信把文件当成内嵌对象塞进编辑框，却不把它算进 Value。
-        vendor 的 ``_uia_has_draft`` 等 U+FFFC，在这个版本上永远等不到 ——
-        它报"没有草稿"时，草稿其实已经在框里了。
+        日志就变成"发送成功 3.3 秒"，而用户那边什么都没收到。
+        更糟的是上层据此记了 [表情] 已发 —— 一次失败被写成成功，
+        之后所有排查都从错误的前提出发。
 
-        所以这里改成两段式：
-            ① 粘贴后判据 = 像素（输入框上方有没有彩色缩略图）
-            ② 发没发出去 = 数据库（由 verify_media_sent 验，不在这里定）
+        现在改成：回车之后**回读数据库**，看到新消息才算成功。
+        数据库是唯一不会说谎的判据。
 
-        像素判据失败时**仍然回车**，理由见下方注释。
+        ═══════════════════════════════════════════════════════════════
+        草稿判据为什么不用彩色像素
+        ═══════════════════════════════════════════════════════════════
+
+        vendor 的 `_input_box_has_color_draft` 扫的是输入框上方 150px
+        区域里有没有彩色像素。实测（2026-11-02）它会**假阳性**：
+        那个位置是消息区底部，上一条消息气泡就在那儿。
+
+        同一时刻另一个判据给出了相反答案：
+            像素草稿            : True     ← 数到彩色
+            _input_box_has_text : False    ← 数不到深色
+        框里要是真有个表情缩略图，它既该彩色也该有深色描边。
+        只有前者为真 → 说明数到的彩色是别的东西。
+
+        所以改用**区域变化量**：粘贴前后同一块区域像不像。
+        进了东西 → 那块区域变了；没进 → 一个像素都不变。
+        它不预设"草稿长什么样"，所以不会被别的彩色骗。
         """
         try:
             from wechatauto.guia import WeChatGUI
@@ -431,30 +458,37 @@ class UiaSender:
             raise SendError(f"加载粘贴工具失败: {exc}", kind="import") from exc
 
         if not WeChatGUI.copy_files_to_clipboard([os.path.abspath(path)]):
+            self._warn("写剪贴板失败（CF_HDROP 没进去）")
             return False
         time.sleep(0.3)
 
         edit.SetFocus()
+        time.sleep(0.2)
 
-        # 拿坐标路线那套像素检测 —— 它需要输入框的**渲染坐标**，
-        # 只有 WeChatGUI 知道（要做 rel→screen 换算）。
         gui = None
         box = None
         try:
             gui = self._gui()
             box = gui.get_input_box()
         except Exception as exc:
-            self._warn(f"拿不到输入框坐标，像素判据不可用：{exc}")
+            self._warn(f"拿不到输入框坐标，区域变化判据不可用：{exc}")
 
-        landed = False
         for n in range(max(1, attempts)):
+            before = self._input_region_signature(gui, box)
+
             edit.SendKeys("{Ctrl}a{Delete}", waitTime=0.1)
+            time.sleep(0.35)      # ⚠ 别急着粘：Delete 可能晚到，把刚粘的删掉
+            self._restore_clipboard_files(path)
             edit.SendKeys("{Ctrl}v", waitTime=0.1)
-            if self._draft_visible(edit, gui, box, wait=3.0):
-                landed = True
-                break
+
+            changed, after = self._wait_input_area_change(
+                gui, box, before, wait=3.0)
+
+            if changed or self._value_has_object(edit):
+                edit.SendKeys("{Enter}", waitTime=0.05)
+                return True
+
             if n < attempts - 1:
-                # 焦点可能没落进输入框：点一下再试
                 try:
                     if box:
                         gui.focus_input(box)
@@ -462,21 +496,77 @@ class UiaSender:
                     pass
                 time.sleep(0.4)
 
-        if not landed:
-            # 两条判据都说没有草稿。两种可能分不开：
-            #   a) 粘贴真失败（剪贴板被清、焦点丢了）
-            #   b) 像素判据也不适用（窗口被别的窗口挡住、缩略图还没画出来）
-            #
-            # 仍然回车。取舍：真失败时发出去的是一条空消息 —— 对方会问
-            # 「你发了啥」，看得见；而静默不发她永远不知道有张表情没出去，
-            # 看不见。宁可错在明处。
-            self._warn(
-                f"草稿判据未见缩略图（像素+Value 都空），仍尝试回车："
-                f"{os.path.basename(path)}")
+        self._warn(
+            f"粘贴三次都没让输入框发生变化，判定失败：{os.path.basename(path)}")
+        return False
 
-        edit.SendKeys("{Enter}", waitTime=0.05)
-        time.sleep(1.2)
-        return True
+    # ── 草稿判据 ────────────────────────────────────────────────────
+
+    def _input_region_signature(self, gui, box):
+        """给输入框（含上方一小条）拍个"指纹"，用来比前后。
+
+        没有 gui/box 时返回 None —— 调用方会退回到只看 Value。
+        """
+        if gui is None or not box:
+            return None
+        try:
+            x0, y0, x1, y1 = box
+            # 只看输入框本体，不往上看 150px ——
+            # 上方是消息区，那里的变化跟草稿无关，是噪音源。
+            rel = (x0 + 4, max(y0, y0), max(y0 + 4, y1 - 4), y1)
+            rel = (rel[0], rel[1], x1 - 4, rel[3])
+            shot = gui._grab_screen(gui._rel_to_screen(rel))
+            return shot.convert("L").resize((48, 16))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _wait_input_area_change(gui, box, before, wait: float = 3.0):
+        """轮询输入框区域，返回 (是否变了, 最新指纹)。"""
+        if before is None:
+            return False, None
+        deadline = time.time() + wait
+        last = None
+        while time.time() < deadline:
+            time.sleep(0.3)
+            now = UiaSender._input_region_signature(gui, box)
+            if now is None:
+                return False, None
+            last = now
+            # 逐像素平均差。阈值 6 是试出来的：
+            # 同一个静止画面重拍两次的差约 0~2，真进了缩略图是 30+。
+            try:
+                a = list(before.getdata())
+                b = list(now.getdata())
+                diff = sum(abs(x - y) for x, y in zip(a, b)) / max(1, len(a))
+                if diff > 6.0:
+                    return True, now
+            except Exception:
+                return False, None
+        return False, last
+
+    @staticmethod
+    def _value_has_object(edit) -> bool:
+        """Value 里有没有 U+FFFC（4.2.0 上附件会进 Value）。"""
+        try:
+            v = edit.GetValuePattern().Value
+        except Exception:
+            return False
+        return bool(v and "\ufffc" in v)
+
+    def _restore_clipboard_files(self, path: str) -> None:
+        """重写一次剪贴板。
+
+        为什么每次粘贴前都要重写：粘贴一次之后剪贴板内容可能被消费掉
+        （尤其是重试的第二、三次），不重写的话后面几次 Ctrl+V 什么都没有。
+        """
+        try:
+            from wechatauto.guia import WeChatGUI
+
+            WeChatGUI.copy_files_to_clipboard([os.path.abspath(path)])
+            time.sleep(0.15)
+        except Exception:
+            pass
 
     @staticmethod
     def _warn(msg: str) -> None:
@@ -496,40 +586,55 @@ class UiaSender:
         except Exception:
             pass
 
-    def _draft_visible(self, edit, gui, box, wait: float = 3.0) -> bool:
-        """判"粘贴的草稿在不在输入框里"。
+    # ── 发送后确认 ──────────────────────────────────────────────────
 
-        两条判据，**任一成立就算有**：
-          ① 输入框 Value 里出现 U+FFFC —— 4.2.0 上的行为
-          ② 输入框上方出现彩色缩略图   —— 4.1.x 上的行为（本机实测只有这条灵）
+    def _db(self):
+        """懒加载数据库只读连接，缓存住。
 
-        都没有才返回 False。任何一条成立就立刻 True，不浪费时间等另一条。
+        注意：WeChatDB 需要管理员权限取密钥。拿不到就返回 None，
+        所有依赖它的判据退化成"不知道"，不要因此把发送判成失败。
         """
-        deadline = time.time() + wait
-        while time.time() < deadline:
-            # ① Value
-            try:
-                v = edit.GetValuePattern().Value
-                if v and "\ufffc" in v:
-                    return True
-            except Exception:
-                # 读不到 Value：没有探测能力，交给像素判据
-                pass
+        db = getattr(self, "_db_obj", None)
+        if db is not None:
+            return db
+        try:
+            from wechatauto import WeChatDB
 
-            # ② 像素
-            if gui is not None and box is not None:
-                try:
-                    if gui._input_box_has_color_draft(box, wait=0.6):
-                        return True
-                except Exception:
-                    pass
+            db = WeChatDB()
+            self._db_obj = db
+            return db
+        except Exception as exc:
+            self._warn(f"打开微信数据库失败，发送校验退化：{exc}")
+            return None
 
-            time.sleep(0.3)
-        return False
+    def _resolve_chat(self, who: str) -> str:
+        """把会话显示名换成 wxid。换不到就用原名（filehelper 这类本来就是）。"""
+        db = self._db()
+        if db is None:
+            return who
+        try:
+            hits = db.search_contact(who)
+            if hits:
+                return hits[0]["username"]
+        except Exception:
+            pass
+        return who
 
-    # ------------------------------------------------------------------
-    # 发送后确认
-    # ------------------------------------------------------------------
+    def _target_seq(self, who: str) -> int:
+        """取会话当前最大 sort_seq，作为"发送前"的基线。
+
+        拿不到返回 0 —— 那样后面任何新消息都算新，宁可误判成功也不要
+        因为读不到数据库就把一次真发送记成失败。
+        """
+        db = self._db()
+        if db is None:
+            return 0
+        try:
+            rows = db.get_messages(self._resolve_chat(who), limit=1)
+            return int(rows[0]["sort_seq"]) if rows else 0
+        except Exception:
+            return 0
+
     def verify_media_sent(self, who: str, path: str,
                           before_seq: int = 0,
                           timeout: float = 8.0) -> bool:
@@ -547,23 +652,10 @@ class UiaSender:
         want = "动画表情" if kind == "sticker" else (
             "图片" if kind == "image" else "文件/链接/卡片")
 
-        db = getattr(self, "_db", None)
+        db = self._db()
         if db is None:
-            try:
-                from wechatauto import WeChatDB
-
-                db = WeChatDB()
-                self._db = db
-            except Exception:
-                return False
-
-        chat = who
-        try:
-            hits = db.search_contact(who)
-            if hits:
-                chat = hits[0]["username"]
-        except Exception:
-            pass
+            return False
+        chat = self._resolve_chat(who)
 
         deadline = time.time() + timeout
         fname = os.path.basename(path)

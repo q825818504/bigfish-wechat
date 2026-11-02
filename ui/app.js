@@ -15,7 +15,8 @@ const S = {
 
 const PAGE_TITLES = {
   overview: '概览', chats: '会话', soul: '灵魂',
-  mood: '心情', memory: '记忆', stickers: '表情包', data: '数据目录',
+  mood: '心情', memory: '记忆', impression: '印象',
+  stickers: '表情包', data: '数据目录',
   plugins: '插件', settings: '设置', logs: '日志',
 };
 
@@ -60,7 +61,8 @@ function go(page) {
 
   if (page === 'soul' && !S.soul) loadSoul();
   if (page === 'mood') loadMood();
-  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); loadPersons(); }
+  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); loadPersons(); loadPoolSummary(); }
+  if (page === 'impression') loadImpression();
   if (page === 'stickers') loadStickers();
   if (page === 'data') loadDataRoot();
   if (page === 'plugins') { closePlugin(); loadPlugins(); }
@@ -1194,11 +1196,27 @@ async function loadFacts(offset) {
       const ownerTag = (!dead && f.owner) ?
         '<span class="memory-time">' + esc(f.owner.split(':').pop().slice(0, 12)) +
         '</span>' : '';
+      // 话题选择（v5）：
+      //   话题 + 可见性**两个都满足**才外传。只标 shared 不选话题 = 不外传。
+      //   所以这里不是装饰，它直接决定"她能对别人说什么"。
+      const topicSel = dead ? '' :
+        '<select class="topic-select" data-topic="' + f.id + '" title="话题决定能不能说给别人听">' +
+        '<option value=""' + (!f.topic ? ' selected' : '') + '>话题…</option>' +
+        TOPIC_ALL.map((t) =>
+          '<option value="' + esc(t.k) + '"' + (f.topic === t.k ? ' selected' : '') + '>' +
+          esc(t.k) + (t.open ? '' : '（不外传）') + '</option>').join('') +
+        '</select>';
+      // 群里说过的事标出来
+      const originTag = (f.origin && f.origin.indexOf('group:') === 0) ?
+        '<span class="health-tag">群里说的</span>' : '';
+      // 真的会外传时给个明显标记
+      const openTag = (f.openable && !dead) ?
+        '<span class="health-tag ok">会外传</span>' : '';
       return '<div class="memory-item' + (dead ? ' is-dead' : '') + '">' +
         '<div class="memory-body"><div class="memory-meta">' +
         '<span class="memory-role">' + esc(f.anchor || '她') + '</span>' +
         '<span class="memory-time">' + esc(f.predicate) + '</span>' + conf + replaced +
-        visBadge + pinBadge + ownerTag +
+        visBadge + pinBadge + ownerTag + originTag + openTag + topicSel +
         '<span class="memory-time">' + esc(f.createdText || '') + '</span>' + del +
         '</div><div class="memory-text">' + esc(f.object) + '</div></div></div>';
     }).join('');
@@ -1369,6 +1387,22 @@ $('#btnMemVacuum').addEventListener('click', async () => {
 const TIER_LABEL = { owner: '主人', known: '熟人', guest: '陌生' };
 const VIS_LABEL = { private: '私密', shared: '可共享', public: '公开' };
 
+/* 话题表：和白名单/黑名单必须与 bigfish/memory.py 的 TOPIC_* 一致。
+ * open=true 的是白名单（可以外传），false 的是黑名单与灰区（一律不外传）。
+ *
+ * ⚠ 这里只是**展示**。真正的判定在 Python 侧（open_facts_for / topic_allowed），
+ *   前端说"可以"没用 —— 后端不认就是不认。这样即使有人改了 JS，
+ *   也改不出一个泄露口。 */
+const TOPIC_ALL = [
+  { k: '食物', open: true }, { k: '爱好', open: true }, { k: '作息', open: true },
+  { k: '性格', open: true }, { k: '口头禅', open: true }, { k: '称呼', open: true },
+  { k: '住址', open: false }, { k: '工作', open: false }, { k: '行程', open: false },
+  { k: '身体', open: false }, { k: '金钱', open: false }, { k: '家人', open: false },
+  { k: '联系人', open: false }, { k: '隐私', open: false },
+  { k: '年龄', open: false }, { k: '职业', open: false }, { k: '城市', open: false },
+  { k: '情感', open: false }, { k: '近况', open: false },
+];
+
 async function loadOwners() {
   if (!S.bridge || !S.bridge.owner_candidates) return;
   try {
@@ -1464,6 +1498,198 @@ async function addIdentity() {
     if ($('#idValue')) $('#idValue').value = '';
     loadOwners();
   } catch (e) { toast('添加失败'); }
+}
+
+/* ── 记忆池分栏 ──
+ *
+ * 只切显示，不改变任何数据。默认永远是「主人」那一栏 ——
+ * 其他池只给数量占位，不给内容。
+ */
+function switchMemTab(name) {
+  document.querySelectorAll('#memTabs .subtab').forEach((b) => {
+    b.classList.toggle('is-active', b.dataset.memtab === name);
+  });
+  document.querySelectorAll('[data-mempane]').forEach((p) => {
+    p.classList.toggle('is-active', p.dataset.mempane === name);
+  });
+  if (name === 'others') loadPoolSummary();
+}
+
+async function loadPoolSummary() {
+  if (!S.bridge || !S.bridge.pool_summary) return;
+  try {
+    const d = JSON.parse(await S.bridge.pool_summary());
+    if (d.error) return toast(d.error);
+    const pools = d.pools || [];
+    const others = pools.filter((p) => !p.isMain);
+    setText('#poolNum', others.length);
+    setText('#poolTag', others.length + ' 个池');
+    const box = $('#poolList');
+    if (!box) return;
+    if (!others.length) {
+      box.innerHTML = '<div class="empty"><p>还没有别人的记忆池 —— ' +
+        '等你跟她以外的人聊过，这里就会有。</p></div>';
+      return;
+    }
+    // ⚠ 只显示「名字 + 条数」，不显示任何事实内容。
+    //    这是刻意留白的：别人的池不该在主人没主动点开时被铺开。
+    box.innerHTML = others.map((p) => {
+      const kind = p.kind === 'group' ? '群' : '人';
+      return '<div class="pool-item">' +
+        '<div class="pool-name">' + esc(p.name) + '</div>' +
+        '<div class="pool-meta"><span class="health-tag">' + kind + '</span>' +
+        '<span class="health-tag">' + p.facts + ' 条认识</span>' +
+        '<span class="health-tag">' + p.messages + ' 条原文</span>' +
+        '<span class="memory-time">' + esc(p.platform || '') + '</span></div>' +
+        '</div>';
+    }).join('');
+  } catch (e) { /* 池总览失败不影响主流程 */ }
+}
+
+/* ── 话题 ──
+ *
+ * 打话题 = 声明"这条讲的是哪类事"。它和可见性是**与**的关系：
+ *   可见性 shared + 白名单话题  → 可以外传
+ *   其余任何组合              → 不外传
+ * 所以打错话题最多是"这条不给外人看"，不会反向泄露。
+ */
+async function setTopic(factId, topic) {
+  if (!S.bridge || !S.bridge.set_fact_topic) return;
+  const t = TOPIC_ALL.find((x) => x.k === topic);
+  if (topic && t && !t.open) {
+    const NL = String.fromCharCode(10);
+    const ok = confirm('「' + topic + '」不在可以外传的话题里。' + NL + NL +
+      '选了它这条仍然不会说给别人听 —— 只是记一下它是哪类事。继续？');
+    if (!ok) { loadFacts(); return; }   // 取消就重画，把下拉框选回去
+  }
+  try {
+    const r = JSON.parse(await S.bridge.set_fact_topic(Number(factId), topic || ''));
+    if (!r.ok) return toast(r.error || '修改失败');
+    toast(topic ? ('已标记为「' + topic + '」') : '已清空话题（不外传）');
+    loadFacts();
+  } catch (e) { toast('修改失败'); }
+}
+
+/* ── 角色印象页 ──
+ *
+ * 一人一页，横向切换，主人永远第一页。
+ * 每页两块：
+ *   ① 你手写的评语（模型不参与，纯文本框）
+ *   ② 她会对别人说的开放信息（实时从 facts 查，不存副本）
+ *
+ * 「点删除」= 撤回开放，不是忘掉：
+ *   事实还在，她照样拿它当结论，只是不再对别人提。
+ */
+let IMPR = { people: [], active: '' };
+
+async function loadImpression() {
+  if (!S.bridge || !S.bridge.impression_board) return;
+  try {
+    const d = JSON.parse(await S.bridge.impression_board());
+    if (d.error) return toast(d.error);
+    IMPR.people = d.people || [];
+    setText('#imprCount', IMPR.people.length + ' 人');
+    renderImprTabs();
+    renderImprPanes();
+  } catch (e) { toast('读取印象失败'); }
+}
+
+function renderImprTabs() {
+  const box = $('#imprTabs');
+  if (!box) return;
+  if (!IMPR.people.length) {
+    box.innerHTML = '';
+    const panes = $('#imprPanes');
+    if (panes) {
+      panes.innerHTML = '<div class="empty"><h3>还没有人</h3>' +
+        '<p>跟她聊过之后，这里会一个一个人出来</p></div>';
+    }
+    return;
+  }
+  // 主人固定第一个
+  const sorted = IMPR.people.slice().sort((a, b) =>
+    (a.isOwner ? 0 : 1) - (b.isOwner ? 0 : 1));
+  IMPR.people = sorted;
+  if (!IMPR.active || !sorted.some((p) => p.owner === IMPR.active)) {
+    IMPR.active = sorted[0].owner;
+  }
+  box.innerHTML = sorted.map((p) => {
+    const cls = p.owner === IMPR.active ? ' is-active' : '';
+    const star = p.isOwner ? ' ★' : '';
+    return '<button class="subtab' + cls + '" data-impr="' + esc(p.owner) + '">' +
+      esc(p.name || p.owner) + star + '</button>';
+  }).join('');
+}
+
+function renderImprPanes() {
+  const box = $('#imprPanes');
+  if (!box || !IMPR.people.length) return;
+  const p = IMPR.people.find((x) => x.owner === IMPR.active) || IMPR.people[0];
+  if (!p) return;
+  const opens = p.open || [];
+  const openRows = opens.length
+    ? opens.map((o) => (
+      '<div class="open-item">' +
+      '<div class="open-body">' +
+      '<span class="health-tag ok">' + esc(o.topic) + '</span>' +
+      '<span class="memory-role">' + esc(o.predicate) + '</span>' +
+      '<span class="open-text">' + esc(o.object) + '</span>' +
+      '</div>' +
+      '<button class="btn btn-sm" data-revoke="' + o.id + '" title="撤回：她不再对别人提这条">' +
+      '删除</button>' +
+      '</div>')).join('')
+    : '<div class="empty" style="padding:14px 0"><p>' +
+      '还没有她会说出去的事。<br>' +
+      '去「记忆 → 她认定的事」，把想公开的那条改成「可共享」并选一个话题。</p></div>';
+
+  box.innerHTML =
+    '<div class="card">' +
+    '<div class="card-head"><h2>' + esc(p.name || p.owner) +
+    (p.isOwner ? ' <span class="health-tag ok">主人</span>' : '') + '</h2>' +
+    '<span class="tag">' + p.facts + ' 条认识 / ' + p.private + ' 条私密</span></div>' +
+    '<div class="field full" style="margin-bottom:16px">' +
+    '<label>你怎么看这段关系（手写，模型不参与）</label>' +
+    '<textarea id="imprNote" rows="3" placeholder="比如：话不多，但每次说饿都是真的饿了">' +
+    esc(p.note || '') + '</textarea>' +
+    '<div class="path-row" style="margin-top:8px">' +
+    '<button class="btn btn-primary btn-sm" id="btnSaveNote">保存评语</button>' +
+    '<span class="memory-time" id="noteHint"></span>' +
+    '</div></div>' +
+    '<div class="card-head" style="margin-top:6px"><h2>她对别人会说的</h2>' +
+    '<span class="tag">' + opens.length + ' 条</span></div>' +
+    '<div class="card-desc" style="margin-bottom:10px">' +
+    '这些是<b>可以</b>说出去的。住址、行程、身体、钱、家人一律不在里面 —— ' +
+    '就算你标了「可共享」，话题不对也不外传。' +
+    '</div>' +
+    '<div class="open-list">' + openRows + '</div>' +
+    '</div>';
+}
+
+async function saveImprNote() {
+  const el = $('#imprNote');
+  const p = IMPR.people.find((x) => x.owner === IMPR.active);
+  if (!el || !p || !S.bridge) return;
+  try {
+    const r = JSON.parse(await S.bridge.set_impression(p.owner, el.value.trim()));
+    if (!r.ok) return toast(r.error || '保存失败');
+    p.note = el.value.trim();
+    setText('#noteHint', '已保存');
+    setTimeout(() => setText('#noteHint', ''), 2000);
+  } catch (e) { toast('保存失败'); }
+}
+
+async function revokeOpen(factId) {
+  const NL = String.fromCharCode(10);
+  const ok = confirm('不再对别人提这条？' + NL + NL +
+    '她不会忘掉它 —— 只是不再说给外人听。');
+  if (!ok) return;
+  try {
+    const r = JSON.parse(await S.bridge.revoke_open(Number(factId)));
+    if (!r.ok) return toast(r.error || '操作失败');
+    toast('已撤回');
+    loadImpression();
+    loadFacts();
+  } catch (e) { toast('操作失败'); }
 }
 
 async function setVisibility(factId, vis) {
@@ -1647,10 +1873,41 @@ const bindFactUI = () => {
     if (!t) return;
     forgetFact(Number(t.dataset.forget));
   });
+  // 话题下拉：改了立刻存，不是等刷新
+  document.addEventListener('change', (e) => {
+    const s = e.target.closest('[data-topic]');
+    if (!s) return;
+    setTopic(s.dataset.topic, s.value);
+  });
+  // 记忆池分栏
+  document.querySelectorAll('#memTabs .subtab').forEach((b) => {
+    b.addEventListener('click', () => switchMemTab(b.dataset.memtab));
+  });
 };
 bindFactUI();
 bindOwnerUI();
 bindPersonUI();
+
+/* ────────── 印象页 ──────────
+ *
+ * 横向分页：一人一页。切页只重画，不重新拉数据 ——
+ * 数据每次进页面时拉一次就够，来回切不该反复打后端。
+ */
+(function bindImpressionUI() {
+  document.addEventListener('click', (e) => {
+    const tab = e.target.closest('[data-impr]');
+    if (tab) {
+      IMPR.active = tab.dataset.impr;
+      renderImprTabs();
+      renderImprPanes();
+      return;
+    }
+    const rv = e.target.closest('[data-revoke]');
+    if (rv) { revokeOpen(rv.dataset.revoke); return; }
+    const save = e.target.closest('#btnSaveNote');
+    if (save) saveImprNote();
+  });
+})();
 
 /* ────────── 数据目录 ────────── */
 

@@ -996,25 +996,33 @@ def open_facts_for(path: str, bank: str, owner: str, *,
 
 
 def scope_filter(owner: str, tier: str,
-                 also_owners: Sequence[str] = ()) -> Tuple[str, List[str]]:
+                 also_owners: Sequence[str] = (),
+                 *, strict_owner: bool = False) -> Tuple[str, List[str]]:
     """把 owner + tier 翻成一条 SQL 条件。
 
-    规则只有两条，按顺序：
+    两条规则：
 
         ① 属于我的：**全部可见**，不管它是什么级别
            —— 别人的私密只对我不可见，我自己的私密我当然看得见。
-        ② 不属于我的：只给 shared / public
+        ② 不属于我的：按 tier 决定（见 visible_visibilities）
 
     `also_owners`：同一个人的**其它平台账号**（person 展开的结果）。
     微信里的我看 B站里那个我聊过的东西，靠的就是它。
 
+    `strict_owner=True`：**只**要属于我的，不要 shared 掺进来。
+        「查 A 的池」和「以 A 的身份看世界」是两件事：
+          · 前者要 strict —— UI 上点开某个人的池，就该只看到他的
+          · 后者不要 —— 看世界时，别人的 shared 也算这个世界的一部分
+
     ⚠ 只传"同一个 person 名下的账号"。**绝不能**把 shared 逻辑和它混起来：
       "我别的账号" 和 "别人的 shared" 是两回事，混了就是越权。
     """
-    vis = visible_visibilities(tier)
-    placeholders = ",".join("?" * len(vis))
     mine = [owner] + [o for o in (also_owners or ()) if o and o != owner]
     mine_marks = ",".join("?" * len(mine))
+    if strict_owner:
+        return f"owner IN ({mine_marks})", list(mine)
+    vis = visible_visibilities(tier)
+    placeholders = ",".join("?" * len(vis))
     clause = f"(owner IN ({mine_marks}) OR visibility IN ({placeholders}))"
     return clause, [*mine, *vis]
 
@@ -1362,7 +1370,8 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
                query: str = "", limit: int = 100, offset: int = 0,
                owner: str = "", tier: str = "",
                also_owners: Sequence[str] = (),
-               origin: str = "", topic: str = "") -> Dict[str, Any]:
+               origin: str = "", topic: str = "",
+               strict: bool = False) -> Dict[str, Any]:
     """列/搜事实。
 
     两种调用方式：
@@ -1370,6 +1379,10 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
       · **说话视角**（传了 owner 和 tier）：只返回这个人有权看到的事实，
         走 scope_filter() 那条唯一的隔离判断。
         `also_owners` 传同一个人的其它平台账号，实现跨平台记忆汇总。
+
+    `strict=True`（v5）：**只**要 owner 名下的，不要别人的 shared 掺进来。
+        UI 上点开某个人的池时用它 —— "看他的池"和"以他的身份看世界"
+        是两件事，前者不该夹带别人的东西。
 
     `origin` / `topic`（v5）：精确过滤。"group:xxx" 取某个群里说过的话；
     话题给一个值就只出那一类。两个都空 = 不按这两项过滤。
@@ -1381,7 +1394,8 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
         return {"items": [], "total": 0}
     where, params = ["bank = ?"], [bank]
     if owner and tier:
-        clause_extra, extra_params = scope_filter(owner, tier, also_owners)
+        clause_extra, extra_params = scope_filter(owner, tier, also_owners,
+                                                  strict_owner=strict)
         where.append(clause_extra)
         params += extra_params
     if status in (ACTIVE, SUPERSEDED, FORGOTTEN):
@@ -1593,52 +1607,68 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
          直接返回空串 —— 宁可这次不注入，也不能瞎注入。
       2. 置顶单独走一遍，**独立预算**。置顶的事实不该被普通检索挤掉：
          "你叫她爸爸"和"今天下雨"不该抢同一个名额。
-      3. **非主人只拿得到"开放信息"** —— 走 open_facts_for()，
-         两个条件同时成立才算（visibility 已标 shared/public 且话题在白名单）。
-         这就是"她知道你喜欢吃辣，但不知道你昨天住院了"的实现方式。
-         v5 之前这里给的是"所有 shared"，于是只要你标过一次 shared，
-         连"住址"都会被端出去 —— 白名单补的就是这个洞。
+      3. **注入永远是"这个人 + 公共"两条腿，主人不例外。**
+
+         这条和 list_facts 的"主人全可见"**不是一回事**，必须分开：
+             list_facts(tier=owner)  → UI 上主人能翻到全部（数据在他硬盘上）
+             facts_for_prompt(...)   → 但**不会**把别人的私密塞进提示词
+
+         为什么主人也不许注入别人的私密：
+             她跟 A 说话时，如果 B 的私密在提示词里，她就有机会说漏。
+             "看得见"是主人的权利，"说得出"是她的行为 —— 后者不看 tier，
+             只看这条事实是不是冲着"双方共同知道"去的。
+             所以即便 A 是主人，注入的仍是：A 自己的全部 + 所有人的开放信息。
       4. **跨平台**：她自己在这里查出这个人的所有平台账号
          （owner_persons），一起交给 scope_filter。调用方不需要知道
          person 表的存在 —— 少一个参数就少一处漏。
       5. `question`（v5）：本轮对方说了什么。目前只用于**注入侧不提无关的开放信息**
          —— 对方没问到主人时，不主动把主人的爱好塞进去（那反而会让她
-         在闲聊里突然提一嘴"我主人爱吃烧烤"，很不自然）。
+         在闲聊里突然提一句"我主人爱吃烧烤"，很不自然）。
          传空串 = 不过滤（旧行为）。
     """
     if not owner or not tier:
         return ""
     # 这个人在所有平台的账号。没认领时就是他自己一个。
     siblings = [o for o in owner_persons(path, owner) if o and o != owner]
-
-    # ① 置顶：独立预算，先占位
-    pinned = list_facts(path, bank, status=ACTIVE, owner=owner, tier=tier,
-                        also_owners=siblings,
-                        limit=max(1, pinned_limit)).get("items") or []
-    # ② 普通：剩下的名额
-    normal = list_facts(path, bank, status=ACTIVE, owner=owner, tier=tier,
-                        also_owners=siblings,
-                        limit=max(1, limit)).get("items") or []
-
     mine = {owner, *siblings}
 
-    # ③ 非主人：只留"开放信息"。open_facts_for 是唯一判定，
-    #    这里不复制它的条件 —— 两处各写一份就会漂。
-    if tier != TIER_OWNER:
-        allowed_ids: set = set()
-        for o in mine:
-            for it in open_facts_for(path, bank, o, limit=200):
-                allowed_ids.add(it["id"])
-        pinned = [i for i in pinned if i["id"] in allowed_ids]
-        normal = [i for i in normal if i["id"] in allowed_ids]
+    # ① 只取"属于这个人的" —— 用 owner 精确过滤，不用 tier。
+    #    tier 在这里唯一的作用是**决定要不要额外补开放信息**，
+    #    它不能扩大可见范围。写成 list_facts(tier=tier) 的话，
+    #    主人 tier 会把全库都捞进来 —— 那正是"跟 A 说话却带着 B 的秘密"。
+    pinned = list_facts(path, bank, status=ACTIVE, owner=owner,
+                        tier=TIER_OWNER,          # 只为让 scope_filter 放行 owner 自己
+                        also_owners=siblings,
+                        limit=max(1, pinned_limit)).get("items") or []
+    normal = list_facts(path, bank, status=ACTIVE, owner=owner,
+                        tier=TIER_OWNER,
+                        also_owners=siblings,
+                        limit=max(1, limit)).get("items") or []
+    # 上面用 TIER_OWNER 只是为了让 scope_filter 的"我自己的全可见"生效；
+    # 结果集里仍然可能夹带 visibility=shared 的别人的东西，
+    # 所以下面还要按 owner 再收一刀。
+    pinned = [i for i in pinned if i["owner"] in mine]
+    normal = [i for i in normal if i["owner"] in mine]
+
+    # ② 追加：全库的开放信息。
+    #    B 问「你主人爱吃啥」，靠的就是这一段 —— 开放信息存在主人名下，
+    #    但此刻跟她说话的是 B，所以要按"公共资料"的身份补进来。
+    extra = []
+    for o in _all_owners(path):
+        for it in open_facts_for(path, bank, o, limit=200):
+            if it["id"] not in {x["id"] for x in pinned} and \
+               it["id"] not in {x["id"] for x in normal}:
+                extra.append(it)
+    extra.sort(key=lambda x: -float(x.get("confidence") or 0))
+    extra = extra[:4]          # 开放信息是补充，不该挤掉"我自己的事"
 
     seen, lines = set(), []
-    for item in [i for i in pinned if i.get("pinned")] + normal:
+    for item in [i for i in pinned if i.get("pinned")] + normal + extra:
         fid = item.get("id")
         if fid in seen:
             continue
         seen.add(fid)
-        if len(lines) >= limit + pinned_limit:
+        if len(lines) >= limit + pinned_limit + len(extra):
             break
         # "我"= 这个人自己的（任何一个平台账号），"别人"= 别的 owner 分享出来的
         who = item["anchor"] or ("我" if item["owner"] in mine else "别人")
@@ -1651,8 +1681,45 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
         o = item.get("origin") or ""
         if o.startswith("group:"):
             where = "（群里说的）"
-        lines.append(f"- {star}{who}｜{item['predicate']}：{item['object']}{mark}{where}")
+        # 开放信息标出来 —— 让模型知道"这条是对外可以说"的，
+        # 而不是自己猜哪条能说。判定已经做完了，这里只是标注。
+        shared_mark = ""
+        if item["owner"] not in mine and item.get("visibility") in (VIS_SHARED, VIS_PUBLIC):
+            shared_mark = "（可以告诉别人）"
+        lines.append(f"- {star}{who}｜{item['predicate']}：{item['object']}"
+                     f"{mark}{where}{shared_mark}")
     return "\n".join(lines)
+
+
+def _all_owners(path: str) -> List[str]:
+    """库里所有 owner。用于「开放信息」的全库扫描。
+
+    ⚠ 从 **facts 表**取，不从 owners 表取。
+      以前这里查 owners，于是"写过事实但还没登记 owner"的人
+      （reflect 直接 remember、没走 ensure_owner 的路径）整个失踪，
+      表现为"标了共享但对方看不到" —— 查起来像权限问题，其实是漏人。
+
+    facts 里出现过的 owner 才是真正常识意义上的"有过记忆的人"，
+    owners 表只是它的一个索引/补充（存 tier、display_name）。
+    """
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT owner FROM facts WHERE owner <> ''").fetchall()
+        out = [r["owner"] for r in rows]
+        try:
+            out += [r["owner"] for r in
+                    conn.execute("SELECT owner FROM owners").fetchall()]
+        except Exception:
+            pass
+        return list(dict.fromkeys(out))
+    except Exception:
+        return []
+    finally:
+        conn.close()
 
 
 def owner_said_about(path: str, bank: str, answerer_owner: str,
@@ -2006,7 +2073,7 @@ REFLECT_SYSTEM = """你在帮一个角色把她记得的事整理成「事实」
 只输出一个 JSON 对象，不要任何其它文字、不要 Markdown 代码块。
 
 格式：
-{"facts":[{"anchor":"","predicate":"","object":"","confidence":0.6,"chunks":[1],"evidence":""}],"skip_reason":""}
+{"facts":[{"anchor":"","predicate":"","object":"","confidence":0.6,"chunks":[1],"evidence":"","topic":""}],"skip_reason":""}
 
 规则：
 1. **只从下面给出的原文里提炼**，不许补充原文没有的事，不许把她的猜测写成事实。
@@ -2022,10 +2089,26 @@ REFLECT_SYSTEM = """你在帮一个角色把她记得的事整理成「事实」
 5. confidence 0~1：原文明确陈述 0.8~0.9；从语气推测 0.4~0.6；玩笑/气话/客套 0.2~0.3
    或干脆不提。
 6. chunks 填支持这条事实的原文编号（下面每行开头的 [n]），至少一个。
+   **这个编号会被程序拿去核对**，填一个不存在的编号这条事实会被直接丢掉。
 7. evidence 摘 20 字以内的原话片段作依据。
 8. **不确定就少提**。宁缺毋滥：一次情绪、玩笑、客套不能变成长期标签。
    纯寒暄（"在吗""嗯""好"）不产生任何事实，skip_reason 里说明。
 9. 涉及密码、密钥、身份证号、银行卡的内容一律不提。
+10. topic 是这条事实讲的**哪一类事**，只能从下面这些词里选一个，
+    一个都不像就留空：
+        食物 爱好 作息 性格 口头禅 称呼
+        住址 工作 行程 身体 金钱 家人 联系人 隐私
+        年龄 职业 城市 情感 近况
+
+    ⚠ topic 决定「这条能不能说给别人听」，所以**必须按字面归类**，
+      不许为了让它"看起来更安全"而往前面几类上靠。
+      拿不准就留空 —— 留空等于不外传，是安全的那一边。
+      举几个容易错的：
+        「他住在朝阳区」      → 住址（不是"行程"）
+        「他今年 28」         → 年龄
+        「他在字节上班」      → 工作（不是"职业"，职业是"程序员"这种）
+        「他昨天发烧了」      → 身体
+        「他昨天加班到十点」  → 行程
 """
 
 
@@ -2065,6 +2148,12 @@ def _parse_reflect(raw: str) -> Tuple[List[Fact], str]:
             # 只接受它明确给出的 "shared"，且后面还有一道主人确认（见 desktop）。
             visibility=(VIS_SHARED if str(item.get("visibility") or "").strip().lower()
                         == VIS_SHARED else VIS_PRIVATE),
+            # v5：话题由模型按字面归类，认不出就留空（= 不外传）。
+            #   ⚠ 这里**不做任何模糊匹配** —— 模型给"吃的东西"这种近似词
+            #     一律当没说过。宁可少判一类，也不能把"住址"误判成"食物"。
+            topic=str(item.get("topic") or "").strip(),
+            # origin 由调用方（reflect_on_session）按会话类型填，不由模型决定。
+            # 模型不知道"这句话是在哪个群说的"，让它填等于给它一个编造机会。
         )
         if f.ok:
             facts.append(f)
@@ -2334,7 +2423,9 @@ def _ensure_anchor_safe(path: str, bank: str, name: str,
 def reflect_on_session(path: str, bank: str, session: str, call_model,
                        *, owner: str = "", tier: str = TIER_GUEST,
                        batch: int = 40, now: Optional[int] = None,
-                       self_names: Sequence[str] = ()) -> Dict[str, Any]:
+                       self_names: Sequence[str] = (),
+                       group_owner: str = "",
+                       origin: str = "") -> Dict[str, Any]:
     """对某个会话的新消息做一次反思，把原文沉淀成事实。
 
     `call_model(system, user) -> str` 由调用方注入（replier.call_model）。
@@ -2342,10 +2433,14 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
 
     `owner` / `tier`：这个会话属于谁、对方是什么身份。**必须传** ——
     反思出来的事实要打上"属于谁"的印记，否则写不进去（remember 会拒绝）。
-    tier 同时决定这批事实**默认的共享级别**：
-        主人说的话 → 默认 private（只有她能看）
-        其他人说的话 → 默认 private（对方自己的事，同样只给这个人看）
-    两者都是 private，区别只在于"谁能看到它"由 owner 决定。
+
+    `group_owner`（v5）：当这次反思发生在群里时，传"这个群"的 owner 键。
+    传了就会**双写**：说话人的池 + 群的池（见 remember_both）。
+    私聊时留空 = 只写一份，行为与以前完全一致。
+
+    `origin`（v5）：这条事实是在哪儿说的。私聊传 "private"，
+    群聊传 "group:<群 id>"。由调用方给，**不由模型决定** ——
+    模型不知道自己在哪个群说话，让它填等于给它一个编造机会。
 
     `self_names`：**角色自己**的名字与自称（别人叫她什么）。必须传 ——
     否则模型分不清"对方发来一句「肥鱼」"是打招呼还是自我介绍，
@@ -2406,14 +2501,38 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
         facts, skip = _parse_reflect(raw)
         valid_chunks = set(chunk_ids)
         added = repaired = 0
+        mirrored = 0
         failed = []
         for f in facts:
-            f.source_chunks = [c for c in f.source_chunks if c in valid_chunks] or chunk_ids[:1]
+            # ⚠ 模型给的 chunk 编号只当**线索**：取与本批原文的交集。
+            #   交集为空说明它指的是一条不存在的来源 —— 以前这里是
+            #   `or chunk_ids[:1]`，等于**替模型伪造一个来源**，然后照写不误。
+            #   这和"任何记忆都要有来源"是直接冲突的，所以改成拒收。
+            picked = [c for c in f.source_chunks if c in valid_chunks]
+            if not picked:
+                failed.append(f"{f.predicate}: 来源编号无效（{f.source_chunks[:3]}），拒收")
+                continue
+            f.source_chunks = picked
             # 归属由调用方给定，不由模型决定 —— 模型可能把别人的事写到
             # 另一个人名下，而"归属错了"是比"记错了"更难发现的问题。
             if not f.owner:
                 f.owner = owner
-            ok, _fid, _err = remember(path, bank, f)
+            if origin:
+                f.origin = origin
+            if group_owner:
+                res = remember_both(path, bank, f, group_owner=group_owner,
+                                    allowed_sessions=[session])
+                ok, _fid = bool(res.get("ok")), res.get("personal")
+                if res.get("group"):
+                    mirrored += 1
+                for e in res.get("errors") or []:
+                    failed.append(f"{f.predicate}: {e}")
+            else:
+                ok, _fid, _err = remember(path, bank, f,
+                                          verify_sources=True,
+                                          allowed_sessions=[session])
+                if not ok:
+                    failed.append(f"{f.predicate}: {_err}")
             if ok:
                 added += 1
                 if f.anchor:
@@ -2426,9 +2545,6 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
                                                       f.source_chunks)
                     if not ok_a:
                         failed.append(f"{f.predicate}: 锚点 {err_a}")
-            else:
-                # 失败必须报出来。以前 _err 被丢掉，等于把"没写进去"伪装成"没产生"。
-                failed.append(f"{f.predicate}: {_err}")
         last_id = int(rows[-1]["id"])
         conn.execute(
             "INSERT INTO reflection_state(bank,session,last_message,last_run,last_error) "
@@ -2438,6 +2554,7 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
             (bank, session, last_id, now))
         conn.commit()
         return {"ok": True, "added": added, "repaired": repaired,
+                "mirrored": mirrored,
                 "messages": len(rows), "skip_reason": skip,
                 "failed": failed[:8]}
     except Exception as exc:
