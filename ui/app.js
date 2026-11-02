@@ -414,7 +414,11 @@ async function pickAccount() {
   const box = $('#accountList');
   if (!modal || !box) return toast('界面缺少账号弹窗');
   if (!list.length) {
-    box.innerHTML = '<div class="empty"><p>本机没有找到已登录的微信</p></div>';
+    box.innerHTML = '<div class="empty">' +
+      '<h3>没有正在运行的微信</h3>' +
+      '<p>这个列表只显示<b>已经启动</b>的微信账号 —— ' +
+      '连一个没启动的号没有意义，它的消息读不到、也发不出去。<br>' +
+      '请先打开微信并登录，再回来点「选择账号」。</p></div>';
   } else {
     box.innerHTML = list.map((a) => {
       // 显示名优先：手填的备注 > 已知昵称/alias > wxid
@@ -425,9 +429,11 @@ async function pickAccount() {
       // （多开时 A 号十分钟前刚写过，可能比正在聊的 B 号时间还近）。
       const run = a.running
         ? '<span class="tag ok" style="margin-left:8px">● 正在运行</span>'
-        : '<span class="tag" style="margin-left:8px">未运行</span>';
+        : '<span class="tag" style="margin-left:8px">未启动</span>';
+      // 头像只放一个符号，不放昵称首字 ——
+      // 放了就跟右边那行名字重复（截图里"四条"出现两次）。
       return `<div class="session-item">
-        <span class="chat-avatar">${esc((title || '?').slice(0, 2))}</span>
+        <span class="chat-avatar">●</span>
         <div class="session-main" data-acc="${esc(a.account)}" style="cursor:pointer">
           <div class="session-name">${esc(title)}${run}
             ${a.isSaved ? '<span class="tag" style="margin-left:6px">上次用的</span>' : ''}

@@ -930,7 +930,18 @@ class Backend(QObject):
                     "chats": len(((cfg.get("per_account") or {})
                                   .get(a["account"], {}) or {}).get("chats") or []),
                 })
-            # 正在跑的一律排最前 —— 用户几乎总是想连那个
+            # **只保留正在运行的账号。**
+            #
+            # 理由：连一个没启动的微信没有意义 —— 它的数据库不会被更新，
+            # 消息读不到、发送也发不出去，用户会以为是软件坏了。
+            # 所以这里直接过滤掉，列表里只出现"现在就能用"的号。
+            #
+            # 但要留一个例外：上次用过的那个即使没在跑也显示出来，
+            # 否则用户会以为"我的配置丢了"。用 running=false 标清楚即可。
+            #
+            # 全都不在跑时（比如微信还没启动），返回空列表，
+            # 界面给一句明确的指引，而不是给一堆点了没反应的选项。
+            out = [a for a in out if a["running"] or a["isSaved"]]
             out.sort(key=lambda x: (not x["running"], x["account"]))
             return json.dumps({
                 "root": root or "",
