@@ -247,9 +247,11 @@ $('#btnOpenWechat').addEventListener('click', async () => {
 
 function renderChats() {
   const box = $('#chatList');
+  const tabs = $('#chatTabs');
   setText('#chatCount', `${S.chats.length} 个`);
 
   if (!S.chats.length) {
+    if (tabs) tabs.innerHTML = '';
     box.innerHTML = `<div class="empty">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
         <path d="M4 6h16v10H8l-4 4V6z"/></svg>
@@ -258,55 +260,114 @@ function renderChats() {
     return;
   }
 
-  /* 分组。
+  /* 分组做成顶部的一排小板块。
    *
-   * 以前只有一个平铺列表，公众号（实测 147 个）和联系人（21 个）混在一起，
-   * 想找个人得往下翻半天。现在按 kind 分四组，各自带数量。
+   * 以前是纵向分组标题 —— 180 条里联系人 94 个铺满屏，
+   * 想切到群聊得滚过整屏。现在横向排一排，点哪个看哪个。
    */
   const GROUPS = [
-    { key: 'contact', label: '联系人', note: '' },
-    { key: 'group', label: '群聊', note: '打开开关的群才会被回复' },
-    { key: 'official', label: '公众号', note: '不建议打开' },
-    { key: 'system', label: '系统', note: '' },
+    { key: 'contact', label: '联系人' },
+    { key: 'group', label: '群聊' },
+    { key: 'official', label: '公众号' },
+    { key: 'system', label: '系统' },
   ];
-
-  let html = '';
-  for (const g of GROUPS) {
-    const rows = S.chats.filter((c) => (c.kind || 'contact') === g.key);
-    if (!rows.length) continue;
-    html += `<div class="chat-group">
-      <div class="chat-group-head">
-        <span>${esc(g.label)}</span>
-        <span class="tag">${rows.length}</span>
-        ${g.note ? `<span class="chat-group-note">${esc(g.note)}</span>` : ''}
-      </div>`;
-    html += rows.map((c) => {
-      const on = S.watching.has(c.username);
-      const initial = (c.name || '?').trim().charAt(0).toUpperCase();
-      const unread = c.unread ? ` · ${c.unread > 99 ? '99+' : c.unread} 条未读` : '';
-      return `<div class="chat-row${on ? ' is-on' : ''}" data-chat="${esc(c.username)}">
-        <span class="chat-avatar">${esc(initial)}</span>
-        <div style="min-width:0">
-          <div class="chat-name">${esc(c.name)}</div>
-          <div class="chat-sub">${unread || '—'}</div>
-        </div>
-        <span class="chat-toggle"></span>
-      </div>`;
-    }).join('');
-    html += '</div>';
+  const counts = {};
+  for (const c of S.chats) {
+    const k = c.kind || 'contact';
+    counts[k] = (counts[k] || 0) + 1;
   }
-  box.innerHTML = html;
+  // 当前选中的组：没选或该组为空时落到第一个有内容的组
+  let active = S.chatTab || '';
+  if (!active || !counts[active]) {
+    active = (GROUPS.find((g) => counts[g.key]) || GROUPS[0]).key;
+  }
+  S.chatTab = active;
+
+  if (tabs) {
+    tabs.innerHTML = GROUPS.filter((g) => counts[g.key]).map((g) => {
+      const on = g.key === active ? ' is-active' : '';
+      // 该组里已勾选几个，让用户一眼看出"这组有在用的"
+      const picked = S.chats.filter(
+        (c) => (c.kind || 'contact') === g.key && S.watching.has(c.username)).length;
+      return `<button class="chat-tab${on}" data-tab="${g.key}">
+        <span>${esc(g.label)}</span>
+        <span class="chat-tab-count">${counts[g.key]}</span>
+        ${picked ? `<span class="chat-tab-picked">${picked}</span>` : ''}
+      </button>`;
+    }).join('');
+    $$('#chatTabs [data-tab]').forEach((b) => {
+      b.addEventListener('click', () => { S.chatTab = b.dataset.tab; renderChats(); });
+    });
+  }
+
+  const rows = S.chats.filter((c) => (c.kind || 'contact') === active);
+  box.innerHTML = rows.map((c) => {
+    const on = S.watching.has(c.username);
+    const initial = (c.name || '?').trim().charAt(0).toUpperCase();
+    const unread = c.unread ? ` · ${c.unread > 99 ? '99+' : c.unread} 条未读` : '';
+    return `<div class="chat-row${on ? ' is-on' : ''}" data-chat="${esc(c.username)}">
+      <span class="chat-avatar">${esc(initial)}</span>
+      <div style="min-width:0">
+        <div class="chat-name">${esc(c.name)}</div>
+        <div class="chat-sub">${unread || '—'}</div>
+      </div>
+      <span class="chat-toggle"></span>
+    </div>`;
+  }).join('');
 
   $$('#chatList [data-chat]').forEach((row) => {
     row.addEventListener('click', () => {
       const uid = row.dataset.chat;
       if (S.watching.has(uid)) S.watching.delete(uid);
       else S.watching.add(uid);
+      S.watchDirty = true;
       renderChats();
-      syncWatching();
+      updateWatchBar();
     });
   });
-  setText('#watchCount', S.watching.size + ' 个会话');
+  updateWatchBar();
+}
+
+/* 底部：已选多少个 + 保存按钮。
+ *
+ * 问题 3 说的是"没有保存配置的功能"。之前每点一下就写盘（syncWatching），
+ * 表面上看是"自动保存了"，但用户看不到任何"已保存"的确认，
+ * 也不知道改了多久生效 —— 他以为根本没保存。
+ * 现在改成：改动只进内存（标记 dirty），点保存或切页才落盘，
+ * 并明确显示"有 N 个未保存的改动"。
+ */
+function updateWatchBar() {
+  setText('#watchCount', S.watching.size + ' 个');
+  const btn = $('#btnSaveWatch');
+  if (btn) {
+    btn.disabled = !S.watchDirty;
+    btn.textContent = S.watchDirty ? '保存修改' : '已保存';
+    btn.classList.toggle('btn-primary', !!S.watchDirty);
+  }
+  const hint = $('#watchHint');
+  if (hint) {
+    hint.textContent = S.watchDirty
+      ? '有未保存的修改'
+      : (S.watching.size ? '这 ' + S.watching.size + ' 个会话会持续监听' : '还没有选择要监听的会话');
+    hint.className = 'hint-line' + (S.watchDirty ? ' is-warn' : '');
+  }
+}
+
+async function saveWatch() {
+  if (!S.bridge) return;
+  const btn = $('#btnSaveWatch');
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const r = JSON.parse(await S.bridge.set_watching(
+      JSON.stringify([...S.watching])));
+    if (r.error) return toast(r.error);
+    S.watchDirty = false;
+    toast('已保存 · 这 ' + S.watching.size + ' 个会话会持续监听');
+    updateWatchBar();
+  } catch (e) {
+    toast('保存失败');
+    updateWatchBar();
+  }
 }
 
 async function syncWatching() {
@@ -386,9 +447,11 @@ async function chooseAccount(acc) {
     if (r.restored) {
       // 这个号上次勾过会话 —— 自动恢复，不用重勾
       S.watching = new Set(r.chats || []);
+      S.watchDirty = false;
       toast('已恢复上次的 ' + S.watching.size + ' 个会话');
     } else {
       S.watching = new Set();
+      S.watchDirty = false;
     }
     await refreshAccountLabel();
     await doLoadChats();
@@ -419,6 +482,7 @@ async function doLoadChats() {
 }
 
 $('#btnPickAccount').addEventListener('click', pickAccount);
+if ($('#btnSaveWatch')) $('#btnSaveWatch').addEventListener('click', saveWatch);
 $('#btnLoadChats').addEventListener('click', doLoadChats);
 document.addEventListener('click', (e) => {
   const rn = e.target.closest('[data-rename]');
@@ -1073,6 +1137,9 @@ $('#btnMemNext').addEventListener('click', () => {
  */
 
 S.facts = { offset: 0, total: 0, status: '' };
+S.chatTab = '';        // 当前选中的会话分组
+S.watchDirty = false;  // 监听列表有没有未保存的改动
+S.accountList = [];    // 上次拉到的账号列表（改名用）
 
 async function loadMemoryHealth() {
   if (!S.bridge || !S.bridge.memory_health) return;

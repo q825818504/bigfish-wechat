@@ -774,6 +774,76 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   overflow-wrap: anywhere;
 }
 
+/* ══ 会话分组板块 ══
+   横向一排小板块，点哪个看哪个。
+   以前是纵向分组标题，联系人 94 个会铺满整屏，
+   想切到群聊得滚过一整屏。 */
+.chat-tabs {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 2px 0 14px;
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: 10px;
+}
+.chat-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-soft);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .15s, color .15s, border-color .15s;
+}
+.chat-tab:hover { background: var(--surface-3); }
+.chat-tab.is-active {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.chat-tab-count {
+  font: 11px var(--mono-font);
+  padding: 1px 7px;
+  border-radius: 20px;
+  background: var(--surface-3);
+}
+.chat-tab.is-active .chat-tab-count {
+  background: rgba(255, 255, 255, .55);
+}
+.chat-tab-picked {
+  font: 10px var(--mono-font);
+  padding: 1px 6px;
+  border-radius: 20px;
+  background: var(--ok);
+  color: #fff;
+}
+
+/* ══ 保存条 ══
+   以前每次点击就静默写盘，用户看不到任何"已保存"的确认，
+   以为根本没保存。现在改动只进内存，点保存才落盘。 */
+.watch-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  margin-top: 16px;
+}
+.watch-bar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.watch-bar-count {
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
 /* ══ 会话分组 ══
    公众号（实测 147 个）跟联系人（21 个）混在一起时，
    想找个人要翻半天。分组标题用弱化色，不抢会话本身。 */
@@ -1263,6 +1333,7 @@ button:focus-visible, input:focus-visible, a:focus-visible {
 }
 .hint-line.is-ok { color: var(--ok); }
 .hint-line.is-err { color: var(--error); }
+.hint-line.is-warn { color: var(--accent-text); font-weight: 600; }
 
 /* ══ 鲸落卡片：整站唯一一处"危险"视觉 ══
    不喧哗，但一眼能看出它跟别的卡片不是一回事 */

@@ -220,12 +220,23 @@
             <h2>微信会话</h2>
             <span class="tag" id="chatCount">0 个</span>
           </div>
+          <div class="chat-tabs" id="chatTabs"></div>
           <div class="chat-list" id="chatList">
             <div class="empty">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 6h16v10H8l-4 4V6z"/></svg>
               <h3>还没有加载会话</h3>
               <p>点右上角「加载会话」，从你的微信里读取列表</p>
             </div>
+          </div>
+        </div>
+
+        <div class="card watch-bar">
+          <div class="watch-bar-inner">
+            <div>
+              <div class="watch-bar-count" id="watchCount">0 个</div>
+              <div class="hint-line" id="watchHint">还没有选择要监听的会话</div>
+            </div>
+            <button class="btn btn-sm" id="btnSaveWatch" disabled>已保存</button>
           </div>
         </div>
 

@@ -951,10 +951,36 @@ class Backend(QObject):
                 pass
             self._reader = None
 
+            t0 = time.time()
             r = WeChatReader(account=acc).open()
+
+            # ⚠ 关键校验：WeChatDB 在"指定账号解不开"时会自己切到别的账号。
+            #   这里必须确认**实际打开的**就是用户选的那个，否则：
+            #     · 界面显示的是他选的号
+            #     · 数据其实来自另一个号
+            #     · 而且他完全不知道
+            #   这种错位比"打不开"严重得多，所以宁可明确失败。
+            actual = getattr(r._db, "account", "") or ""
+            if actual and actual != acc:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                self._reader = None
+                return json.dumps({
+                    "ok": False,
+                    "error": (
+                        "你选的账号解不开（可能未登录 / 数据库损坏 / "
+                        "微信刚更新）。驱动层自动换到了「%s」，"
+                        "为避免看到别人的聊天记录，这里直接停止。" % actual
+                    ),
+                    "switched_to": actual,
+                }, ensure_ascii=False)
+
             info = r.self_info()
             self.account = info.get("nick_name") or acc
             self._reader = r
+            cost = time.time() - t0
 
             # 记住选择 + 缓存昵称 + **恢复这个号上次的监听配置**
             c = load_json_config()
@@ -979,9 +1005,12 @@ class Backend(QObject):
                 "ok": True,
                 "account": acc,
                 "nick": self.account,
+                "nickSource": info.get("nick_source", ""),
                 "wxid": getattr(r._db, "wxid", ""),
                 "chats": restored,
                 "restored": bool(restored),
+                "costMs": int(cost * 1000),
+                "unkeyed": len(getattr(r._db, "unkeyed", []) or []),
             }, ensure_ascii=False)
         except Exception as exc:
             self._reader = None
