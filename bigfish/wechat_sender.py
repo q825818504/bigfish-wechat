@@ -538,15 +538,20 @@ class UiaSender:
             time.sleep(1.2)
 
             # ── 阶段 ④：这时候才验证 ──
-            changed, _after = self._wait_input_area_change(
+            changed, after = self._wait_input_area_change(
                 gui, box, before, wait=2.5)
 
             if changed or self._value_has_object(edit):
+                ratio = after[0] if after else 0.0
+                self._warn(f"草稿已进输入框（彩色占比 {ratio:.1%}）")
                 self._real_enter(gui)
                 return True
 
+            ratio = after[0] if after else 0.0
             self._warn(
-                f"第 {n + 1} 次粘贴后输入框没变化，重试")
+                f"第 {n + 1} 次粘贴后输入框没变化"
+                f"（彩色占比 {ratio:.1%}，阈值 "
+                f"{self.DRAFT_COLOR_RATIO:.0%}），重试")
 
         self._warn(
             f"粘贴 {attempts} 次都没让输入框发生变化，判定失败："
@@ -655,14 +660,32 @@ class UiaSender:
 
     @staticmethod
     def _input_region_signature(gui, box):
-        """给输入框拍个"指纹"，用来比前后。
+        """给输入框拍个"指纹"，返回 (彩色占比, 灰度缩略图)。
 
-        只看输入框**本体**，不往上看。早先 vendor 那个判据扫的是
-        输入框上方 150px，那个位置是消息区底部 —— 上一条消息气泡就在
-        那儿，于是恒报"有草稿"。这里刻意把小一圈：
-        (x0+4, y0+4, x1-4, y1-4)。
+        ═══════════════════════════════════════════════════════════════
+        为什么要拍两样东西
+        ═══════════════════════════════════════════════════════════════
 
-        没有 gui/box 时返回 None —— 调用方退回到只看 Value。
+        2026-11-02 实测过两种判据，都栽过：
+
+        ① 灰度图逐像素差（旧方案）
+           输入框只有 88px 高，再各切 4px 只剩 80。缩略图放进去后
+           缩成 48×16，差值被平均稀释 —— 实测 **5.9**，而阈值是 6。
+           只差 0.1 就误判成"没进去"。用户贴的截图里草稿明明在。
+
+        ② 只看输入框上方 150px 的彩色像素（vendor 那个）
+           那个位置是消息区底部，上一条消息气泡就在那儿 → 恒报 True。
+
+        现在两条都留，但主判据换成**彩色占比**：
+
+            空输入框   纯白/纯灰，彩色占比 ≈ 0%
+            有缩略图   黄色/彩色一片 → 明显 > 2%
+
+        它不依赖缩放、不被平均稀释，阈值 2% 留了很大余量。
+        灰度图留着只为打日志（人看着方便），不参与判定。
+
+        区域仍然只看输入框**本体** (x0+4, y0+4, x1-4, y1-4)，
+        不往上看 —— 那是消息区，是噪音源。
         """
         if gui is None or not box:
             return None
@@ -671,34 +694,53 @@ class UiaSender:
             if x1 - x0 < 16 or y1 - y0 < 16:
                 return None
             rel = (x0 + 4, y0 + 4, x1 - 4, y1 - 4)
-            shot = gui._grab_screen(gui._rel_to_screen(rel))
-            return shot.convert("L").resize((48, 16))
+            shot = gui._grab_screen(gui._rel_to_screen(rel)).convert("RGB")
+
+            # 彩色占比：抽样算，每 4 像素取一个，够准也够快
+            total = 0
+            colored = 0
+            px = shot.load()
+            w, h = shot.size
+            for yy in range(0, h, 4):
+                for xx in range(0, w, 4):
+                    r, g, b = px[xx, yy]
+                    total += 1
+                    if (abs(r - g) > 24 or abs(g - b) > 24
+                            or abs(r - b) > 24):
+                        colored += 1
+            ratio = (colored / total) if total else 0.0
+
+            return (ratio, shot.convert("L").resize((48, 16)))
         except Exception:
             return None
 
-    @staticmethod
-    def _wait_input_area_change(gui, box, before, wait: float = 3.0):
-        """轮询输入框区域，返回 (是否变了, 最新指纹)。"""
+    #: 彩色像素占比超过这个值，就认定输入框里有附件草稿。
+    #:
+    #: 定 2% 的理由：空输入框里的占位文字是灰色（abs 差 < 24 不算彩色），
+    #: 实测占比 0%；有缩略图时是一大片色块，实测远超 10%。
+    #: 留两个数量级的余量，不会被边缘情况顶到线上。
+    DRAFT_COLOR_RATIO = 0.02
+
+    @classmethod
+    def _wait_input_area_change(cls, gui, box, before, wait: float = 3.0):
+        """轮询输入框，返回 (是否进了东西, 最新指纹)。
+
+        `before` 是粘贴前拍的指纹，可以是 None（拿不到输入框坐标时）——
+        那种情况返回 (False, None)，调用方退回到只看 Value。
+        """
         if before is None:
             return False, None
         deadline = time.time() + wait
         last = None
         while time.time() < deadline:
             time.sleep(0.3)
-            now = UiaSender._input_region_signature(gui, box)
+            now = cls._input_region_signature(gui, box)
             if now is None:
                 return False, None
             last = now
-            # 逐像素平均差。阈值 6 是试出来的：
-            # 同一个静止画面重拍两次的差约 0~2，真进了缩略图是 30+。
-            try:
-                a = list(before.getdata())
-                b = list(now.getdata())
-                diff = sum(abs(x - y) for x, y in zip(a, b)) / max(1, len(a))
-                if diff > 6.0:
-                    return True, now
-            except Exception:
-                return False, None
+            ratio, _gray = now
+            if ratio >= cls.DRAFT_COLOR_RATIO:
+                return True, now
         return False, last
 
     @staticmethod
