@@ -497,12 +497,29 @@ class UiaSender:
             time.sleep(0.3)
 
             # 聚焦。真实按键吃焦点，必须在写剪贴板之前点好。
-            if gui is not None and box:
-                try:
-                    gui.focus_input(box)
-                except Exception as exc:
-                    self._warn(f"聚焦失败：{exc}")
-            time.sleep(0.2)
+            #
+            # ═══════════════════════════════════════════════════════════
+            # 三层聚焦，全都要做
+            # ═══════════════════════════════════════════════════════════
+            #
+            # 2026-11-03 实测：剪贴板完全正确（用户拿脚本写的那份手动
+            # Ctrl+V 能贴进去、能发出去、收到的是表情），但脚本自己按
+            # Ctrl+V 时输入框彩色占比 0.0%。所以问题在"按键没送到"。
+            #
+            # 三个层次，缺一层都可能失败：
+            #
+            #   ① 窗口前台      gui.ensure_visible()
+            #      —— 微信不在前台，按键会打到别的窗口
+            #   ② UIA 控件聚焦  edit.SetFocus()
+            #      —— UIA 层的"这是焦点控件"，不受 WS_EX_TRANSPARENT 影响
+            #   ③ 系统键盘焦点  gui.focus_input(box)（真实鼠标点击）
+            #      —— keybd_event 只认系统键盘焦点，这一层必须靠点击
+            #
+            # 以前只做了 ③。而 vendor 的 wx_click 为了穿透
+            # WS_EX_TRANSPARENT 会临时改窗口样式再改回去，时序上可能
+            # 让点击落空 —— ② 就是为这种情况兜底的。
+            self._focus_input_hard(edit, gui, box)
+            time.sleep(0.25)
 
             # 基准指纹 —— 最后一次截图，之后到粘贴完成前不再截。
             # ⚠ 必须传 box：早先这里漏传，直接
@@ -524,6 +541,37 @@ class UiaSender:
             #   一个像素都不变 —— 我为此查了四轮都查错了方向。
             if not self._write_clipboard_files(path):
                 return False
+
+            # ── 阶段 ②b：写完之后的两项体检 ──
+            #
+            # 1) 剪贴板里到底有没有那张图
+            #    Set-Clipboard 返回 0 不等于写进去了（路径带中文/空格时
+            #    可能写了个不存在的路径）。必须读回来验。
+            # 2) 前台窗口还是不是微信
+            #    起 powershell 会抢焦点，哪怕加了 CREATE_NO_WINDOW。
+            #    Ctrl+V 打错窗口的话，表现就是"输入框 0.0%"。
+            got = self._clipboard_files()
+            if not got:
+                self._warn(
+                    f"写完剪贴板但读回来是空的（{os.path.basename(path)}），"
+                    f"下面这次粘贴注定失败")
+            elif os.path.normcase(got[0]) != os.path.normcase(
+                    os.path.abspath(path)):
+                self._warn(f"剪贴板里是别的文件：{got[0]}")
+
+            front = self._foreground_title()
+            if not self._is_wechat_title(front):
+                self._warn(f"写剪贴板之后前台变成了 {front!r}，"
+                           f"重新把微信提到前面")
+                try:
+                    if gui is not None:
+                        gui.ensure_visible()
+                        time.sleep(0.4)
+                        if box:
+                            gui.focus_input(box)
+                            time.sleep(0.2)
+                except Exception as exc:
+                    self._warn(f"重新聚焦失败：{exc}")
 
             # ── 阶段 ③：立刻粘贴。这一段里**不许有任何截图或探测** ──
             try:
@@ -557,6 +605,174 @@ class UiaSender:
             f"粘贴 {attempts} 次都没让输入框发生变化，判定失败："
             f"{os.path.basename(path)}")
         return False
+
+    # ── 聚焦：三层一起上 ───────────────────────────────────────────
+
+    def _focus_input_hard(self, edit, gui, box) -> bool:
+        """把键盘焦点真正送进输入框。返回是否确认焦点在微信里。
+
+        为什么不是只调一个方法：`keybd_event` 发的按键只认**系统键盘焦点**。
+        而"微信是前台窗口"不等于"输入框有键盘焦点" ——
+        窗口在前台，焦点可能在标题栏、可能是上一个控件。
+
+        三层按顺序做，每层都验：
+
+            ① ensure_visible  微信不在前台就拉回前台
+            ② SetFocus        UIA 层面指定焦点控件（不吃鼠标，最可靠）
+            ③ focus_input     真实坐标点击（系统焦点只有它给得了）
+
+        任何一层失败都继续做下一层 —— 它们各自管一段，不是互斥的。
+        """
+        ok = True
+
+        # ① 前台
+        if gui is not None:
+            try:
+                gui.ensure_visible()
+            except Exception as exc:
+                self._warn(f"ensure_visible 失败：{exc}")
+                ok = False
+        time.sleep(0.2)
+
+        # ② UIA 控件聚焦 —— 这一步不依赖坐标，也不受
+        #    WS_EX_TRANSPARENT 影响，是三个里最稳的
+        try:
+            edit.SetFocus()
+        except Exception as exc:
+            self._warn(f"edit.SetFocus 失败：{exc}")
+            ok = False
+        time.sleep(0.15)
+
+        # ③ 真实点击 —— keybd_event 需要的系统键盘焦点只能靠它
+        if gui is not None and box:
+            try:
+                gui.focus_input(box)
+            except Exception as exc:
+                self._warn(f"focus_input 失败：{exc}")
+                ok = False
+
+            # 验一下：键盘焦点窗口是不是微信
+            try:
+                info = self._focus_info()
+                self._warn(f"聚焦后 {info}")
+                fg = self._foreground_title()
+                if not self._is_wechat_title(fg):
+                    self._warn(f"前台不是微信（{fg!r}），按键大概率打空")
+                    ok = False
+            except Exception:
+                pass
+
+            return ok
+
+    # ── 剪贴板：读回与前台检查 ─────────────────────────────────────
+
+    @staticmethod
+    def _clipboard_files() -> list:
+        """读回剪贴板里的文件路径列表。读不到返回空列表。
+
+        只读，不改。用来验证 Set-Clipboard 是否真的写进去了 ——
+        它返回 0 只能说明命令执行完了，不能说明内容对。
+        """
+        try:
+            import win32clipboard
+            import win32con
+
+            win32clipboard.OpenClipboard()
+            try:
+                if win32clipboard.IsClipboardFormatAvailable(
+                        win32con.CF_HDROP):
+                    return list(win32clipboard.GetClipboardData(
+                        win32con.CF_HDROP) or [])
+                return []
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            return []
+
+    @staticmethod
+    def _focus_info() -> str:
+        """当前键盘焦点在哪。
+
+        这是判断"按键会不会打空"的唯一直接证据：
+        前台窗口是微信，但键盘焦点可能还在别处（上一个控件、
+        或者别的线程的窗口），keybd_event 会跟着焦点走。
+
+        用 GetGUIThreadInfo 拿真实焦点 —— 它比 GetFocus 可靠，
+        GetFocus 只对调用线程的窗口有效，跨进程永远是 NULL。
+        """
+        try:
+            import ctypes
+
+            class GUITHREADINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", ctypes.c_uint32),
+                    ("flags", ctypes.c_uint32),
+                    ("hwndActive", ctypes.c_void_p),
+                    ("hwndFocus", ctypes.c_void_p),
+                    ("hwndCapture", ctypes.c_void_p),
+                    ("hwndMenuOwner", ctypes.c_void_p),
+                    ("hwndMoveSize", ctypes.c_void_p),
+                    ("hwndCaret", ctypes.c_void_p),
+                    ("rcCaret", ctypes.c_long * 4),
+                ]
+
+            u = ctypes.windll.user32
+            u.GetForegroundWindow.restype = ctypes.c_void_p
+            u.GetWindowThreadProcessId.restype = ctypes.c_uint32
+            u.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p,
+                                                   ctypes.POINTER(ctypes.c_uint32)]
+
+            fg = u.GetForegroundWindow()
+            if not fg:
+                return "没有前台窗口"
+
+            tid = u.GetWindowThreadProcessId(fg, None)
+            gi = GUITHREADINFO()
+            gi.cbSize = ctypes.sizeof(GUITHREADINFO)
+            if not u.GetGUIThreadInfo(tid, ctypes.byref(gi)):
+                return f"GetGUIThreadInfo 失败（fg={fg}）"
+
+            def title(h):
+                if not h:
+                    return "<无>"
+                n = u.GetWindowTextLengthW(h)
+                b = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(h, b, n + 1)
+                return b.value or f"<空 h={h}>"
+
+            return (f"前台={title(gi.hwndActive)!r} "
+                    f"焦点={title(gi.hwndFocus)!r}")
+        except Exception as exc:
+            return f"<读不到：{exc}>"
+
+    @staticmethod
+    def _foreground_title() -> str:
+        """当前前台窗口标题。用来确认按键会打到谁。"""
+        try:
+            import ctypes
+
+            u = ctypes.windll.user32
+            hwnd = u.GetForegroundWindow()
+            n = u.GetWindowTextLengthW(hwnd)
+            buf = ctypes.create_unicode_buffer(n + 1)
+            u.GetWindowTextW(hwnd, buf, n + 1)
+            return buf.value or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_wechat_title(title: str) -> bool:
+        """前台是不是微信。
+
+        标题可能是「微信」「Weixin」「微信(3)」之类，用包含匹配。
+        空标题当作"不知道"，返回 True —— 没有探测能力不等于出错，
+        不要因为读不到标题就中断发送。
+        """
+        t = (title or "").strip()
+        if not t:
+            return True
+        low = t.lower()
+        return ("微信" in t) or ("wechat" in low) or ("weixin" in low)
 
     # ── 写剪贴板 ────────────────────────────────────────────────────
 
