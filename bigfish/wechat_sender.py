@@ -457,10 +457,26 @@ class UiaSender:
         except Exception as exc:
             raise SendError(f"加载粘贴工具失败: {exc}", kind="import") from exc
 
-        if not WeChatGUI.copy_files_to_clipboard([os.path.abspath(path)]):
-            self._warn("写剪贴板失败（CF_HDROP 没进去）")
-            return False
-        time.sleep(0.3)
+        # ═══════════════════════════════════════════════════════════════
+        # 顺序是这段代码的全部要点
+        # ═══════════════════════════════════════════════════════════════
+        #
+        # 踩过的坑（2026-11-02，用户手动验证出来的）：
+        #   用户手动复制 GIF → 贴进微信 → 成了。
+        #   我这边同样的剪贴板格式（CF_HDROP）→ 什么都没进去。
+        #
+        #   用户后来确认：**截图会吃掉剪贴板**。
+        #   而我原来的流程是：
+        #       写剪贴板 → 截基准图 → get_input_box（截图）
+        #       → 聚焦（截图）→ Ctrl+V        ← 这时剪贴板早就空了
+        #
+        #   所以正确的顺序是：
+        #       ① 先把该截的图都截完（基准指纹）
+        #       ② 再写剪贴板
+        #       ③ **立刻** Ctrl+V，中间一个截图动作都没有
+        #       ④ 粘贴完成之后才去验证
+        #
+        #   基准指纹一定要在写剪贴板**之前**拍好。
 
         gui = None
         box = None
@@ -470,71 +486,60 @@ class UiaSender:
         except Exception as exc:
             self._warn(f"拿不到输入框坐标，区域变化判据不可用：{exc}")
 
+        # ── 阶段 ①：写剪贴板之前的准备 ──
+        # 清空用控件级 SendKeys：纯文本操作，控件自己处理，不需要系统队列。
         for n in range(max(1, attempts)):
+            try:
+                edit.SendKeys("{Ctrl}a{Delete}", waitTime=0.1)
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+            # 聚焦。真实按键吃焦点，必须在写剪贴板之前点好。
+            if gui is not None and box:
+                try:
+                    gui.focus_input(box)
+                except Exception as exc:
+                    self._warn(f"聚焦失败：{exc}")
+            time.sleep(0.2)
+
+            # 基准指纹 —— 最后一次截图，之后到粘贴完成前不再截。
             before = self._input_region_signature(gui, box)
 
-            # 清空。这里仍然用控件级 SendKeys —— 清空是纯文本操作，
-            # 控件自己处理，不需要走系统队列。
-            edit.SendKeys("{Ctrl}a{Delete}", waitTime=0.1)
-            time.sleep(0.35)      # 别急着粘：Delete 可能晚到，把刚粘的删掉
-            self._restore_clipboard_files(path)
+            # ── 阶段 ②：写剪贴板 ──
+            if not WeChatGUI.copy_files_to_clipboard([os.path.abspath(path)]):
+                self._warn("写剪贴板失败（CF_HDROP 没进去）")
+                return False
 
-            # ═══ 关键：用**真实键盘事件**粘贴 ═══
-            #
-            #   edit.SendKeys("{Ctrl}v") 是控件级投递，对文本有效、对文件无效。
-            #   实测（2026-11-02）：同一张 GIF，用户手动 Ctrl+V 能贴进输入框，
-            #   而 SendKeys 投递的 Ctrl+V 什么都不发生 —— 输入框前后像素
-            #   一个都没变，截图里也是空的。
-            #
-            #   差别在消息从哪个队列进：SendKeys 直接写进那个 Edit 控件，
-            #   微信的 Qt 主循环根本不参与；文件是「把文件对象放进输入框」
-            #   这种富操作，得由主循环自己处理，控件级消息会被直接忽略。
-            #
-            #   WinInput.key 走 keybd_event，进的是系统输入队列，和人手一样。
-            if not self._real_paste(gui, box):
-                self._warn("真实 Ctrl+V 投递失败（拿不到键盘输入器）")
+            # ── 阶段 ③：立刻粘贴。这一段里**不许有任何截图或探测** ──
+            try:
+                from wechatauto.guia import WinInput
 
-            changed, after = self._wait_input_area_change(
-                gui, box, before, wait=3.0)
+                WinInput().key(0x56, ctrl=True)     # VK_V
+            except Exception as exc:
+                self._warn(f"真实 Ctrl+V 失败：{exc}")
+                return False
+
+            # 给微信时间把文件读进来。这里的 sleep 不截图，是安全的。
+            time.sleep(1.2)
+
+            # ── 阶段 ④：这时候才验证 ──
+            changed, _after = self._wait_input_area_change(
+                gui, box, before, wait=2.5)
 
             if changed or self._value_has_object(edit):
-                # 回车也走真实键盘 —— 同一个理由，控件级回车对附件无效。
                 self._real_enter(gui)
                 return True
 
-            if n < attempts - 1:
-                try:
-                    if box:
-                        gui.focus_input(box)
-                except Exception:
-                    pass
-                time.sleep(0.4)
+            self._warn(
+                f"第 {n + 1} 次粘贴后输入框没变化，重试")
 
         self._warn(
-            f"粘贴三次都没让输入框发生变化，判定失败：{os.path.basename(path)}")
+            f"粘贴 {attempts} 次都没让输入框发生变化，判定失败："
+            f"{os.path.basename(path)}")
         return False
 
     # ── 真实键盘 ────────────────────────────────────────────────────
-
-    def _real_paste(self, gui, box) -> bool:
-        """把焦点点进输入框，然后发真实的 Ctrl+V。
-
-        为什么要先点：keybd_event 发的是**全局**按键，谁有焦点谁收。
-        控件级 SendKeys 不受焦点影响，真实按键受影响 —— 这是换路线
-        必须补上的一步，否则按键会打到最后活跃的那个窗口里去。
-        """
-        try:
-            if gui is not None and box:
-                gui.focus_input(box)
-                time.sleep(0.25)
-            from wechatauto.guia import WinInput
-
-            WinInput().key(0x56, ctrl=True)     # VK_V
-            time.sleep(0.5)
-            return True
-        except Exception as exc:
-            self._warn(f"真实 Ctrl+V 失败：{exc}")
-            return False
 
     def _real_enter(self, gui) -> bool:
         """真实回车。附件提交同样需要走系统输入队列。"""
@@ -602,21 +607,6 @@ class UiaSender:
             return False
         return bool(v and "\ufffc" in v)
 
-    def _restore_clipboard_files(self, path: str) -> None:
-        """重写一次剪贴板。
-
-        为什么每次粘贴前都要重写：粘贴一次之后剪贴板内容可能被消费掉
-        （尤其是重试的第二、三次），不重写的话后面几次 Ctrl+V 什么都没有。
-        """
-        try:
-            from wechatauto.guia import WeChatGUI
-
-            WeChatGUI.copy_files_to_clipboard([os.path.abspath(path)])
-            time.sleep(0.15)
-        except Exception:
-            pass
-
-    @staticmethod
     def _warn(msg: str) -> None:
         """把警告同时写到 wechatauto 的日志和标准错误。
 

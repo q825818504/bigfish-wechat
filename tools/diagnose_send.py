@@ -209,7 +209,9 @@ def main() -> int:
         print(f"  最近三条：{before}")
 
         # ══════════════════════════════════════════════════
-        print("\n── 步骤 1：粘贴 ──")
+        print("\n── 步骤 1：对照基线 —— 旧流程（写完剪贴板又截图，再贴）──")
+        print("   这就是一直失败的那个顺序，留作对照：")
+        print("   写剪贴板 → 截图 → Ctrl+V，中间那次截图把剪贴板吃了。")
         from wechatauto.guia import WeChatGUI
 
         ok = WeChatGUI.copy_files_to_clipboard([gif])
@@ -220,10 +222,14 @@ def main() -> int:
         time.sleep(0.2)
         edit.SendKeys("{Ctrl}a{Delete}", waitTime=0.1)
         time.sleep(0.2)
+        # 这里就是 bug 本身：写完之后又截了一次图
+        b0 = box()
+        if b0:
+            sig(gui, b0)
         edit.SendKeys("{Ctrl}v", waitTime=0.1)
         time.sleep(1.5)
 
-        show("控件级 SendKeys 粘贴后 Value", val())
+        show("旧流程粘贴后 Value", val())
         b = box()
         print(f"  输入框矩形: {b}")
         if b:
@@ -237,26 +243,32 @@ def main() -> int:
         snap(gui, "1-控件级粘贴", outdir)
 
         # ══════════════════════════════════════════════════
-        print("\n── 步骤 2：真实键盘 Ctrl+V（keybd_event，走系统输入队列）──")
-        print("   已知：控件级 SendKeys 对文件无效，人手 Ctrl+V 有效。")
-        print("   差别在消息从哪个队列进 —— 这一步验证换队列是否就够了。")
+        print("\n── 步骤 2：换正确顺序 —— 先备齐、再写剪贴板、立刻贴 ──")
+        print("   用户确认过：**截图会吃掉剪贴板**。")
+        print("   所以写剪贴板之后到 Ctrl+V 之间，一个截图动作都不能有。")
 
         from wechatauto.guia import WinInput
 
         b = box()
-        before_sig = sig(gui, b)
+        # ① 先把该截的、该探的全部做完
         if b:
             try:
-                gui.focus_input(b)          # 真实按键吃焦点，必须先点进输入框
-                time.sleep(0.25)
+                gui.focus_input(b)
             except Exception as exc:
                 print(f"     聚焦失败：{exc}")
-        WeChatGUI.copy_files_to_clipboard([gif])   # 重新写一次，保险
-        time.sleep(0.2)
-        WinInput().key(0x56, ctrl=True)             # VK_V
-        time.sleep(1.5)
+        time.sleep(0.35)
+        before_sig = sig(gui, b)          # 最后一次截图
+        time.sleep(0.15)
 
-        show("真实 Ctrl+V 后 Value", val())
+        # ② 写剪贴板
+        WeChatGUI.copy_files_to_clipboard([gif])
+
+        # ③ 立刻 Ctrl+V —— 中间零截图
+        WinInput().key(0x56, ctrl=True)
+        time.sleep(1.2)
+
+        # ④ 这时候才验证
+        show("正确顺序粘贴后 Value", val())
         after_sig = sig(gui, b)
         print(f"  输入框区域变化：{sig_diff(before_sig, after_sig):.1f}"
               f"（>6 表示进了东西）")
@@ -266,7 +278,7 @@ def main() -> int:
                 print(f"  深色像素有字 : {gui._input_box_has_text(b)}")
             except Exception:
                 pass
-        snap(gui, "2-真实粘贴", outdir)
+        snap(gui, "2-正确顺序粘贴", outdir)
 
         # ══════════════════════════════════════════════════
         print("\n── 步骤 3：真实回车发送 ──")
