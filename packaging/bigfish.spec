@@ -76,6 +76,13 @@ hiddenimports = [
     # 局部 import 之外的动态情况，显式列出最稳 —— 漏了它，打包版会在
     # 第一次写记忆时抛 ImportError，而不是启动时。
     "bigfish.memory",
+    # 插件系统：和 memory 同一个理由 —— 只在 build_prompt / handle 里
+    # `from bigfish import plugins`。漏了它，程序照常启动、界面照常打开，
+    # 只有真正聊天时才 ImportError。实测当前版本 PyInstaller 能分析到，
+    # 但这里显式列出，别赌分析器的行为。
+    "bigfish.plugins",
+    "bigfish.plugins.guard",
+    "bigfish.plugins.clock",
     "wechatauto",
     "wechatauto.db",
     "wechatauto.uia_driver",

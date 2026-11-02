@@ -24,6 +24,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
 for _s in (sys.stdout, sys.stderr):
     if _s is not None:
@@ -157,6 +158,28 @@ class BigFishApp:
             sys_parts.append("\n## 这会儿的状态\n\n"
                              f"- 心情：{ctx.mood.label}"
                              f"（{ctx.mood.value:.0f}/100）")
+
+        # 插件段按身份序并入（与 desktop.py 同一套：灵魂 860 / 心情 900 /
+        # 生活 870 / 守卫 9990）。两个入口必须一致 —— 否则同一句话在
+        # 命令行跑和在 EXE 里跑，她会用不同的语气回。
+        try:
+            from bigfish import plugins as _P
+
+            _sections = [(860, sys_parts[0])]
+            _sections += [(900, t) for t in sys_parts[1:]]
+            for _order, _title, _text in _P.prompt_sections({
+                "now": datetime.now(),
+                "channel": "group" if msg.chat_id.endswith("@chatroom") else "private",
+                "chat_name": msg.chat_name,
+                "sender_name": msg.sender_name,
+                "user_text": text,
+                "soul": self.soul,
+            }):
+                _sections.append((_order, _text))
+            _sections.sort(key=lambda item: item[0])
+            sys_parts = [t for _o, t in _sections]
+        except Exception as exc:
+            self.log(f"[插件] 注入失败：{exc}")
 
         user_parts = []
         # 原文检索：她「听过什么」。

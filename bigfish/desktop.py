@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 import traceback
+from datetime import datetime
 
 
 def _safe_reconfigure_stdout() -> None:
@@ -427,6 +428,19 @@ class EngineWorker(QThread):
         self.owner_id = owner_id          # 供 _reflect_async 等后台线程使用
         if owner_id:
             self._log(f"主人：{owner_raw}（记忆可看 private）", "")
+            # 顺手把主人登记进 owners 表。
+            # 不登记的话，第一次启动时 owner 表是空的，注入时按 guest 算 ——
+            # 主人自己反而看不到自己的私密。这个 bug 很隐蔽：
+            # 界面上"已绑定"看着好好的，实际她对你一个字都不多说。
+            try:
+                from bigfish import memory as _M1, vault as _V1
+                _db = _V1.memory_db_path()
+                if _db:
+                    _M1.ensure_schema(_db)
+                    _M1.ensure_owner(_db, "dafeiyu", owner_id,
+                                     tier=_M1.TIER_OWNER)
+            except Exception as exc:
+                self._log(f"[警告] 主人登记失败：{exc}", "err")
         else:
             self._log("[警告] 没配置主人，所有人一律按陌生处理（只看 shared）", "err")
 
@@ -611,12 +625,62 @@ class EngineWorker(QThread):
             self._log(f"[收] {msg.chat_name}：{msg.preview(50)}", "in")
             self.chat_event.emit(msg.chat_name, msg.preview(60), "in")
 
+            # ── 插件判定（gate 类）：该不该回 ──
+            #
+            # 放在这里而不是更早：此时 body 已确定（群里已剥掉 @）、hist 已入列，
+            # 判定插件能拿到完整上下文；而"收"已经记过账 —— 她确实收到了，
+            # 只是选择不说。这两种事在日志里必须分得开。
+            try:
+                from bigfish import plugins as _P
+
+                _silent, _why = _P.apply_gates({
+                    "now": datetime.now(),
+                    "channel": "group" if is_group else "private",
+                    "chat_name": msg.chat_name,
+                    "sender_name": msg.sender_name,
+                    "user_text": body or "",
+                    "history": list(hist),
+                    "soul": self.soul,
+                })
+            except Exception as _exc:
+                _silent, _why = False, ""
+                self._log(f"[插件] 判定失败：{_exc}", "err")
+            if _silent:
+                self._log(f"[静默] {msg.chat_name}：{_why}", "think")
+                return
+
             # ---- 组装上下文 ----
             ctx = load_context(query=body or "")
-            sys_parts = [ctx.persona or self.soul.render_persona()]
+
+            # system 段按**身份序**排：内建段（灵魂 860 / 心情 900）与
+            # 插件段（生活 870 / 目标 880 / 关系 920 / 守卫 9990）一起排序。
+            #
+            # 为什么不直接 append：插件有自己的座位，顺序决定语气。
+            # 守卫必须最后出现（越靠后越有分量），时间感知要在心情之前
+            # （"现在几点"是处境，"此刻怎样"是气氛，处境先立住）。
+            # 详见 bigfish/plugins/__init__.py 的 BUILTIN_SEATS / PLUGIN_SEATS。
+            _sections = [(860, ctx.persona or self.soul.render_persona())]
             if ctx.mood and ctx.mood.injected_text.strip():
-                sys_parts.append("\n## 这会儿的状态\n\n"
-                                 + ctx.mood.injected_text.strip())
+                _sections.append((900, "\n## 这会儿的状态\n\n"
+                                       + ctx.mood.injected_text.strip()))
+            try:
+                from bigfish import plugins as _P
+
+                for _order, _title, _text in _P.prompt_sections({
+                    "now": datetime.now(),
+                    "channel": "group" if is_group else "private",
+                    "chat_name": msg.chat_name,
+                    "sender_name": msg.sender_name,
+                    "user_text": body or "",
+                    "soul": self.soul,
+                }):
+                    _sections.append((_order, _text))
+            except Exception as _exc:
+                # 插件系统坏了不该让她失语
+                self._log(f"[插件] 注入失败：{_exc}", "err")
+
+            _sections.sort(key=lambda item: item[0])
+            sys_parts = [text for _o, text in _sections]
 
             user_parts = []
             mem = ctx.render_memory()
@@ -1164,6 +1228,87 @@ class Backend(QObject):
             return json.dumps({"ok": True}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── 插件（她由哪些部分拼起来） ──
+    #
+    # 开关与参数都写 <数据根>/plugins.json，跟着数据目录搬家。
+    # 改完立刻生效：每轮对话现拼 prompt 时现查开关，没有常驻注册要注销。
+    # 开关只有用户能改 —— 不注册任何让模型改它的工具。
+
+    @Slot(result=str)
+    def list_plugins(self) -> str:
+        """插件清单（含未启用的）。界面据此渲染卡片与开关。"""
+        try:
+            from bigfish import plugins
+
+            return json.dumps(plugins.inventory(), ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def set_plugin_enabled(self, payload: str) -> str:
+        """{"id": "clock", "enabled": false}"""
+        try:
+            from bigfish import plugins
+
+            data = json.loads(payload or "{}")
+            pid = str(data.get("id") or "").strip()
+            if not pid:
+                return json.dumps({"ok": False, "error": "缺少插件 id"},
+                                  ensure_ascii=False)
+            ok, err = plugins.set_enabled(pid, bool(data.get("enabled")))
+            if not ok:
+                return json.dumps({"ok": False, "error": err},
+                                  ensure_ascii=False)
+            return json.dumps({"ok": True, **plugins.inventory()},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def save_plugin_config(self, payload: str) -> str:
+        """{"id": "clock", "config": {"precision": "day"}}"""
+        try:
+            from bigfish import plugins
+
+            data = json.loads(payload or "{}")
+            pid = str(data.get("id") or "").strip()
+            patch = data.get("config")
+            if not pid or not isinstance(patch, dict):
+                return json.dumps({"ok": False, "error": "缺少 id 或 config"},
+                                  ensure_ascii=False)
+            ok, cfg, err = plugins.set_config(pid, patch)
+            if not ok:
+                return json.dumps({"ok": False, "error": err},
+                                  ensure_ascii=False)
+            return json.dumps({"ok": True, "config": cfg, **plugins.inventory()},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def preview_plugin(self, payload: str) -> str:
+        """{"id": "clock"} → 用当前配置渲染这一轮会注入的原文。
+
+        详情页靠它回答「我改了这个参数，她到底会看到什么」。
+        纯渲染：不写盘、不发消息。
+        """
+        try:
+            from bigfish import plugins
+
+            data = json.loads(payload or "{}")
+            pid = str(data.get("id") or "").strip()
+            if not pid:
+                return json.dumps({"ok": False, "error": "缺少插件 id"},
+                                  ensure_ascii=False)
+            return json.dumps({"ok": True, "text": plugins.preview(pid)},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     # ── 记忆（可读可删可导出） ──
     @Slot(result=str)
@@ -2510,30 +2655,67 @@ def main() -> int:
     return app.exec()
 
 
-def run_selftest() -> int:
-    """在 exe 内部跑自检，输出到控制台。
+def _open_console() -> bool:
+    """把 stdout/stderr 接到父控制台。成功返回 True。"""
+    if not getattr(sys, "frozen", False):
+        return False
+    try:
+        import ctypes
 
-    检查项和 tools/selftest.py 一致，但跑的是**打包后的代码**——
+        if ctypes.windll.kernel32.AttachConsole(-1):   # ATTACH_PARENT_PROCESS
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8",
+                              errors="replace", buffering=1)
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8",
+                              errors="replace", buffering=1)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def run_selftest() -> int:
+    """在 exe 内部跑自检。
+
+    检查项和 tools/selftest.py 一致，但跑的是**打包后的代码** ——
     这才是用户实际会遇到的那份。
 
-    exe 是 console=False 的 GUI 程序，默认没有控制台。
-    从命令行带 --selftest 启动时，主动 AttachConsole 到父进程
-    （cmd/PowerShell），这样输出才能被看到。
+    ⚠ 为什么先收进内存再统一输出：
+    exe 是 console=False 的 GUI 程序，`sys.stdout` 默认是 None，print 被
+    静默丢弃。而 AttachConsole 成功或失败会**中途**改变 stdout ——
+    实测过一次：灵魂/插件/心情/记忆/模型 五项全部凭空消失，输出直接从
+    「微信数据库」开始，统计却写着"通过 12"。看着像自检漏了项，其实只是
+    前五行的 print 掉进了 None。
+    现在整份输出先写进 StringIO，最后一次性交给能用的那个通道。
     """
-    import traceback
+    import contextlib
+    import io
 
-    # GUI 程序附加到父控制台，否则 print 全部丢弃
-    if getattr(sys, "frozen", False):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = _run_selftest_inner()
+    text = buf.getvalue()
+
+    if _open_console():
         try:
-            import ctypes
-            ATTACH_PARENT_PROCESS = -1
-            if ctypes.windll.kernel32.AttachConsole(ATTACH_PARENT_PROCESS):
-                sys.stdout = open("CONOUT$", "w", encoding="utf-8",
-                                  errors="replace", buffering=1)
-                sys.stderr = open("CONOUT$", "w", encoding="utf-8",
-                                  errors="replace", buffering=1)
+            sys.stdout.write(text)
+            sys.stdout.flush()
         except Exception:
             pass
+        return rc
+
+    # 没有控制台：fd 1/2 可能已被父进程重定向到文件（`> log.txt`）
+    for fd in (1, 2):
+        try:
+            os.write(fd, text.encode("utf-8", "replace"))
+            return rc
+        except Exception:
+            continue
+    return rc
+
+
+def _run_selftest_inner() -> int:
+    """自检主体。输出全走 print，由 run_selftest 统一收口。"""
+    import traceback
 
     HR = "=" * 66
     results = []
@@ -2594,6 +2776,31 @@ def run_selftest() -> int:
     print("工厂自检")
     print("-" * 66)
     item("灵魂", t_soul)
+
+    # 1.5 插件（她由哪些部分拼起来）
+    def t_plugins():
+        from bigfish import plugins as P
+
+        # ⚠ 这条专门用来抓「打包漏了 bigfish/plugins」。
+        #   插件只在 build_prompt 里 import —— 漏了的话程序照常启动、
+        #   界面照常打开，只有真正聊天时才炸。那种问题没人能自查出来。
+        inv = P.inventory()
+        items = inv["plugins"]
+        assert items, "一个插件都没登记 —— 打包时漏了 bigfish/plugins"
+
+        prompt_on = [p for p in items if p["scope"] == "prompt" and p["enabled"]]
+        secs = P.prompt_sections({})
+        assert len(secs) == len(prompt_on), (
+            f"注入 {len(secs)} 段，但已启用的注入类插件有 {len(prompt_on)} 个")
+
+        orders = [s[0] for s in secs]
+        assert orders == sorted(orders), f"注入顺序没按身份序：{orders}"
+
+        on = [p["title"] for p in items if p["enabled"]]
+        return (f"{len(items)} 个插件，已启用 {len(on)} 个"
+                f"（{'、'.join(on) or '无'}）；本轮注入 {len(secs)} 段"
+                f"（{', '.join(str(o) for o in orders) or '—'}）")
+    item("插件", t_plugins)
 
     # 2. 心情
     def t_mood():

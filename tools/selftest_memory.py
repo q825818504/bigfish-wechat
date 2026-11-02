@@ -323,6 +323,31 @@ def t_reflect(tmp: str) -> None:
     check("产出 1 条事实", r.get("added") == 1, str(r))
     check("调了一次模型", calls["n"] == 1, str(calls))
 
+    # ⚠ 回归：多条事实必须**全部**入库。
+    #   曾经的 bug：ensure_anchor 在反思的长连接上开了未提交写事务，
+    #   下一条 remember（另开连接）拿到 "database is locked"，
+    #   而错误被丢掉 —— 表现是"模型给了 N 条，库里只多 1 条"，全程无声。
+    #   用三条带锚点的事实压住它。
+    V.capture_message("wechat:dad", "r-multi", "user", "又说了一句", db_path=db)
+
+    def many(system, user):
+        return json.dumps({"facts": [
+            {"anchor": "我", "predicate": "多A", "object": "甲", "confidence": 0.8,
+             "chunks": [], "evidence": ""},
+            {"anchor": "我", "predicate": "多B", "object": "乙", "confidence": 0.8,
+             "chunks": [], "evidence": ""},
+            {"anchor": "老爸", "predicate": "多C", "object": "丙", "confidence": 0.8,
+             "chunks": [], "evidence": ""},
+        ]}, ensure_ascii=False)
+
+    rm = M.reflect_on_session(db, "dafeiyu", "wechat:dad", many,
+                              owner=OWNER, tier=M.TIER_OWNER,
+                              self_names=["大肥鱼"])
+    check("多条事实：无失败项", rm.get("failed") == [], str(rm))
+    check("多条事实：三条全进库", rm.get("added") == 3, str(rm))
+    got3 = {f["predicate"] for f in M.list_facts(db, "dafeiyu")["items"]}
+    check("三条都在库里", {"多A", "多B", "多C"} <= got3, str(sorted(got3)))
+
     r2 = M.reflect_on_session(db, "dafeiyu", "wechat:dad", fake,
                           owner=OWNER, tier=M.TIER_OWNER,
                           self_names=["大肥鱼"])

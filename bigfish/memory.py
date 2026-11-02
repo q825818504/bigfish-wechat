@@ -1712,6 +1712,36 @@ def _coerce_confidence(value: Any) -> float:
     return 0.5
 
 
+def _ensure_anchor_safe(path: str, bank: str, name: str,
+                        chunks: Sequence[int] = ()) -> Tuple[bool, str]:
+    """在**独立短连接**里建锚点并挂 chunk，立刻提交。
+
+    为什么不能复用外部那条长连接：`ensure_anchor` 是写操作，一旦在长连接上
+    执行就开了一个未提交的写事务（SQLite 的 deferred → RESERVED 锁）。
+    此时任何**另一个连接**的写入都会拿到 "database is locked" 并失败。
+
+    反思循环里就是"先 remember（新连接）→ 再 ensure_anchor（长连接）→
+    再 remember（新连接）"这个顺序，于是第二条事实永远写不进去，
+    而且错误被丢掉，看起来像"模型少给了"。
+
+    短连接 + 立刻提交，把锁持有时间压到一个语句以内。
+    """
+    try:
+        c = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with c:
+            aid = ensure_anchor(c, bank, name)
+            for chunk in chunks:
+                link_anchor_chunk(c, aid, int(chunk))
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        c.close()
+
+
 def reflect_on_session(path: str, bank: str, session: str, call_model,
                        *, owner: str = "", tier: str = TIER_GUEST,
                        batch: int = 40, now: Optional[int] = None,
@@ -1787,6 +1817,7 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
         facts, skip = _parse_reflect(raw)
         valid_chunks = set(chunk_ids)
         added = repaired = 0
+        failed = []
         for f in facts:
             f.source_chunks = [c for c in f.source_chunks if c in valid_chunks] or chunk_ids[:1]
             # 归属由调用方给定，不由模型决定 —— 模型可能把别人的事写到
@@ -1797,9 +1828,18 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
             if ok:
                 added += 1
                 if f.anchor:
-                    aid = ensure_anchor(conn, bank, f.anchor)
-                    for c in f.source_chunks:
-                        link_anchor_chunk(conn, aid, c)
+                    # ⚠ 锚点必须在**独立的短连接**里写。
+                    #   以前这里用 reflect 开头那条长连接，ensure_anchor 一写就开了
+                    #   未提交的写事务，下一个 remember（另开连接）直接
+                    #   "database is locked" —— 而错误被 _err 吞掉，表现为
+                    #   "模型给了 2 条事实，库里只多了 1 条"，且完全无声。
+                    ok_a, err_a = _ensure_anchor_safe(path, bank, f.anchor,
+                                                      f.source_chunks)
+                    if not ok_a:
+                        failed.append(f"{f.predicate}: 锚点 {err_a}")
+            else:
+                # 失败必须报出来。以前 _err 被丢掉，等于把"没写进去"伪装成"没产生"。
+                failed.append(f"{f.predicate}: {_err}")
         last_id = int(rows[-1]["id"])
         conn.execute(
             "INSERT INTO reflection_state(bank,session,last_message,last_run,last_error) "
@@ -1809,7 +1849,8 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
             (bank, session, last_id, now))
         conn.commit()
         return {"ok": True, "added": added, "repaired": repaired,
-                "messages": len(rows), "skip_reason": skip}
+                "messages": len(rows), "skip_reason": skip,
+                "failed": failed[:8]}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "added": 0}
     finally:

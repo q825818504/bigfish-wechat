@@ -1221,3 +1221,300 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   border-color: var(--error);
   box-shadow: 0 0 0 3px var(--error-soft);
 }
+
+/* ══ 插件板块 ══
+   形态对齐 DSH 的插件页：一行一个插件（图标 / 标题+说明 / 右侧开关），
+   点标题进详情改参数。只有列表和详情两块，不做市场、不做搜索 ——
+   这里装的都是自己写的插件，数量以"能一眼看完"为准。 */
+
+.plug-count { font-size: 11px; color: var(--muted); }
+
+.plug-list { display: flex; flex-direction: column; }
+
+.plug-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 0;
+  border-top: 1px solid var(--border-soft);
+}
+.plug-row:first-child { border-top: 0; }
+
+.plug-icon {
+  flex: none;
+  width: 36px; height: 36px;
+  border-radius: 10px;
+  background: var(--surface-3);
+  color: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+}
+.plug-icon svg { width: 19px; height: 19px; }
+.plug-icon-lg { width: 44px; height: 44px; border-radius: 12px; }
+.plug-icon-lg svg { width: 22px; height: 22px; }
+
+.plug-main {
+  flex: 1 1 auto; min-width: 0;
+  text-align: left;
+  background: transparent; border: 0; padding: 0;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.plug-main:hover .plug-title { color: var(--accent); }
+
+.plug-title {
+  font-size: 13px; font-weight: 500;
+  display: flex; align-items: center; gap: 8px;
+  transition: color .14s;
+}
+.plug-desc {
+  font-size: 11px; color: var(--muted);
+  margin-top: 3px; line-height: 1.6;
+}
+.plug-meta {
+  font-size: 10px; color: var(--muted);
+  margin-top: 5px;
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.plug-seat {
+  font-size: 10px; font-weight: 400;
+  padding: 1px 7px; border-radius: 20px;
+  background: var(--surface-3); color: var(--muted);
+}
+.plug-dot { opacity: .5; }
+.plug-state { color: var(--ok); }
+.plug-state.is-off { color: var(--muted); }
+
+/* ── 身份序 ── */
+.plug-seats { display: flex; flex-wrap: wrap; gap: 8px; }
+.plug-seatchip {
+  font-size: 11px; color: var(--muted);
+  padding: 4px 10px; border-radius: 20px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+}
+.plug-seatchip b {
+  font-family: var(--mono-font);
+  font-size: 10px; font-weight: 600;
+  color: var(--accent-text);
+  margin-right: 6px;
+}
+.plug-seatchip.is-builtin {
+  background: var(--accent-soft);
+  border-color: #d5e3f2;
+  color: var(--accent-text);
+}
+.plug-seatchip.is-builtin b { color: var(--accent-text); }
+
+/* ── 详情页 ── */
+.plug-back {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: transparent; border: 0; padding: 0 0 14px;
+  font: inherit; font-size: 12px; color: var(--muted);
+  cursor: pointer;
+}
+.plug-back:hover { color: var(--text); }
+.plug-back svg { width: 14px; height: 14px; }
+
+.plug-detail-head {
+  display: flex; align-items: flex-start; gap: 14px;
+  margin-bottom: 18px;
+}
+.plug-detail-copy { flex: 1 1 auto; min-width: 0; }
+.plug-detail-copy h2 { font-size: 17px; }
+.plug-detail-copy p {
+  font-size: 12px; color: var(--muted);
+  margin-top: 5px; line-height: 1.7;
+}
+.plug-detail-head .switch-control { margin-top: 6px; }
+
+.plug-actions {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 16px;
+}
+.plug-hint { font-size: 11px; color: var(--muted); }
+
+/* 插件表单里的下拉与多行文本（原有 .field 只定义了 input） */
+.field select,
+.field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  font: inherit; font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  transition: border-color .16s, box-shadow .16s;
+}
+.field textarea { resize: vertical; line-height: 1.7; }
+.field select:hover,
+.field textarea:hover { border-color: var(--muted); }
+.field select:focus,
+.field textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* 插件详情的两处视觉修正（截图后发现的）：
+   ① select 默认没有下拉箭头，看起来像只读输入框 —— 补一个；
+   ② 布尔字段的开关直接贴在 label 下，比旁边的输入框高半行 —— 给个对齐垫。 */
+.field select {
+  appearance: none;
+  padding-right: 34px;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  background-size: 14px 14px;
+}
+.field .switch-control { margin: 9px 0 10px; }
+
+/* ══ 插件详情：四个区块 ══
+   ① 它做什么  ② 她实际收到的  ③ 可自定义的配置  ④ 在提示词里的位置
+   这一屏要回答三个问题：这插件是干嘛的、她到底收到什么、我能改哪些。 */
+
+/* ① 它做什么 */
+.plug-why p {
+  font-size: 12.5px;
+  line-height: 1.85;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+.plug-why p:last-child { margin-bottom: 0; }
+
+.plug-points {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-soft);
+}
+.plug-points-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 8px;
+  letter-spacing: .02em;
+}
+.plug-points-col.is-limit .plug-points-title { color: var(--muted); }
+.plug-points ul { list-style: none; margin: 0; padding: 0; }
+.plug-points li {
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--text);
+  padding-left: 16px;
+  position: relative;
+  margin-bottom: 6px;
+}
+.plug-points li::before {
+  content: "";
+  position: absolute;
+  left: 2px; top: 8px;
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+.plug-points-col.is-limit li::before { background: var(--muted); opacity: .6; }
+.plug-points li.is-empty { color: var(--muted); opacity: .7; }
+.plug-points li.is-empty::before { display: none; }
+
+/* ② 她实际收到的 */
+.plug-preview {
+  font-family: var(--mono-font);
+  font-size: 11.5px;
+  line-height: 1.85;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 340px;
+  overflow: auto;
+}
+.plug-preview-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ③ 字段事实行 */
+.plug-field-type {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+  margin-left: 8px;
+  padding: 1px 7px;
+  border-radius: 20px;
+  background: var(--surface-3);
+}
+.plug-field-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11px;
+  color: var(--muted);
+  opacity: .85;
+}
+.plug-field-facts span { position: relative; }
+.plug-field-facts span + span::before {
+  content: "·";
+  position: absolute;
+  left: -9px;
+  opacity: .6;
+}
+
+/* ④ 身份序阶梯 */
+.plug-ladder { display: flex; flex-direction: column; gap: 2px; }
+.plug-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.plug-step-order {
+  font-family: var(--mono-font);
+  font-size: 11px;
+  width: 40px;
+  flex: none;
+  opacity: .75;
+}
+.plug-step-label { font-weight: 500; flex: none; }
+.plug-step-note {
+  font-size: 11px;
+  opacity: .7;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plug-step.is-builtin { background: var(--surface-2); }
+.plug-step.is-builtin .plug-step-label { color: var(--accent-text); }
+.plug-step-tag {
+  font-size: 9.5px;
+  padding: 1px 6px;
+  border-radius: 20px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  flex: none;
+}
+.plug-step.is-mine {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.plug-step.is-mine .plug-step-label { color: var(--accent-text); font-weight: 600; }
+.plug-step-here {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--accent-text);
+  font-weight: 600;
+  flex: none;
+}

@@ -16,7 +16,7 @@ const S = {
 const PAGE_TITLES = {
   overview: '概览', chats: '会话', soul: '灵魂',
   mood: '心情', memory: '记忆', data: '数据目录',
-  settings: '设置', logs: '日志',
+  plugins: '插件', settings: '设置', logs: '日志',
 };
 
 /* ────────── 工具 ────────── */
@@ -61,6 +61,7 @@ function go(page) {
   if (page === 'mood') loadMood();
   if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); loadPersons(); }
   if (page === 'data') loadDataRoot();
+  if (page === 'plugins') { closePlugin(); loadPlugins(); }
 }
 
 $$('.nav-item').forEach((b) => b.addEventListener('click', () => go(b.dataset.page)));
@@ -1868,6 +1869,377 @@ $('#btnUpdate').addEventListener('click', async () => {
   } else {
     toast(r.error || '更新失败');
   }
+});
+
+/* ────────── 插件 ────────── */
+
+const PLUG = { data: null, current: null, draft: {} };
+
+/** 每种形态一个小图标（内联 SVG，和侧栏同一套线条风格） */
+const PLUG_ICONS = {
+  prompt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6h14M5 11h10M5 16h7"/></svg>',
+  gate: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 17h16M12 7v10"/><circle cx="12" cy="12" r="2"/></svg>',
+  hook: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h11M12 7l5 5-5 5"/></svg>',
+};
+
+function plugById(id) {
+  return ((PLUG.data && PLUG.data.plugins) || []).find((p) => p.id === id) || null;
+}
+
+async function loadPlugins() {
+  if (!S.bridge) return;
+  try {
+    const d = JSON.parse(await S.bridge.list_plugins());
+    if (d && d.error) {
+      $('#plugRows').innerHTML =
+        `<div class="empty"><h3>读不到插件清单</h3><p>${esc(d.error)}</p></div>`;
+      return;
+    }
+    PLUG.data = d;
+    renderPluginList();
+    renderPluginSeats();
+    // 详情页开着时同步刷新（改完开关后回填）
+    if (PLUG.current) openPlugin(PLUG.current);
+  } catch (e) {
+    $('#plugRows').innerHTML =
+      `<div class="empty"><h3>读不到插件清单</h3><p>${esc(e.message || e)}</p></div>`;
+  }
+}
+
+function renderPluginList() {
+  const rows = $('#plugRows');
+  const list = (PLUG.data && PLUG.data.plugins) || [];
+  const on = list.filter((p) => p.enabled).length;
+  setText('#plugCount', list.length ? `已启用 ${on} / ${list.length}` : '');
+
+  const path = (PLUG.data && PLUG.data.statePath) || '';
+  const hint = $('#plugStoreHint');
+  if (hint) {
+    hint.textContent = '开关存在数据目录里';
+    hint.title = path ? `跟着数据目录走：${path}` : '';
+  }
+
+  if (!list.length) {
+    rows.innerHTML = '<div class="empty" style="padding:28px 0"><p>还没有登记任何插件。</p></div>';
+    return;
+  }
+
+  rows.innerHTML = list.map((p) => `
+    <div class="plug-row" data-plug="${esc(p.id)}">
+      <div class="plug-icon">${PLUG_ICONS[p.scope] || PLUG_ICONS.prompt}</div>
+      <button class="plug-main" type="button" data-open="${esc(p.id)}">
+        <div class="plug-title">${esc(p.title)}${
+          p.seat ? `<span class="plug-seat">${esc(p.seat)}</span>` : ''}</div>
+        <div class="plug-desc">${esc(p.desc)}</div>
+        <div class="plug-meta">
+          <span>${esc(p.scopeLabel)}</span>
+          ${p.enabled ? '<span class="plug-dot">·</span><span class="plug-state">已启用</span>' : ''}
+        </div>
+      </button>
+      <label class="switch-control" title="${p.enabled ? '停用' : '启用'}">
+        <input type="checkbox" data-toggle="${esc(p.id)}" ${p.enabled ? 'checked' : ''}>
+        <span class="switch-track"></span>
+      </label>
+    </div>`).join('');
+}
+
+function renderPluginSeats() {
+  const box = $('#plugSeats');
+  const seats = (PLUG.data && PLUG.data.seats) || [];
+  box.innerHTML = seats.map((s) => `
+    <span class="plug-seatchip${s.builtin ? ' is-builtin' : ''}"
+          title="${esc(s.note)}${s.builtin ? '（内建，不可关）' : ''}">
+      <b>${s.order}</b>${esc(s.label)}
+    </span>`).join('');
+}
+
+function openPlugin(id) {
+  const p = plugById(id);
+  if (!p) return;
+  PLUG.current = id;
+  PLUG.draft = { ...(p.config || {}) };
+
+  $('#plugListWrap').hidden = true;
+  $('#plugDetailWrap').hidden = false;
+  // 详情自己有完整标题，page-heading 再来一遍就重复了
+  const head = document.querySelector('.page[data-page="plugins"] .page-heading');
+  if (head) head.hidden = true;
+  setText('#breadcrumb', '插件 / ' + p.title);
+
+  $('#plugIcon').innerHTML = PLUG_ICONS[p.scope] || PLUG_ICONS.prompt;
+  setText('#plugTitle', p.title);
+  setText('#plugDesc', p.desc);
+
+  const meta = [];
+  meta.push(`<span>${esc(p.scopeLabel)}</span>`);
+  if (p.seat) meta.push(`<span class="plug-seat">座位 ${esc(p.seat)}</span>`);
+  meta.push(`<span class="plug-state${p.enabled ? '' : ' is-off'}">${p.enabled ? '已启用' : '未启用'}</span>`);
+  if (p.configFields && p.configFields.length) {
+    meta.push(`<span>${p.configFields.length} 项可调</span>`);
+  }
+  $('#plugMeta').innerHTML = meta.join('');
+
+  $('#plugToggle').checked = !!p.enabled;
+
+  renderPluginWhy(p);
+  renderPluginFields(p);
+  renderPluginLadder(p);
+  refreshPluginPreview();
+
+  setText('#plugHint', '');
+  $('#plugSave').disabled = true;
+}
+
+/** ① 它做什么：为什么需要 + 会影响什么 / 不会做什么 */
+function renderPluginWhy(p) {
+  // 说明文字里允许 **加粗** —— 先转义再替换，顺序不能反
+  const fmt = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+
+  const why = $('#plugWhy');
+  if (p.why) {
+    why.innerHTML = p.why.split('\n').filter(Boolean)
+      .map((line) => `<p>${fmt(line)}</p>`).join('');
+    why.hidden = false;
+  } else {
+    why.hidden = true;
+  }
+
+  const fill = (sel, list, empty) => {
+    const box = $(sel);
+    if (list && list.length) {
+      box.innerHTML = list.map((x) => `<li>${fmt(x)}</li>`).join('');
+    } else {
+      box.innerHTML = `<li class="is-empty">${esc(empty)}</li>`;
+    }
+  };
+  fill('#plugAffects', p.affects, '未声明');
+  fill('#plugLimits', p.limits, '未声明');
+}
+
+/** ② 她实际收到的：调后端实时渲染 */
+async function refreshPluginPreview() {
+  const id = PLUG.current;
+  const box = $('#plugPreview');
+  if (!id || !S.bridge) return;
+  const p = plugById(id);
+
+  if (p && p.scope !== 'prompt') {
+    box.textContent = '这个插件不往提示词里加内容（它是「'
+      + (p.scopeLabel || p.scope) + '」类），所以没有注入原文。';
+    setText('#plugPreviewWhere', '');
+    setText('#plugPreviewNote', '');
+    return;
+  }
+
+  setText('#plugPreviewWhere', p && p.seat ? `拼在 ${p.seat}` : '');
+  box.textContent = '渲染中…';
+  try {
+    const r = JSON.parse(await S.bridge.preview_plugin(JSON.stringify({ id })));
+    if (!r.ok) {
+      box.textContent = '渲染失败：' + (r.error || '未知错误');
+      return;
+    }
+    box.textContent = r.text || '（这一段这一轮不注入）';
+    setText('#plugPreviewNote', p && p.enabled
+      ? '用当前时间与当前参数渲染'
+      : '⚠ 插件已停用——上面是「启用后会注入」的样子，现在并没有生效');
+  } catch (e) {
+    box.textContent = '渲染失败：' + (e.message || e);
+  }
+}
+
+/** ④ 在提示词里的位置：把身份序画成阶梯，标出这一层 */
+function renderPluginLadder(p) {
+  const box = $('#plugLadder');
+  const seats = (PLUG.data && PLUG.data.seats) || [];
+  if (!seats.length) { box.innerHTML = ''; return; }
+  const mine = p.order;
+  box.innerHTML = seats.map((s) => {
+    const isMine = mine && s.order === mine;
+    const cls = 'plug-step'
+      + (s.builtin ? ' is-builtin' : '')
+      + (isMine ? ' is-mine' : '');
+    return `<div class="${cls}">
+      <span class="plug-step-order">${s.order}</span>
+      <span class="plug-step-label">${esc(s.label)}</span>
+      <span class="plug-step-note">${esc(s.note)}</span>
+      ${isMine ? '<span class="plug-step-here">← 这个插件</span>' : ''}
+      ${s.builtin ? '<span class="plug-step-tag">内建</span>' : ''}
+    </div>`;
+  }).join('');
+}
+
+/** 把字段的默认值翻成人类可读（select 要把 value 换成 label） */
+function plugDefaultLabel(f) {
+  const d = f.default;
+  if (d === undefined || d === null || d === '') {
+    return f.type === 'text' ? '（空）' : '（无）';
+  }
+  if (f.type === 'boolean') return d ? '开' : '关';
+  if (f.type === 'select') {
+    const hit = (f.options || []).find((o) => o.value === d);
+    return hit ? (hit.label || hit.value) : String(d);
+  }
+  return String(d);
+}
+
+/** 每个字段的「事实行」：默认值 / 类型 / 范围 / 可选值 */
+function plugFieldFacts(f) {
+  const facts = [`默认：${plugDefaultLabel(f)}`];
+  if (f.type === 'number' && (f.min != null || f.max != null)) {
+    facts.push(`范围：${f.min ?? '—'} ~ ${f.max ?? '—'}`);
+  }
+  if (f.type === 'text' && f.maxLength) {
+    facts.push(`最多 ${f.maxLength} 字`);
+  }
+  if (f.optionsHint) {
+    facts.push(`可选：${f.optionsHint}`);
+  }
+  return facts;
+}
+
+function renderPluginFields(p) {
+  const box = $('#plugFields');
+  const fields = p.configFields || [];
+  setText('#plugFieldCount', fields.length ? `${fields.length} 项` : '没有可调参数');
+
+  if (!fields.length) {
+    box.innerHTML = `<div class="field full"><small>这个插件没有可调参数 ——
+      它的内容是一段固定文本，改坏了比不加更糟，所以只留开关。</small></div>`;
+    return;
+  }
+  box.innerHTML = fields.map((f) => {
+    const v = PLUG.draft[f.key];
+    let control = '';
+    if (f.type === 'boolean') {
+      control = `<label class="switch-control" style="margin-top:2px">
+        <input type="checkbox" data-field="${esc(f.key)}" ${v ? 'checked' : ''}>
+        <span class="switch-track"></span></label>`;
+    } else if (f.type === 'select') {
+      const opts = (f.options || []).map((o) =>
+        `<option value="${esc(o.value)}" ${o.value === v ? 'selected' : ''}>${esc(o.label || o.value)}</option>`);
+      control = `<select data-field="${esc(f.key)}">${opts.join('')}</select>`;
+    } else if (f.type === 'number') {
+      control = `<input type="number" data-field="${esc(f.key)}" value="${esc(v)}"
+        ${f.min != null ? `min="${f.min}"` : ''} ${f.max != null ? `max="${f.max}"` : ''}
+        ${f.step != null ? `step="${f.step}"` : ''}>`;
+    } else if (f.type === 'text') {
+      control = `<textarea data-field="${esc(f.key)}" rows="3"
+        ${f.maxLength ? `maxlength="${f.maxLength}"` : ''}
+        placeholder="留空即用默认">${esc(v || '')}</textarea>`;
+    } else {
+      control = `<input type="text" data-field="${esc(f.key)}" value="${esc(v || '')}">`;
+    }
+    return `<div class="field${f.type === 'text' ? ' full' : ''}">
+      <label>${esc(f.label)}<span class="plug-field-type">${esc(f.typeLabel || f.type)}</span></label>
+      ${control}
+      ${f.note ? `<small>${esc(f.note)}</small>` : ''}
+      <div class="plug-field-facts">${
+        plugFieldFacts(f).map((x) => `<span>${esc(x)}</span>`).join('')}</div>
+    </div>`;
+  }).join('');
+}
+
+function closePlugin() {
+  PLUG.current = null;
+  PLUG.draft = {};
+  $('#plugDetailWrap').hidden = true;
+  $('#plugListWrap').hidden = false;
+  const head = document.querySelector('.page[data-page="plugins"] .page-heading');
+  if (head) head.hidden = false;
+  setText('#breadcrumb', PAGE_TITLES.plugins);
+}
+
+async function togglePlugin(id, enabled) {
+  if (!S.bridge) return;
+  try {
+    const r = JSON.parse(await S.bridge.set_plugin_enabled(
+      JSON.stringify({ id, enabled })));
+    if (!r.ok) {
+      toast(r.error || '切换失败');
+      await loadPlugins();      // 回滚到真实状态，不做「假装成功」
+      return;
+    }
+    PLUG.data = r;
+    renderPluginList();
+    renderPluginSeats();
+    if (PLUG.current === id) openPlugin(id);
+    toast(enabled ? '已启用，下一轮对话起生效' : '已停用，下一轮对话起不再注入');
+  } catch (e) {
+    toast('切换失败：' + (e.message || e));
+    await loadPlugins();
+  }
+}
+
+async function savePluginConfig() {
+  const id = PLUG.current;
+  if (!id || !S.bridge) return;
+  const p = plugById(id);
+  if (!p) return;
+  const patch = {};
+  for (const f of (p.configFields || [])) {
+    if (PLUG.draft[f.key] !== undefined) patch[f.key] = PLUG.draft[f.key];
+  }
+  try {
+    const r = JSON.parse(await S.bridge.save_plugin_config(
+      JSON.stringify({ id, config: patch })));
+    if (!r.ok) { setText('#plugHint', r.error || '保存失败'); return; }
+    PLUG.data = r;
+    renderPluginList();
+    renderPluginSeats();
+    openPlugin(id);           // 里面会重新渲染预览
+    setText('#plugHint', '已保存');
+    toast('已保存');
+  } catch (e) {
+    setText('#plugHint', '保存失败：' + (e.message || e));
+  }
+}
+
+/* 事件委托：列表的开关与进入详情、详情页的字段改动 */
+
+document.addEventListener('click', (e) => {
+  const open = e.target.closest('[data-open]');
+  if (open) { openPlugin(open.dataset.open); return; }
+  if (e.target.closest('#plugBack')) { closePlugin(); return; }
+  if (e.target.closest('#plugSave')) { savePluginConfig(); return; }
+  if (e.target.closest('#plugPreviewRefresh')) { refreshPluginPreview(); return; }
+});
+
+document.addEventListener('change', (e) => {
+  const t = e.target;
+
+  const tg = t.closest('[data-toggle]');
+  if (tg) { togglePlugin(tg.dataset.toggle, tg.checked); return; }
+
+  if (t.id === 'plugToggle' && PLUG.current) {
+    togglePlugin(PLUG.current, t.checked);
+    return;
+  }
+
+  const f = t.closest('[data-field]');
+  if (f && PLUG.current) {
+    const key = f.dataset.field;
+    PLUG.draft[key] = t.type === 'checkbox' ? t.checked
+      : t.type === 'number' ? Number(t.value) : t.value;
+    const p = plugById(PLUG.current);
+    const changed = p && (p.configFields || []).some(
+      (fd) => PLUG.draft[fd.key] !== (p.config || {})[fd.key]);
+    $('#plugSave').disabled = !changed;
+    setText('#plugHint', '');
+  }
+});
+
+/* 输入框用 input 事件才能实时启用保存按钮（change 要失焦才触发） */
+document.addEventListener('input', (e) => {
+  const f = e.target.closest('[data-field]');
+  if (!f || !PLUG.current) return;
+  if (e.target.type === 'checkbox' || e.target.tagName === 'SELECT') return;
+  const key = f.dataset.field;
+  PLUG.draft[key] = e.target.type === 'number' ? Number(e.target.value) : e.target.value;
+  const p = plugById(PLUG.current);
+  const changed = p && (p.configFields || []).some(
+    (fd) => PLUG.draft[fd.key] !== (p.config || {})[fd.key]);
+  $('#plugSave').disabled = !changed;
 });
 
 /* ────────── 后端桥接 ────────── */
