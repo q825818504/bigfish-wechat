@@ -898,7 +898,18 @@ class Backend(QObject):
             from wechatauto.db import auto_detect_db_dir, list_accounts
 
             root = auto_detect_db_dir()
+
+            # 用「进程是否占用数据库」判断谁在跑，而不是 mtime。
+            # 详见 memory/wechat.py:probe_running_accounts 的三次踩坑记录。
+            try:
+                from bigfish.wechat import probe_running_accounts
+                probed = {a["account"]: a for a in probe_running_accounts(root)}
+            except Exception:
+                probed = {}
             rows = list_accounts(root) if root else []
+            for r in rows:
+                p = probed.get(r["account"]) or {}
+                r["running"] = bool(p.get("running"))
             cfg = load_json_config()
             saved = str((cfg.get("auto_reply") or {}).get("account") or "")
 
@@ -912,12 +923,15 @@ class Backend(QObject):
                     "account": a["account"],
                     "wxid": a["wxid"],
                     "nick": names.get(a["account"], ""),
+                    "running": bool(a.get("running")),
                     "lastActivity": ts_to_local(
                         int((a.get("last_activity") or 0) * 1000)),
                     "isSaved": a["account"] == saved,
                     "chats": len(((cfg.get("per_account") or {})
                                   .get(a["account"], {}) or {}).get("chats") or []),
                 })
+            # 正在跑的一律排最前 —— 用户几乎总是想连那个
+            out.sort(key=lambda x: (not x["running"], x["account"]))
             return json.dumps({
                 "root": root or "",
                 "accounts": out,

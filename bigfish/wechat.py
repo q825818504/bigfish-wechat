@@ -9,6 +9,8 @@ _bigfish_keybridge 自动处理，只在首次取密钥时弹一次 UAC。
 """
 from __future__ import annotations
 
+import re
+
 import os
 import sys
 from dataclasses import dataclass
@@ -70,6 +72,130 @@ def _classify(uid: str) -> str:
     if "holder" in u:
         return "system"
     return "contact"
+
+
+def probe_running_accounts(db_dir: Optional[str] = None) -> List[Dict]:
+    """探测**正在运行**的微信账号（按进程占用数据库判断）。
+
+    返回 [{"account", "wxid", "running", "lastActivity", "lockedDb"}]，
+    running=True 的那个就是当前登录、正在跑的微信。
+
+    为什么不用 mtime：
+      mtime 是"最后被写过"，不是"正在被使用"。多开时 A 号关掉十分钟前
+      刚写过，B 号正在聊，mtime 可能还是 A 更近 —— 按它选就会选错。
+
+    为什么不用进程命令行：
+      Weixin.exe 主进程的命令行里**没有账号信息**（实测只有
+      "D:/WeChat/Weixin/Weixin.exe"），账号是登录后才知道的。
+
+    所以只能看"谁的文件被占着" —— 这是唯一与进程直接相关、又不需要
+    注入/读内存的信号。
+
+    ⚠ 只读探测：File::Open 尝试独占打开，成功就立刻 close。
+      进程占用时抛 PermissionError，我们不重试、不强制打开。
+    """
+    import glob as _glob
+
+    if db_dir is None:
+        try:
+            import sys as _sys
+
+            from bigfish.wechat import _VENDOR  # noqa: F401
+
+            if _VENDOR not in _sys.path:
+                _sys.path.insert(0, _VENDOR)
+            from wechatauto.db import auto_detect_db_dir
+
+            db_dir = auto_detect_db_dir()
+        except Exception:
+            db_dir = ""
+    if not db_dir or not os.path.isdir(db_dir):
+        return []
+
+    out = []
+    for acc_dir in sorted(_glob.glob(os.path.join(db_dir, "*"))):
+        if not os.path.isdir(os.path.join(acc_dir, "db_storage")):
+            continue
+        account = os.path.basename(acc_dir)
+        db_file = ""
+        for pat in ("db_storage/message/message_0.db",
+                    "db_storage/**/message_0.db"):
+            hit = _glob.glob(os.path.join(acc_dir, pat), recursive=True)
+            if hit:
+                db_file = hit[0]
+                break
+        locked = _is_locked(db_file)
+        newest = 0.0
+        try:
+            for root, _dirs, files in os.walk(os.path.join(acc_dir, "db_storage")):
+                for f in files:
+                    if f.endswith(".db") and not f.endswith("-wal"):
+                        newest = max(newest, os.path.getmtime(os.path.join(root, f)))
+        except Exception:
+            pass
+        out.append({
+            "account": account,
+            "wxid": re.sub(r"_\w{4}$", "", account),
+            "running": locked,
+            "lastActivity": int(newest * 1000) if newest else 0,
+            "lockedDb": os.path.basename(db_file),
+        })
+    # 正在跑的一律排前面，其余按活跃时间
+    out.sort(key=lambda a: (not a["running"], -a["lastActivity"]))
+    return out
+
+
+def _is_locked(path: str) -> bool:
+    """这个账号的库是否正被微信进程占用（= 微信正在运行）。
+
+    这条路踩了三次坑，全记在这：
+
+      ① open('r+b')  —— Python 在 Windows 上默认带共享读，
+                        别人开着也可能开得动。实测三个号全是"未占用"。
+      ② msvcrt.locking —— 加的是普通字节锁，而 SQLite/微信用的是
+                        它自己的字节区间锁，两者互不相干，测不出来。
+      ③ BEGIN IMMEDIATE —— 微信的库是 SQLCipher 加密的，
+                        sqlite3 连打开都报 "file is not a database"，
+                        根本走不到加锁那一步。
+
+    最终用 Windows 原生 CreateFileW，**dwShareMode = 0**（完全不共享）：
+      别的进程正开着 → 返回 INVALID_HANDLE_VALUE + ERROR_SHARING_VIOLATION
+      没人开         → 拿到句柄，立刻 CloseHandle
+
+    这是唯一能绕过"Python 默认共享"、又不需要读加密内容的办法。
+    只打开句柄，不读一个字节，不写一个字节。
+    """
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        GENERIC_READ = 0x80000000
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        INVALID_HANDLE = ctypes.c_void_p(-1).value
+        ERROR_SHARING_VIOLATION = 32
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+            wintypes.HANDLE]
+        k32.CreateFileW.restype = wintypes.HANDLE
+
+        h = k32.CreateFileW(path, GENERIC_READ,
+                            0,               # ← 关键：dwShareMode = 0，不共享
+                            None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+        if h is None or h == INVALID_HANDLE:
+            err = ctypes.get_last_error()
+            return err == ERROR_SHARING_VIOLATION
+        k32.CloseHandle(h)
+        return False
+    except Exception:
+        # 探测本身失败时**不要**谎报"在运行" —— 那会让用户看到三个号都是★。
+        # 返回 False，界面上靠 mtime 排序仍然可用。
+        return False
 
 
 def _clean_name(value: str) -> str:

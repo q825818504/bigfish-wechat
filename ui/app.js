@@ -420,11 +420,17 @@ async function pickAccount() {
       // 显示名优先：手填的备注 > 已知昵称/alias > wxid
       const title = a.nick || a.wxid;
       const sub = a.nick ? a.wxid + ' · ' : '';
+      // 「正在运行」= 这个号的数据库正被微信进程占用。
+      // 这是唯一与真实进程挂钩的信号，比"最后活跃时间"可靠得多
+      // （多开时 A 号十分钟前刚写过，可能比正在聊的 B 号时间还近）。
+      const run = a.running
+        ? '<span class="tag ok" style="margin-left:8px">● 正在运行</span>'
+        : '<span class="tag" style="margin-left:8px">未运行</span>';
       return `<div class="session-item">
         <span class="chat-avatar">${esc((title || '?').slice(0, 2))}</span>
         <div class="session-main" data-acc="${esc(a.account)}" style="cursor:pointer">
-          <div class="session-name">${esc(title)}
-            ${a.isSaved ? '<span class="tag" style="margin-left:8px">上次用的</span>' : ''}
+          <div class="session-name">${esc(title)}${run}
+            ${a.isSaved ? '<span class="tag" style="margin-left:6px">上次用的</span>' : ''}
             ${a.chats ? `<span class="tag" style="margin-left:6px">${a.chats} 个会话</span>` : ''}
           </div>
           <div class="session-sub">${esc(sub)}最后活跃 ${esc(a.lastActivity)}</div>
