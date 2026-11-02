@@ -1,26 +1,48 @@
-修重复发送：UIA 成功之后又走了一遍兜底
+表情包真机跑通：7/7，原生表情，会动
 
-真机日志：
-    发送后新增 2 条
-       · type='动画表情' sender_id=4
-       · type='动画表情' sender_id=4
-    耗时 12.6s（正常约 6s）
+真机结果：
+    聚焦后 前台='微信' 焦点='微信'
+    草稿已进输入框（彩色占比 8.5%）
+    发送后新增 1 条
+      · type='动画表情' sender_id=4
+    ✓ 新增消息里有「动画表情」
+    耗时 9.3s
+    用户确认：是原生表情，可以动
 
-一次调用发了两条。原因是兜底条件写错了：
+整条链路：
+    GIF → _outbox → 剪贴板（五种格式）→ 输入框 → 原生表情
 
-    ok = self._paste_media_uia(...)
-    if ok:
-        pass                                # 成功了，但什么都没做
-    if not err or err.startswith(...):      # err 还是空字符串 → True
-        gui.send_file(...)                  # 又发一次
+这一轮记进 planning 的四个坑：
+  ① 剪贴板只写 CF_HDROP 不够，微信走 OLE 认 DataObject/FileNameW
+  ② 微信拒绝从临时目录粘贴文件 —— 最贵的一个，十几轮都卡在这里
+  ③ 灰度差判据 5.9 卡在阈值 6 下面，换彩色占比
+  ④ vendor 那句 sender_id != 2 在这台机器上会把自己发的全过滤掉
 
-`err` 在成功路径上从来没被赋值，所以 `not err` 恒真。
+decisions 补 D-41 ~ D-46（六条）：
+  D-41 GIF 就是原生表情，不碰表情面板
+  D-42 媒体文件必须先离开临时目录
+  D-43 剪贴板要写全五种格式
+  D-44 草稿判据用彩色占比，不用灰度差
+  D-45 发送成功与否只信数据库
+  D-46 一次调用只发一条
 
-改成 uia_ok 显式记录，兜底只在它为 False 时跑。
+architecture 补「发表情：第二条发送通道」整节，
+说明为什么媒体比文本多那么多步、为什么最后一步永远回读数据库。
 
-另外 sender_id=4 而不是 2 —— 这印证了上一个提交的判断：
-vendor 那句 `sender_id != 2` 在这台机器上会把所有自己发的消息
-过滤掉，验证函数必然返回 False。
+清理：删掉 8 个一次性诊断脚本（diagnose_* / key_probe / clip_diff /
+paste_only / paste_probe / find_attach_button），结论都进了 commit
+和代码注释。保留 4 个有长期价值的：
+  live_sticker_test  正式验证
+  path_probe         换机器后验路径
+  focus_probe        粘贴突然不工作时判定焦点
+  check_method_calls 静态查参数个数
 
-真机结果（修之前）：7/7 通过，但发了两条。
-修完之后应该只发一条。
+测试：
+  selftest_vault        148/148
+  selftest_sticker       42/42
+  selftest_plugins       89/89
+  selftest_engine_fixes  60/60
+  test_no_leak           30/30
+  test_persona_parity    18/18
+  selftest_ui            全通过
+  check_method_calls     无问题
