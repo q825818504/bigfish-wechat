@@ -59,7 +59,7 @@ function go(page) {
 
   if (page === 'soul' && !S.soul) loadSoul();
   if (page === 'mood') loadMood();
-  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); }
+  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); }
   if (page === 'data') loadDataRoot();
 }
 
@@ -984,10 +984,24 @@ async function loadFacts(offset) {
         'style="margin-left:6px;width:22px;height:22px">' +
         '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
         '<path d="M6 6l12 12M18 6L6 18"/></svg></button>';
+      // 可见性徽章：私密 / 可共享 / 公开。点它切换 —— 这是唯一能
+      // 把私密内容放给别人的口子，所以点了会弹确认。
+      const visVal = f.visibility || 'private';
+      const visCls = visVal === 'private' ? '' : 'ok';
+      const visBadge = dead ? '' :
+        '<button class="health-tag ' + visCls + '" data-vis="' + f.id + '" ' +
+        'data-target="' + (visVal === 'private' ? 'shared' : 'private') + '" ' +
+        'title="点一下改成' + (visVal === 'private' ? '可共享' : '私密') + '">' +
+        esc(VIS_LABEL[visVal] || visVal) + '</button>';
+      const pinBadge = (f.pinned && !dead) ? '<span class="fact-conf">★</span>' : '';
+      const ownerTag = (!dead && f.owner) ?
+        '<span class="memory-time">' + esc(f.owner.split(':').pop().slice(0, 12)) +
+        '</span>' : '';
       return '<div class="memory-item' + (dead ? ' is-dead' : '') + '">' +
         '<div class="memory-body"><div class="memory-meta">' +
         '<span class="memory-role">' + esc(f.anchor || '她') + '</span>' +
         '<span class="memory-time">' + esc(f.predicate) + '</span>' + conf + replaced +
+        visBadge + pinBadge + ownerTag +
         '<span class="memory-time">' + esc(f.createdText || '') + '</span>' + del +
         '</div><div class="memory-text">' + esc(f.object) + '</div></div></div>';
     }).join('');
@@ -1147,6 +1161,149 @@ $('#btnMemVacuum').addEventListener('click', async () => {
  *   事实页 → 忘掉（只失效）/ 整理（新增认识）/ 修索引（修复派生层）
  */
 
+/* ── 主人与共享 ──
+ *
+ * 三个动作：
+ *   绑定主人   选一个微信会话 → 写配置 + 写 owners 表 → 立刻生效
+ *   补平台身份 B站/抖音/手机号，先建记录（暂不合并，见后端注释）
+ *   改可见性   把一条事实从 private 改成 shared，**唯一能主动泄露的口子**
+ */
+
+const TIER_LABEL = { owner: '主人', known: '熟人', guest: '陌生' };
+const VIS_LABEL = { private: '私密', shared: '可共享', public: '公开' };
+
+async function loadOwners() {
+  if (!S.bridge || !S.bridge.owner_candidates) return;
+  try {
+    const d = JSON.parse(await S.bridge.owner_candidates());
+    const sel = $('#ownerPick');
+    const list = $('#ownerList');
+    if (!sel || !list) return;
+
+    // ① 下拉：微信会话
+    const chats = d.chats || [];
+    sel.innerHTML = chats.length
+      ? chats.map((c) => {
+          const tag = c.isCurrent ? '（当前主人）' : '';
+          return '<option value="' + esc(c.wxid) + '">' +
+            esc(c.name) + tag + '</option>';
+        }).join('')
+      : '<option value="">（没有可选的私聊会话）</option>';
+
+    // ② 健康行
+    const h = $('#ownerHealth');
+    const cur = d.current || '';
+    if (h) {
+      h.innerHTML = cur
+        ? '<span class="health-tag ok">主人：' + esc(cur) + '</span>'
+        : '<span class="health-tag warn">还没设主人 —— 所有人按陌生处理</span>';
+    }
+    const tag = $('#ownerTag');
+    if (tag) tag.textContent = cur ? '已绑定' : '未绑定';
+
+    // ③ 列表：所有登记过的人
+    const known = d.known || [];
+    if (!known.length) {
+      list.innerHTML = '<div class="empty" style="padding:12px 0">' +
+        '<p>还没有记录到任何人。跟她聊几句，或者从上面选一个主人。</p></div>';
+      return;
+    }
+    list.innerHTML = known.map((o) => {
+      const isOwner = o.tier === 'owner';
+      const cls = isOwner ? 'ok' : '';
+      return '<div class="session-item">' +
+        '<div class="session-main">' +
+        '<div class="session-name">' + esc(o.name || o.externalId) +
+        '<span class="health-tag ' + cls + '" style="margin-left:8px">' +
+        esc(TIER_LABEL[o.tier] || o.tier) + '</span>' +
+        '<span class="health-tag" style="margin-left:4px">' +
+        esc(o.platform) + '</span></div>' +
+        '<div class="session-sub">' + esc(o.externalId) + '</div>' +
+        '</div>' +
+        (isOwner ? '' :
+          '<button class="btn btn-sm" data-tier="' + esc(o.owner) +
+          '">设为主人</button>') +
+        '</div>';
+    }).join('');
+  } catch (e) {
+    toast('读取主人信息失败');
+  }
+}
+
+async function bindOwner(ownerKey) {
+  if (!S.bridge) return;
+  // ownerKey 形如 private:wechat:wxid_xxx；也接受纯 wxid
+  let platform = 'wechat';
+  let eid = ownerKey || '';
+  if (eid.indexOf(':') >= 0) {
+    const parts = eid.split(':');
+    platform = parts[1] || 'wechat';
+    eid = parts.slice(2).join(':');
+  }
+  if (!eid) return toast('先选一个人');
+  const ok = confirm('把「' + eid + '」设为主人？' + String.fromCharCode(10) +
+    String.fromCharCode(10) +
+    '主人能看到全部记忆（数据在你电脑上）。' +
+    String.fromCharCode(10) + '原来的主人会降为「熟人」。');
+  if (!ok) return;
+  try {
+    const r = JSON.parse(await S.bridge.bind_owner(platform, eid));
+    if (!r.ok) return toast(r.error || '绑定失败');
+    toast('已设为主人，立刻生效');
+    loadOwners();
+    loadFacts();
+  } catch (e) { toast('绑定失败'); }
+}
+
+async function addIdentity() {
+  if (!S.bridge) return;
+  const plat = $('#idPlatform') ? $('#idPlatform').value : '';
+  const val = $('#idValue') ? $('#idValue').value.trim() : '';
+  if (!val) return toast('先填 id');
+  try {
+    const r = JSON.parse(await S.bridge.add_identity(plat, val, false));
+    if (!r.ok) return toast(r.error || '添加失败');
+    toast('已添加（' + plat + '）');
+    if ($('#idValue')) $('#idValue').value = '';
+    loadOwners();
+  } catch (e) { toast('添加失败'); }
+}
+
+async function setVisibility(factId, vis) {
+  if (!S.bridge) return;
+  const label = VIS_LABEL[vis] || vis;
+  const ok = confirm('把这条改成「' + label + '」？' + String.fromCharCode(10) +
+    String.fromCharCode(10) +
+    (vis === 'private'
+      ? '私密：只有归属的那个人能看到。'
+      : '可共享：**其他任何人**都会被允许看到它。想清楚再点。'));
+  if (!ok) return;
+  try {
+    const r = JSON.parse(await S.bridge.set_fact_visibility(String(factId), vis));
+    if (!r.ok) return toast(r.error || '修改失败');
+    toast('已改为「' + label + '」');
+    loadFacts();
+  } catch (e) { toast('修改失败'); }
+}
+
+const bindOwnerUI = () => {
+  const on = (sel, ev, fn) => {
+    const el = $(sel);
+    if (el) el.addEventListener(ev, fn);
+  };
+  on('#btnBindOwner', 'click', () => {
+    const sel = $('#ownerPick');
+    if (sel) bindOwner(sel.value);
+  });
+  on('#btnAddIdentity', 'click', addIdentity);
+  document.addEventListener('click', (e) => {
+    const t = e.target.closest('[data-tier]');
+    if (t) { bindOwner(t.dataset.tier); return; }
+    const v = e.target.closest('[data-vis]');
+    if (v) setVisibility(v.dataset.vis, v.dataset.target);
+  });
+};
+
 const bindFactUI = () => {
   const on = (sel, ev, fn) => {
     const el = $(sel);
@@ -1170,6 +1327,7 @@ const bindFactUI = () => {
   });
 };
 bindFactUI();
+bindOwnerUI();
 
 /* ────────── 数据目录 ────────── */
 

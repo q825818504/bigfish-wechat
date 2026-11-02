@@ -1395,24 +1395,6 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
-    @Slot(int, str, result=str)
-    def set_fact_visibility(self, fact_id: int, visibility: str) -> str:
-        """改一条事实的共享级别。
-
-        ⚠ 这是**唯一能把私密变成可共享**的入口，只在界面上由用户点。
-          任何模型、任何自动流程都不该调它 —— 这是整个系统里
-          唯一能主动泄露的口子，所以必须是人来按。
-        """
-        try:
-            from bigfish import memory as M, vault as V
-
-            db = V.memory_db_path()
-            ok, err = M.set_visibility(db or "", "dafeiyu", int(fact_id),
-                                       visibility, by="ui")
-            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-
     @Slot(str, result=str)
     def list_owners(self) -> str:
         """列出所有出现过的人（owner）与等级。界面用来确认"谁是主人"。"""
@@ -1452,6 +1434,199 @@ class Backend(QObject):
             db = V.memory_db_path()
             ok, err = M.set_tier(db or "", str(d.get("owner") or ""),
                                  str(d.get("tier") or ""))
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── 主人绑定 ────────────────────────────────────────────────────
+    #
+    # 设计取舍（想清楚再改）：
+    #
+    #   ① **不做"发暗号绑定"**。微信里发「/我是主人」看着省事，但暗号一旦
+    #      被人看到，谁都能发 —— 那等于把管理员密码贴在公告板上。
+    #      绑定必须发生在"只有主人能操作的地方"，也就是这台电脑的界面上。
+    #
+    #   ② 候选列表来自**真实会话**，不是让用户手打 wxid。
+    #      手打 id 有两个问题：填错一个字符就绑了个不存在的号（静默失败）；
+    #      而且用户根本记不住自己的 wxid。点选不会错。
+    #
+    #   ③ 绑定写进 config.json 的 auto_reply.owner，**立刻生效**：
+    #      同时更新内存里的 self.owner_id 与 owners 表的 tier。
+    #      不用重启，因为主人身份只影响"能给谁看 private"，不涉及连接重建。
+
+    @Slot(result=str)
+    def owner_candidates(self) -> str:
+        """可绑定为主的候选：微信里出现过的私聊对象 + 已在 owners 表里的人。"""
+        try:
+            import sqlite3
+
+            from bigfish import memory as M, vault as V
+
+            cfg = load_json_config().get("auto_reply") or {}
+            current = str(cfg.get("owner") or "").strip()
+
+            # ① 已登记的 owner（含别的平台，以后 B站/抖音都从这里来）
+            known: list = []
+            db = V.memory_db_path()
+            if db and os.path.isfile(db):
+                conn = sqlite3.connect(db)
+                conn.row_factory = sqlite3.Row
+                try:
+                    for r in conn.execute(
+                            "SELECT owner,kind,platform,display_name,tier,last_seen "
+                            "FROM owners ORDER BY last_seen DESC LIMIT 200"):
+                        known.append({
+                            "owner": r["owner"],
+                            "platform": r["platform"],
+                            "kind": r["kind"],
+                            "name": r["display_name"] or "",
+                            "tier": r["tier"],
+                            "externalId": r["owner"].rsplit(":", 1)[-1],
+                        })
+                finally:
+                    conn.close()
+
+            # ② 微信会话（还没进 owners 表的也能绑）
+            #    这是"点选"的核心：用户认得的是名字，不是 wxid。
+            chats: list = []
+            try:
+                from bigfish.wechat import WeChatReader
+
+                r = WeChatReader().open()
+                for s in r.sessions(limit=80):
+                    uid = s.get("username") or ""
+                    # 只列真实的人：公众号(gh_)、服务号、系统账号都不是人，
+                    # 把主人误绑到一个公众号上会得到一个"永远不回话的主人"。
+                    if s.get("is_group"):
+                        continue
+                    if not uid.startswith("wxid_"):
+                        continue
+                    chats.append({
+                        "wxid": uid,
+                        "name": s.get("name") or uid,
+                        "summary": s.get("summary") or "",
+                        "isCurrent": uid == current,
+                    })
+            except Exception as exc:
+                chats.append({"wxid": "", "name": f"（读不到会话：{exc}）",
+                              "summary": "", "isCurrent": False})
+
+            return json.dumps({
+                "current": current,
+                "chats": chats,
+                "known": known,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"current": "", "chats": [], "known": [],
+                               "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, result=str)
+    def bind_owner(self, platform: str, external_id: str) -> str:
+        """把某个人设为主人。platform 目前只有 wechat，留给抖音/B站。
+
+        ⚠ 这是**权限提升操作**，只在界面上由人点。没有"发消息自动成为主人"
+          这条路 —— 那条路等于把门钥匙交给任何一个看到消息的人。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            plat = (platform or "wechat").strip().lower()
+            eid = (external_id or "").strip()
+            if not eid:
+                return json.dumps({"ok": False, "error": "缺少平台 id"},
+                                  ensure_ascii=False)
+
+            owner = M.owner_of_private(eid, platform=plat)
+
+            # ① 写进配置（重启后仍然是主人）
+            c = load_json_config()
+            ar = c.setdefault("auto_reply", {})
+            old = str(ar.get("owner") or "").strip()
+            ar["owner"] = eid
+            ar["owner_platform"] = plat
+            # 监听名单里要有他，否则收不到消息
+            chats = [str(x) for x in (ar.get("chats") or [])]
+            if eid not in chats:
+                chats.insert(0, eid)
+            ar["chats"] = chats
+            save_json_config(c)
+
+            # ② 写进 owners 表（立即生效，供注入使用）
+            db = V.memory_db_path()
+            if db:
+                M.ensure_schema(db)
+                M.ensure_owner(db, "dafeiyu", owner, tier=M.TIER_OWNER,
+                               platform=plat)
+                # 旧主人降级为熟人，避免"两个主人"
+                #
+                # ⚠ 这里以前多传了一个 "dafeiyu" —— set_tier 的签名是
+                #    (path, owner, tier)，多出来的参数让 owner 变成 "dafeiyu"、
+                #    tier 变成 owner 键，校验抛错。而外面套着 except: pass，
+                #    于是"改绑后旧主人没降级"这个 bug 静默存在。
+                #    教训：失败必须报出来，不能吞。
+                if old and old != eid:
+                    old_owner = M.owner_of_private(old, platform=plat)
+                    ok2, err2 = M.set_tier(db, old_owner, M.TIER_KNOWN)
+                    if not ok2:
+                        # 用 getattr 兜底：Backend 有 _log，但单测替身没有。
+                        # 不因为"记日志失败"影响绑定本身。
+                        note = getattr(self, "_log", None)
+                        if callable(note):
+                            note(f"[绑定] 旧主人降级失败：{err2}", "err")
+                        else:
+                            print(f"[绑定] 旧主人降级失败：{err2}")
+
+            # ③ 内存里立刻换 —— 不用重启
+            self.owner_id = owner
+
+            return json.dumps({"ok": True, "owner": owner, "old": old},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, bool, result=str)
+    def add_identity(self, platform: str, external_id: str, is_owner: bool) -> str:
+        """给某个人补一个别的平台身份（B站 UID / 抖音号 / 手机号）。
+
+        现在的实现是"为一个新身份建一条 owner 记录"。真正的跨平台合并
+        （同一个人的微信 + B站 归为一个人）需要一层 person 表，
+        那是下一轮的事 —— 这里先把入口留出来，不做假合并。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            plat = (platform or "").strip().lower()
+            eid = (external_id or "").strip()
+            if not plat or not eid:
+                return json.dumps({"ok": False, "error": "平台和 id 都要填"},
+                                  ensure_ascii=False)
+            db = V.memory_db_path()
+            if not db:
+                return json.dumps({"ok": False, "error": "数据目录未确定"},
+                                  ensure_ascii=False)
+            M.ensure_schema(db)
+            owner = M.owner_of_private(eid, platform=plat)
+            M.ensure_owner(db, "dafeiyu", owner,
+                           tier=M.TIER_OWNER if is_owner else M.TIER_KNOWN,
+                           platform=plat)
+            return json.dumps({"ok": True, "owner": owner}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, result=str)
+    def set_fact_visibility(self, fact_id: str, visibility: str) -> str:
+        """改一条事实的共享级别。
+
+        ⚠ 这是**唯一能把私密变成可共享**的入口，只在界面上由用户点。
+          任何模型、任何自动流程都不该调它 —— 这是整个系统里
+          唯一能主动泄露的口子，所以必须是人来按。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            ok, err = M.set_visibility(db or "", "dafeiyu", int(fact_id),
+                                       visibility, by="ui")
             return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)

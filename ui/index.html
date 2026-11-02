@@ -530,6 +530,62 @@
           </div>
         </div>
 
+        <div class="card" style="margin-top:16px" id="ownerCard">
+          <div class="card-head">
+            <h2>主人与共享</h2>
+            <span class="tag" id="ownerTag">—</span>
+          </div>
+          <div class="card-desc" style="margin-bottom:12px">
+            <strong>这里的每一条记忆都属于某一个人，只有那个人能看见。</strong>
+            「主人」是唯一能让你看全部记录的身份 —— 数据存在你自己的电脑上，
+            主人当然能翻自己家里所有东西。<br>
+            但对<strong>别人</strong>，她只会说出被标成「可共享」的基础信息
+            （爱吃什么、爱好、作息），私密的一律不提。
+          </div>
+
+          <div class="health-row" id="ownerHealth" style="margin-bottom:12px">
+            <span class="health-tag">读取中…</span>
+          </div>
+
+          <div class="form" style="margin-bottom:12px">
+            <div class="field full">
+              <label>从微信会话里选一个主人</label>
+              <div class="path-row">
+                <select id="ownerPick" style="flex:1">
+                  <option value="">正在读取会话…</option>
+                </select>
+                <button class="btn btn-primary" id="btnBindOwner">设为主人</button>
+              </div>
+              <small>
+                点选而不是手打 wxid —— 打错一个字符就会绑到一个不存在的号，
+                而且没人记得住自己的 wxid。
+                绑定后<strong>立刻生效</strong>，不用重启。
+              </small>
+            </div>
+            <div class="field full">
+              <label>补一个别的平台身份（可选）</label>
+              <div class="path-row">
+                <select id="idPlatform">
+                  <option value="bilibili">B 站</option>
+                  <option value="douyin">抖音</option>
+                  <option value="phone">手机号</option>
+                  <option value="wechat">微信</option>
+                </select>
+                <input type="text" id="idValue" placeholder="比如 UID 或手机号" style="flex:1">
+                <button class="btn btn-sm" id="btnAddIdentity">添加</button>
+              </div>
+              <small>
+                ⚠ 现在这是「新建一个身份」，<strong>还不会</strong>把 B 站号和微信号
+                合并成同一个人。真正的跨平台合并需要一层 person 表，那是下一步。
+              </small>
+            </div>
+          </div>
+
+          <div class="session-list" id="ownerList">
+            <div class="empty" style="padding:12px 0"><p>读取中…</p></div>
+          </div>
+        </div>
+
         <div class="card" style="margin-top:16px">
           <div class="card-head">
             <h2>她认定的事</h2>
