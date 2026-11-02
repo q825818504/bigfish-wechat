@@ -54,9 +54,25 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-# 版本号写入 PRAGMA user_version。老库是 1，加了事实层之后是 2。
+# 版本号写入 PRAGMA user_version。
+#   1  原文四表（MemoryStore 兼容）
+#   2  事实层 + 反思 + 锚点元数据
+#   3  多 owner 隔离 + 行为习惯 + 置顶 + visibility
 # 只在 migrate() 里推进，不靠文件名或 PRAGMA 之外的任何状态。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+# 老库（v1/v2）没有这些列，migrate() 用 ALTER TABLE 补。
+# SQLite 的 ADD COLUMN 是常数时间，不影响已有行。
+FACT_COLUMNS_V3: Tuple[Tuple[str, str], ...] = (
+    # 这条事实属于哪个 owner（private:<platform>:<chat> 或 group:<platform>:<id>）
+    ("owner", "TEXT NOT NULL DEFAULT ''"),
+    # 共享级别：private / shared / public —— 见下面的 VIS_* 常数
+    ("visibility", "TEXT NOT NULL DEFAULT 'private'"),
+    # 平台来源，为以后接抖音 / B站预留；空 = 老数据（微信）
+    ("platform", "TEXT NOT NULL DEFAULT 'wechat'"),
+    # 置顶标记。置顶的事实进独立预算，不跟普通检索抢名额
+    ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -121,9 +137,15 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         source_chunks TEXT NOT NULL DEFAULT '[]',
         evidence TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-        note TEXT NOT NULL DEFAULT '')""",
+        note TEXT NOT NULL DEFAULT '',
+        owner TEXT NOT NULL DEFAULT '',
+        visibility TEXT NOT NULL DEFAULT 'private',
+        platform TEXT NOT NULL DEFAULT 'wechat',
+        pinned INTEGER NOT NULL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS facts_bank_status ON facts(bank,status,id)",
     "CREATE INDEX IF NOT EXISTS facts_bank_anchor ON facts(bank,anchor,predicate)",
+    "CREATE INDEX IF NOT EXISTS facts_owner ON facts(bank,owner,status,id)",
+    "CREATE INDEX IF NOT EXISTS facts_vis ON facts(bank,visibility,status)",
     # 事实事件：记 → 改 → 忘，每一步都留痕。忘记不是删除。
     """CREATE TABLE IF NOT EXISTS fact_events (
         id INTEGER PRIMARY KEY, bank TEXT NOT NULL, fact INTEGER,
@@ -143,7 +165,72 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         last_message INTEGER NOT NULL DEFAULT 0,
         last_run INTEGER NOT NULL DEFAULT 0,
         last_error TEXT NOT NULL DEFAULT '')""",
+
+    # ── v3：多用户隔离 ────────────────────────────────────────────────
+    #
+    # 以前全库只有一个 bank（"dafeiyu"），所有聊天混在一起。现在她要去
+    # 微信以外的地方（群、抖音、B站），必须按「谁在跟我说话」分区。
+    #
+    # owner 的算法（与插件同一个思路，但更简单）：
+    #     private:<platform>:<chat_id>     私聊，只有这个人能看到
+    #     group:<platform>:<group_id>      群聊，群里的人共同可见
+    #
+    # ⚠ 绝不用昵称做 key —— 昵称会改、会重名。只用平台给的稳定 id。
+    """CREATE TABLE IF NOT EXISTS owners (
+        owner TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        platform TEXT NOT NULL DEFAULT 'wechat',
+        external_id TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        tier TEXT NOT NULL DEFAULT 'guest',
+        first_seen INTEGER NOT NULL DEFAULT 0,
+        last_seen INTEGER NOT NULL DEFAULT 0)""",
+
+    # ── v3：行为习惯 ──────────────────────────────────────────────────
+    #
+    # 「说够三次才算」。插件那边的规则值得抄：必须在**不同日期**出现够次数，
+    # 单条消息永远不能变成稳定偏好；陈旧证据随时间衰减。
+    """CREATE TABLE IF NOT EXISTS habits (
+        id INTEGER PRIMARY KEY, bank TEXT NOT NULL, owner TEXT NOT NULL,
+        category TEXT NOT NULL, signature TEXT NOT NULL,
+        samples TEXT NOT NULL DEFAULT '[]',
+        count INTEGER NOT NULL DEFAULT 0,
+        days INTEGER NOT NULL DEFAULT 0,
+        first_at INTEGER NOT NULL DEFAULT 0,
+        last_at INTEGER NOT NULL DEFAULT 0,
+        score REAL NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+        UNIQUE(bank, owner, category, signature))""",
+    "CREATE INDEX IF NOT EXISTS habits_owner ON habits(bank,owner,score)",
+
+    # ── v3：置顶 ──────────────────────────────────────────────────────
+    #
+    # 置顶 = "这条不该被挤掉"。独立预算，不跟普通检索抢名额。
+    """CREATE TABLE IF NOT EXISTS pins (
+        id INTEGER PRIMARY KEY, bank TEXT NOT NULL, owner TEXT NOT NULL,
+        fact INTEGER, text TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        UNIQUE(bank, owner, fact))""",
 )
+
+# 共享级别。**这是防泄露的唯一闸门**，任何注入都必须先过它。
+#
+#   private  只属于某个 owner，绝不跨 owner 出现（默认）
+#   shared   可以给"非主人"看的基础信息（爱吃什么、爱好、作息）
+#   public   世界观级别，谁都能看（角色自己的设定）
+#
+# ⚠ 反过来不成立：private 的**永远**不能因为"对方问了"就升级为 shared。
+#   升级必须由主人显式操作，不能由模型决定 —— 模型一定会被诱导。
+VIS_PRIVATE = "private"
+VIS_SHARED = "shared"
+VIS_PUBLIC = "public"
+VISIBILITIES = (VIS_PRIVATE, VIS_SHARED, VIS_PUBLIC)
+
+# 主人 / 熟人 / 陌生人。非主人只能拿到 shared 与 public。
+TIER_OWNER = "owner"
+TIER_KNOWN = "known"
+TIER_GUEST = "guest"
+TIERS = (TIER_OWNER, TIER_KNOWN, TIER_GUEST)
 
 
 def all_statements() -> Tuple[str, ...]:
@@ -237,18 +324,59 @@ def connect(path: str, *, read_only: bool = False, timeout: float = 10.0) -> sql
     return conn
 
 
+def _columns(conn: sqlite3.Connection, table: str) -> set:
+    try:
+        return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    except Exception:
+        return set()
+
+
 def migrate(path: str) -> Tuple[bool, str]:
-    """把一个已有库补齐到当前 schema。**只加表，不改列**。
+    """把一个已有库补齐到当前 schema。**只加表、只加列**，不改也不删。
 
     返回 (ok, error)。已经是最新时是空操作，可以每次启动都调。
+
+    三步：
+      1. 建所有派生的新表（CREATE TABLE IF NOT EXISTS）
+      2. 给 facts 补 v3 的四列（ALTER TABLE ADD COLUMN，常数时间）
+      3. 推进 user_version
+
+    ⚠ ALTER TABLE 之前必须查 PRAGMA table_info —— SQLite 没有
+      "ADD COLUMN IF NOT EXISTS"，重复执行会抛
+      "duplicate column name"。这一步被 selftest 的"重复迁移"用例钉住。
     """
     if not path or not os.path.isfile(path):
         return False, "记忆库不存在"
     try:
         conn = sqlite3.connect(path, timeout=10)
         try:
+            # ① **先补列**，再建表。
+            #   顺序错了会踩这个坑：CREATE TABLE IF NOT EXISTS 对已存在的
+            #    旧 facts 表什么都不做（列还是老的），而后面 UPDATE 里
+            #    引用了新列 → "no such column: owner"。
+            #    所以必须先 ALTER，再跑建表语句（建表语句对老表是空操作，
+            #    对新表会建出完整结构）。
+            if _columns(conn, "facts"):
+                existing = _columns(conn, "facts")
+                for name, decl in FACT_COLUMNS_V3:
+                    if name not in existing:
+                        conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
+
+            # ② 建所有派生的新表（CREATE TABLE IF NOT EXISTS）
             for stmt in DERIVED_STATEMENTS:
                 conn.execute(stmt)
+
+            # ③ 老数据没有 owner：归到 legacy，但**保持 private**。
+            #    绝不因为迁移就把私密内容变成共享。
+            conn.execute(
+                "UPDATE facts SET owner = 'legacy:' || bank "
+                "WHERE owner IS NULL OR owner = ''")
+            conn.execute(
+                "UPDATE facts SET platform = 'wechat' "
+                "WHERE platform IS NULL OR platform = ''")
+            conn.execute(
+                "UPDATE facts SET visibility = 'private' "
+                "WHERE visibility IS NULL OR visibility = ''")
             ver = conn.execute("PRAGMA user_version").fetchone()[0]
             if ver < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -360,6 +488,157 @@ def list_anchors(conn: sqlite3.Connection, bank: str) -> List[Dict[str, Any]]:
 ACTIVE, SUPERSEDED, FORGOTTEN = "active", "superseded", "forgotten"
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 身份与隔离 —— 记忆库唯一的安全边界
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 她的记忆要分两层看：
+#
+#   谁在跟我说话（owner）  →  决定"能看见什么"
+#   这条事实的级别（visibility）→ 决定"能不能给这个人看"
+#
+# 两个条件同时成立才能注入。缺任何一个都不行。
+#
+# ⚠ 最危险的一条：**模型一定会在被追问时试图扩大自己的权限**。
+#   所以"能不能升级 visibility"永远不由模型决定，只由主人显式操作。
+
+
+def make_owner(kind: str, external_id: str, *, platform: str = "wechat") -> str:
+    """算 owner 键。`private:<platform>:<id>` 或 `group:<platform>:<id>`。
+
+    ⚠ 只用平台给的稳定 id，绝不用昵称 ——
+      昵称会改、会重名、群名片可以随便设。用昵称做 key 等于把
+      两个人的记忆混到一起，而且污染不可逆。
+    """
+    kind = (kind or "").strip().lower()
+    if kind not in ("private", "group"):
+        raise ValueError("owner kind 只能是 private 或 group")
+    eid = (external_id or "").strip()
+    if not eid:
+        raise ValueError("owner 需要稳定的 external_id")
+    plat = (platform or "wechat").strip().lower() or "wechat"
+    return f"{kind}:{plat}:{eid}"
+
+
+def owner_of_private(external_id: str, *, platform: str = "wechat") -> str:
+    return make_owner("private", external_id, platform=platform)
+
+
+def owner_of_group(external_id: str, *, platform: str = "wechat") -> str:
+    return make_owner("group", external_id, platform=platform)
+
+
+def ensure_owner(path: str, bank: str, owner: str, *, display_name: str = "",
+                 tier: str = TIER_GUEST, platform: str = "wechat",
+                 now: Optional[int] = None) -> Tuple[bool, str]:
+    """登记一个 owner（第一次见到这个人时调用）。已存在的只更新 last_seen。
+
+    tier 只由主人/管理员改，这里不提供"自己升级自己"的入口。
+    """
+    now = now or _now_ms()
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        kind = owner.split(":", 1)[0] if ":" in owner else "private"
+        with conn:
+            conn.execute(
+                "INSERT INTO owners(owner,kind,platform,external_id,display_name,tier,"
+                "first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(owner) DO UPDATE SET last_seen=excluded.last_seen, "
+                "display_name=CASE WHEN excluded.display_name<>'' "
+                "THEN excluded.display_name ELSE owners.display_name END",
+                (owner, kind, platform, owner.rsplit(":", 1)[-1],
+                 (display_name or "")[:80], tier if tier in TIERS else TIER_GUEST,
+                 now, now))
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def set_tier(path: str, owner: str, tier: str) -> Tuple[bool, str]:
+    """改一个人的身份等级。**只该由主人操作** —— 界面上属于管理动作。"""
+    if tier not in TIERS:
+        return False, f"tier 只能是 {TIERS}"
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            cur = conn.execute("UPDATE owners SET tier=? WHERE owner=?", (tier, owner))
+        if not cur.rowcount:
+            return False, "没有这个 owner"
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def owner_tier(path: str, owner: str, *, default: str = TIER_GUEST) -> str:
+    """读一个人的等级。读不到就按最低权限处理。
+
+    ⚠ 默认值必须是 guest 而不是 owner —— 库坏了、行丢了，
+      宁可把她当陌生人，也不能当主人。
+    """
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return default
+    try:
+        row = conn.execute("SELECT tier FROM owners WHERE owner=?", (owner,)).fetchone()
+        if row is None:
+            return default
+        return row["tier"] if row["tier"] in TIERS else default
+    except Exception:
+        return default
+    finally:
+        conn.close()
+
+
+def visible_visibilities(tier: str) -> Tuple[str, ...]:
+    """这个等级的人**在"别人的内容"里**能看到哪几种级别。
+
+    ⚠ 这里说的是"别的 owner 的东西"。自己 owner 的东西永远全可见，
+      由 scope_filter 的第一条保证，跟 tier 无关。
+
+    **任何等级（包括主人）在别人的内容里都只能看到 shared / public。**
+
+    为什么主人也不放开 private：
+        private 的定义就是"只有属于它的那个 owner 能看"。
+        主人权限管的是"我的东西给不给别人看"，**不是"我能不能翻别人的"**。
+        让主人可以翻遍所有人的私密，等于给了一个巨大的后门：
+        以后接群聊、接抖音，只要套上主人身份就全泄了。
+
+    tier 目前不影响结果 —— 保留参数是为了以后可能加"熟人可见的第三级"。
+    """
+    _ = tier
+    return (VIS_SHARED, VIS_PUBLIC)
+
+
+def scope_filter(owner: str, tier: str) -> Tuple[str, List[str]]:
+    """把 owner + tier 翻成一条 SQL 条件。
+
+    规则只有两条，按顺序：
+
+        ① 属于我的（owner = 我）：**全部可见**，不管它是什么级别
+           —— 别人的私密只对我不可见，我自己的私密我当然看得见。
+        ② 不属于我的：只给 shared / public
+
+    ⚠ 最早这里是"先按级别筛，再按 owner 筛"，结果陌生人连
+      **自己刚说的那条 private** 都看不到 —— 逻辑对了但语义错了。
+      "私密"保护的是"别人看不到我的"，不是"我自己也看不到"。
+    """
+    vis = visible_visibilities(tier)
+    placeholders = ",".join("?" * len(vis))
+    clause = f"(owner = ? OR visibility IN ({placeholders}))"
+    return clause, [owner, *vis]
+
+
 @dataclass
 class Fact:
     predicate: str
@@ -369,6 +648,10 @@ class Fact:
     source_chunks: List[int] = field(default_factory=list)
     evidence: str = ""
     note: str = ""
+    owner: str = ""
+    visibility: str = VIS_PRIVATE
+    platform: str = "wechat"
+    pinned: bool = False
 
     def __post_init__(self) -> None:
         self.predicate = (self.predicate or "").strip()[:120]
@@ -380,6 +663,12 @@ class Fact:
             self.confidence = 0.6
         self.evidence = (self.evidence or "").strip()[:400]
         self.source_chunks = [int(c) for c in (self.source_chunks or [])][:32]
+        # 非法 visibility 直接降回 private —— 失败要往"更安全"的方向倒
+        if self.visibility not in VISIBILITIES:
+            self.visibility = VIS_PRIVATE
+        self.platform = (self.platform or "wechat").strip().lower()[:32]
+        self.owner = (self.owner or "").strip()[:200]
+        self.pinned = bool(self.pinned)
 
     @property
     def ok(self) -> bool:
@@ -399,35 +688,60 @@ def _event(conn: sqlite3.Connection, bank: str, fact_id: Optional[int],
 
 
 def _find_same(conn: sqlite3.Connection, bank: str, fact: Fact) -> Optional[sqlite3.Row]:
-    """同一主体 + 同一谓词已经有一条 active 的事实，就是"要更新"的那条。
+    """同一 owner + 同一主体 + 同一谓词已经有一条 active 的事实，就是"要更新"的那条。
+
+    ⚠ owner 必须参与匹配。以前只看 anchor+predicate，于是
+      **A 说"我爸是老师"、B 说"我爸是医生"会互相覆盖** ——
+      那是记忆污染，而且是"悄悄把人搞混"那种最难查的污染。
 
     object 相同 → 重复提及，只涨置信度，不产生新行（幂等）。
     object 不同 → 新认识覆盖旧的：旧行标 superseded，不删。
     """
+    base = ("SELECT * FROM facts WHERE bank=? AND status='active' "
+            "AND owner=? AND ")
     if fact.anchor:
         return conn.execute(
-            "SELECT * FROM facts WHERE bank=? AND status='active' AND "
-            "anchor=? AND predicate=? ORDER BY id DESC LIMIT 1",
-            (bank, fact.anchor, fact.predicate)).fetchone()
+            base + "anchor=? AND predicate=? ORDER BY id DESC LIMIT 1",
+            (bank, fact.owner, fact.anchor, fact.predicate)).fetchone()
     return conn.execute(
-        "SELECT * FROM facts WHERE bank=? AND status='active' AND "
-        "anchor IS NULL AND predicate=? ORDER BY id DESC LIMIT 1",
-        (bank, fact.predicate)).fetchone()
+        base + "anchor IS NULL AND predicate=? ORDER BY id DESC LIMIT 1",
+        (bank, fact.owner, fact.predicate)).fetchone()
+
+
+_INSERT_FACT = (
+    "INSERT INTO facts(bank,anchor,predicate,object,confidence,status,"
+    "source_chunks,evidence,created_at,updated_at,note,"
+    "owner,visibility,platform,pinned) "
+    "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?)")
+
+
+def _insert_fact(conn: sqlite3.Connection, bank: str, fact: Fact, now: int) -> int:
+    cur = conn.execute(_INSERT_FACT, (
+        bank, fact.anchor, fact.predicate, fact.object, fact.confidence,
+        json.dumps(fact.source_chunks), fact.evidence, now, now, fact.note,
+        fact.owner, fact.visibility, fact.platform, 1 if fact.pinned else 0))
+    return int(cur.lastrowid)
 
 
 def remember(path: str, bank: str, fact: Fact) -> Tuple[bool, Optional[int], str]:
     """写入一条事实。返回 (ok, fact_id, error)。
 
     三种结果：
-      · **新增**：没有同主体同谓词的 active 事实 → INSERT
+      · **新增**：没有同 owner 同主体同谓词的 active 事实 → INSERT
       · **加固**：有，且 object 完全相同 → 置信度上浮（最多到 0.95），不新增行
       · **纠正**：有，但 object 不同 → 旧行 superseded + superseded_by=新行，
         新行新开一条。**两行都在**，所以「她以前以为是 X」查得到。
 
     这个三分法是大肥鱼原来完全没有的：原来记错了只能删，删了就什么都不剩。
+
+    ⚠ owner 为空的写入会被拒绝。这不是形式主义 —— 一条不知道属于谁的事实，
+      在注入时只能二选一：要么谁都看不到（白记），要么谁都看得到（泄露）。
+      所以宁可不收，也不留一条身份不明的事实。
     """
     if not fact.ok:
         return False, None, "predicate / object 为空"
+    if not fact.owner:
+        return False, None, "缺少 owner，拒绝写入（无法判断这条事实属于谁）"
     try:
         conn = connect(path)
     except Exception as exc:
@@ -440,19 +754,14 @@ def remember(path: str, bank: str, fact: Fact) -> Tuple[bool, Optional[int], str
                 if (prev["object"] or "") == fact.object:
                     conf = min(0.95, float(prev["confidence"] or 0) + 0.05)
                     conn.execute(
-                        "UPDATE facts SET confidence=?, updated_at=? WHERE id=?",
-                        (conf, now, prev["id"]))
+                        "UPDATE facts SET confidence=?, updated_at=?, pinned=MAX(pinned,?) "
+                        "WHERE id=?",
+                        (conf, now, 1 if fact.pinned else 0, prev["id"]))
                     _event(conn, bank, int(prev["id"]), "reinforce",
                            f"重复提及：{fact.predicate}", {"confidence": conf})
                     return True, int(prev["id"]), ""
 
-                cur = conn.execute(
-                    "INSERT INTO facts(bank,anchor,predicate,object,confidence,status,"
-                    "source_chunks,evidence,created_at,updated_at,note) "
-                    "VALUES(?,?,?,?,?,'active',?,?,?,?,?)",
-                    (bank, fact.anchor, fact.predicate, fact.object, fact.confidence,
-                     json.dumps(fact.source_chunks), fact.evidence, now, now, fact.note))
-                new_id = int(cur.lastrowid)
+                new_id = _insert_fact(conn, bank, fact, now)
                 conn.execute(
                     "UPDATE facts SET status=?, superseded_by=?, updated_at=? WHERE id=?",
                     (SUPERSEDED, new_id, now, prev["id"]))
@@ -461,15 +770,10 @@ def remember(path: str, bank: str, fact: Fact) -> Tuple[bool, Optional[int], str
                        {"new": new_id, "old_object": prev["object"]})
                 return True, new_id, ""
 
-            cur = conn.execute(
-                "INSERT INTO facts(bank,anchor,predicate,object,confidence,status,"
-                "source_chunks,evidence,created_at,updated_at,note) "
-                "VALUES(?,?,?,?,?,'active',?,?,?,?,?)",
-                (bank, fact.anchor, fact.predicate, fact.object, fact.confidence,
-                 json.dumps(fact.source_chunks), fact.evidence, now, now, fact.note))
-            new_id = int(cur.lastrowid)
+            new_id = _insert_fact(conn, bank, fact, now)
             _event(conn, bank, new_id, "add", fact.predicate,
-                   {"object": fact.object})
+                   {"object": fact.object, "owner": fact.owner,
+                    "visibility": fact.visibility})
             return True, new_id, ""
     except Exception as exc:
         return False, None, str(exc)
@@ -504,11 +808,25 @@ def forget_fact(path: str, bank: str, fact_id: int, reason: str = "") -> Tuple[b
 
 
 def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
-               query: str = "", limit: int = 100, offset: int = 0) -> Dict[str, Any]:
-    """列/搜事实。UI 的「事实」页直接用它。"""
+               query: str = "", limit: int = 100, offset: int = 0,
+               owner: str = "", tier: str = "") -> Dict[str, Any]:
+    """列/搜事实。
+
+    两种调用方式：
+      · **管理视角**（owner 与 tier 都为空）：看得见全部，UI 的管理页用。
+      · **说话视角**（传了 owner 和 tier）：只返回这个人有权看到的事实，
+        走 scope_filter() 那条唯一的隔离判断。
+
+    ⚠ 管理视角只能给 UI 用。任何注入到提示词的路径**必须**传 owner+tier，
+      否则等于把所有人的私密内容摆到台面上。
+    """
     if not path or not os.path.isfile(path):
         return {"items": [], "total": 0}
     where, params = ["bank = ?"], [bank]
+    if owner and tier:
+        clause_extra, extra_params = scope_filter(owner, tier)
+        where.append(clause_extra)
+        params += extra_params
     if status in (ACTIVE, SUPERSEDED, FORGOTTEN):
         where.append("status = ?")
         params.append(status)
@@ -531,7 +849,8 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
         total = conn.execute(f"SELECT COUNT(*) FROM facts{clause}", params).fetchone()[0]
         rows = conn.execute(
             f"SELECT * FROM facts{clause} ORDER BY "
-            "CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC LIMIT ? OFFSET ?",
+            "pinned DESC, CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC "
+            "LIMIT ? OFFSET ?",
             params + [max(1, int(limit)), max(0, int(offset))]).fetchall()
         items = []
         for r in rows:
@@ -539,6 +858,7 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
                 chunks = json.loads(r["source_chunks"] or "[]")
             except Exception:
                 chunks = []
+            keys = set(r.keys())
             items.append({
                 "id": int(r["id"]), "anchor": r["anchor"] or "",
                 "predicate": r["predicate"], "object": r["object"],
@@ -547,6 +867,10 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
                 "createdAt": int(r["created_at"] or 0),
                 "updatedAt": int(r["updated_at"] or 0),
                 "chunks": chunks, "evidence": r["evidence"] or "",
+                "owner": (r["owner"] if "owner" in keys else "") or "",
+                "visibility": (r["visibility"] if "visibility" in keys else VIS_PRIVATE),
+                "platform": (r["platform"] if "platform" in keys else "wechat"),
+                "pinned": bool(r["pinned"]) if "pinned" in keys else False,
             })
         return {"items": items, "total": int(total)}
     except Exception as exc:
@@ -712,22 +1036,107 @@ def recall_text(path: str, bank: str, query: str, *, max_chars: int = 2400) -> s
         return ""
 
 
-def facts_for_prompt(path: str, bank: str, *, anchor: str = "",
-                     limit: int = 12) -> str:
+def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
+                     limit: int = 8, pinned_limit: int = 4) -> str:
     """把「她认为什么」渲染成注入段。这是原文检索之外的第二条腿。
 
     原文给她"你说过什么"，事实给她"我知道你是谁、你偏好什么"。
-    分开注入的原因：原文是逐句的，事实是稳定的，模型用法完全不同。
+
+    ⚠ 这是**最容易泄露的入口**，所以规则写死在这里，不给调用方留余地：
+
+      1. owner 和 tier 是**必填**。没有它们就不知道"能看什么"，
+         直接返回空串 —— 宁可这次不注入，也不能瞎注入。
+      2. 置顶单独走一遍，**独立预算**。置顶的事实不该被普通检索挤掉：
+         "你叫她爸爸"和"今天下雨"不该抢同一个名额。
+      3. 非主人会看到 owner 是别人、但 visibility=shared 的条目 ——
+         这就是"她知道你喜欢吃辣，但不知道你昨天住院了"的实现方式。
     """
-    got = list_facts(path, bank, status=ACTIVE, anchor=anchor,
-                     limit=limit).get("items") or []
-    lines = []
-    for f in got:
-        who = f["anchor"] or "我"
-        conf = f["confidence"]
+    if not owner or not tier:
+        return ""
+    vis = visible_visibilities(tier)
+    placeholders = ",".join("?" * len(vis))
+
+    # ① 置顶：独立预算，先占位
+    pinned = list_facts(path, bank, status=ACTIVE, owner=owner, tier=tier,
+                        limit=max(1, pinned_limit)).get("items") or []
+    # ② 普通：剩下的名额
+    normal = list_facts(path, bank, status=ACTIVE, owner=owner, tier=tier,
+                        limit=max(1, limit)).get("items") or []
+
+    seen, lines = set(), []
+    for item in [i for i in pinned if i.get("pinned")] + normal:
+        fid = item.get("id")
+        if fid in seen:
+            continue
+        seen.add(fid)
+        if len(lines) >= limit + pinned_limit:
+            break
+        who = item["anchor"] or ("我" if item["owner"] == owner else "别人")
+        conf = item["confidence"]
         mark = "" if conf >= 0.7 else "（不确定）"
-        lines.append(f"- {who}｜{f['predicate']}：{f['object']}{mark}")
+        star = "★" if item.get("pinned") else ""
+        lines.append(f"- {star}{who}｜{item['predicate']}：{item['object']}{mark}")
     return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 置顶
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def pin_fact(path: str, bank: str, fact_id: int, *, pinned: bool = True) -> Tuple[bool, str]:
+    """置顶 / 取消置顶一条事实。
+
+    置顶**只是"别被挤掉"**，不改变可信度、不改 visibility、不改状态。
+    别人问起来，置顶的私密事实照样看不到 —— 这两个概念必须分开。
+    """
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            cur = conn.execute("UPDATE facts SET pinned=?, updated_at=? WHERE id=? AND bank=?",
+                               (1 if pinned else 0, _now_ms(), fact_id, bank))
+        if not cur.rowcount:
+            return False, "没有这条事实"
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def set_visibility(path: str, bank: str, fact_id: int, visibility: str,
+                   *, by: str = "") -> Tuple[bool, str]:
+    """改一条事实的共享级别。**这是唯一能把私密变成共享的入口。**
+
+    ⚠ 只该由主人在界面上点。模型、非主人、任何自动流程都不该调它。
+      设计上这里不做权限检查（那是调用方的事），但函数名和文档必须
+      把"这是危险操作"写清楚 —— 因为这是整个系统里唯一能主动泄露的口子。
+    """
+    if visibility not in VISIBILITIES:
+        return False, f"visibility 只能是 {VISIBILITIES}"
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            row = conn.execute("SELECT visibility FROM facts WHERE id=? AND bank=?",
+                               (fact_id, bank)).fetchone()
+            if row is None:
+                return False, "没有这条事实"
+            conn.execute("UPDATE facts SET visibility=?, updated_at=? WHERE id=?",
+                         (visibility, _now_ms(), fact_id))
+            _event(conn, bank, fact_id, "visibility",
+                   f"{row['visibility']} → {visibility}",
+                   {"by": by, "from": row["visibility"], "to": visibility})
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -789,22 +1198,266 @@ def _parse_reflect(raw: str) -> Tuple[List[Fact], str]:
             predicate=str(item.get("predicate") or ""),
             object=str(item.get("object") or ""),
             anchor=str(item.get("anchor") or ""),
-            confidence=item.get("confidence", 0.5),
+            # confidence 必须是真数字 —— 模型可能给 "高" / null / "0.8"。
+            # 以前直接 float() 掉，字符串会静默变成默认值，等于"模型乱写也不报错"。
+            confidence=_coerce_confidence(item.get("confidence")),
             source_chunks=[c for c in (item.get("chunks") or []) if isinstance(c, int)],
             evidence=str(item.get("evidence") or ""),
+            # visibility 默认 private。**模型不许自己说"这条可以给别人看"** ——
+            # 只接受它明确给出的 "shared"，且后面还有一道主人确认（见 desktop）。
+            visibility=(VIS_SHARED if str(item.get("visibility") or "").strip().lower()
+                        == VIS_SHARED else VIS_PRIVATE),
         )
         if f.ok:
             facts.append(f)
     return facts, str(data.get("skip_reason") or "")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 行为习惯 —— 「说够三次才算」
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 为什么要有这一层：facts 是"模型读一遍就想出来的结论"，一次幻觉就永久入库。
+# 习惯是另一回事 —— 它**只数次数，不做解释**：
+#
+#     同一句话，在 ≥3 个**不同日期**出现过 → 才算一个习惯
+#
+# 三个设计要点（都从插件那边学来的，每一条都有血的教训）：
+#
+#   1. `min_count` 与 `min_days` 是**两个独立条件**。
+#      只看次数的话，"今天说了三次好困"就成了"她认定你天天熬夜"。
+#      必须跨日期 —— 一天说一百遍不算习惯。
+#
+#   2. **衰减**。三个月前说过五次的事，不该跟昨天说过五次的一样重。
+#      这里用半衰期（默认 30 天）折现。
+#
+#   3. **只给原话样本，不给标签**。不猜"这是饮食偏好还是抱怨"，
+#      把样本原样交给模型，让它在本轮语境里自己判断。
+#      猜错的标签会跟一辈子，样本不会。
+
+HABIT_MIN_COUNT = 3
+HABIT_MIN_DAYS = 3
+HABIT_MAX_ITEMS = 24
+HABIT_HALF_LIFE_DAYS = 30.0
+_HABIT_BUCKET_HOURS = 8       # 归类用的时间桶：早/午/晚/夜
+
+
+def _day_key(ts_ms: int) -> str:
+    """把一个毫秒时间戳变成「本地日期」，用于"不同日期"判定。"""
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(ts_ms / 1000.0))
+    except Exception:
+        return ""
+
+
+def habit_signature(text: str) -> str:
+    """把一句话压成"同一类说法"的签名。
+
+    用分词结果的**前 6 个词**做指纹：足够区分"好困"和"好饿"，
+    又不会因为多说两个字就变成新习惯。
+
+    ⚠ 不做语义归类。这里只做"长得像不像"的粗判，
+      语义判断交给模型在注入时完成。
+    """
+    toks = terms(text)
+    if not toks:
+        return ""
+    return " ".join(toks[:6])
+
+
+def observe_habit(path: str, bank: str, owner: str, text: str, *,
+                  category: str = "utterance", at: Optional[int] = None) -> Tuple[bool, str]:
+    """记一次习惯观察。同一个签名**重复出现只会累加**，不会新增行。
+
+    这一步很便宜（一次 UPSERT），所以可以每轮都调；重组（衰减 + 截断）
+    由 refresh_habits() 按节奏做，不在这里做。
+    """
+    if not owner or not (text or "").strip():
+        return False, "owner / text 为空"
+    sig = habit_signature(text)
+    if not sig:
+        return False, "分词为空"
+    at = at or _now_ms()
+    day = _day_key(at)
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT * FROM habits WHERE bank=? AND owner=? AND category=? AND signature=?",
+                (bank, owner, category, sig)).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO habits(bank,owner,category,signature,samples,count,days,"
+                    "first_at,last_at,score,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,1,1,?,?,?,?,?)",
+                    (bank, owner, category, sig,
+                     json.dumps([[(text or "").strip()[:200], day]], ensure_ascii=False),
+                     at, at, 1.0, at, at))
+            else:
+                try:
+                    samples = json.loads(row["samples"] or "[]")
+                except Exception:
+                    samples = []
+                seen_days = {s[1] for s in samples if isinstance(s, list) and len(s) > 1}
+                if day not in seen_days:
+                    samples.append([(text or "").strip()[:200], day])
+                    samples = samples[-8:]        # 每类最多留 8 条原话样本
+                    days = int(row["days"] or 0) + 1
+                else:
+                    days = int(row["days"] or 0)
+                conn.execute(
+                    "UPDATE habits SET samples=?, count=count+1, days=?, last_at=?, updated_at=? "
+                    "WHERE id=?",
+                    (json.dumps(samples, ensure_ascii=False), days, at, at, row["id"]))
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def refresh_habits(path: str, bank: str, owner: str, *, now: Optional[int] = None,
+                   half_life_days: float = HABIT_HALF_LIFE_DAYS,
+                   max_items: int = HABIT_MAX_ITEMS) -> Dict[str, Any]:
+    """重算评分、丢掉过期的、截断到上限。**按节奏调用，不是每轮。**
+
+    评分 = 次数 × 衰减。衰减用半衰期：
+        score = count * 0.5 ** (age_days / half_life_days)
+
+    age 用"最后一次出现到现在"，不是"第一次" —— 一个刚提过的老习惯
+    仍然是活的；一个三个月没提过的旧习惯就该沉下去。
+    """
+    now = now or _now_ms()
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        rows = conn.execute(
+            "SELECT * FROM habits WHERE bank=? AND owner=?", (bank, owner)).fetchall()
+        scored = []
+        for r in rows:
+            age_days = max(0.0, (now - int(r["last_at"] or now)) / 86_400_000.0)
+            decay = 0.5 ** (age_days / max(0.1, half_life_days))
+            score = float(r["count"] or 0) * decay
+            scored.append((score, int(r["id"])))
+        scored.sort(key=lambda item: -item[0])
+        keep = {fid for _score, fid in scored[:max_items]}
+        drop = [fid for _score, fid in scored[max_items:]]
+        with conn:
+            for score, fid in scored:
+                conn.execute("UPDATE habits SET score=?, updated_at=? WHERE id=?",
+                             (round(score, 4), now, fid))
+            for fid in drop:
+                conn.execute("DELETE FROM habits WHERE id=?", (fid,))
+        return {"ok": True, "total": len(scored), "kept": len(keep), "dropped": len(drop)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+
+
+def habits_for_prompt(path: str, bank: str, *, owner: str, tier: str,
+                      min_count: int = HABIT_MIN_COUNT,
+                      min_days: int = HABIT_MIN_DAYS,
+                      limit: int = 6) -> str:
+    """把够格的习惯渲染成注入段。
+
+    够格 = count ≥ min_count **且** days ≥ min_days。
+
+    ⚠ 只输出原话样本，不输出"她认定你 X"这类结论。
+      模型拿到样本，自己在本轮语境里判断这是不是饮食偏好。
+    """
+    if not owner or not tier:
+        return ""
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return ""
+    try:
+        rows = conn.execute(
+            "SELECT signature, samples, count, days, score FROM habits "
+            "WHERE bank=? AND owner=? AND count>=? AND days>=? "
+            "ORDER BY score DESC LIMIT ?",
+            (bank, owner, max(1, int(min_count)), max(1, int(min_days)),
+             max(1, int(limit)))).fetchall()
+    except Exception:
+        return ""
+    finally:
+        conn.close()
+    if not rows:
+        return ""
+    lines = []
+    for r in rows:
+        try:
+            samples = json.loads(r["samples"] or "[]")
+        except Exception:
+            samples = []
+        phrases = [s[0] for s in samples if isinstance(s, list) and s and s[0]][:3]
+        if not phrases:
+            continue
+        joined = " / ".join(f"“{p[:40]}”" for p in phrases)
+        lines.append(f"- 说过 {r['count']} 次、跨 {r['days']} 天：{joined}")
+    return "\n".join(lines)
+
+
+def _coerce_confidence(value: Any) -> float:
+    """把模型给的 confidence 收敛到 0..1 的浮点。认不出就退回 0.5。
+
+    这个函数存在的理由：reflection 返回的是模型自由输出，字段类型
+    完全不可信。校验**只做一件正确的事** —— 认不出就取中位数，
+    而不是抛异常让整批反思作废（那样一次格式错误会丢掉一整段记忆）。
+    """
+    if isinstance(value, bool):
+        return 0.5
+    if isinstance(value, (int, float)):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        if not math.isfinite(v):
+            return 0.5
+        return max(0.0, min(1.0, v))
+    if isinstance(value, str):
+        s = value.strip().rstrip("%")
+        try:
+            v = float(s)
+        except ValueError:
+            # "高" / "high" / "0.8" 之类：只认能直接解析的，其余取中位
+            low = value.strip().lower()
+            if low in ("高", "很高", "high", "strong", "确定"):
+                return 0.85
+            if low in ("中", "medium", "一般", "可能"):
+                return 0.6
+            if low in ("低", "很低", "low", "weak", "不确定"):
+                return 0.35
+            return 0.5
+        if s == str(value).strip() and v > 1.0:
+            v = v / 100.0          # 模型常把 85 当成百分比给
+        if not math.isfinite(v):
+            return 0.5
+        return max(0.0, min(1.0, v))
+    return 0.5
+
+
 def reflect_on_session(path: str, bank: str, session: str, call_model,
-                       *, batch: int = 40, now: Optional[int] = None,
+                       *, owner: str = "", tier: str = TIER_GUEST,
+                       batch: int = 40, now: Optional[int] = None,
                        self_names: Sequence[str] = ()) -> Dict[str, Any]:
     """对某个会话的新消息做一次反思，把原文沉淀成事实。
 
     `call_model(system, user) -> str` 由调用方注入（replier.call_model）。
     这样这一层不需要知道模型怎么调、key 在哪，也就不会把网络代码拖进存储层。
+
+    `owner` / `tier`：这个会话属于谁、对方是什么身份。**必须传** ——
+    反思出来的事实要打上"属于谁"的印记，否则写不进去（remember 会拒绝）。
+    tier 同时决定这批事实**默认的共享级别**：
+        主人说的话 → 默认 private（只有她能看）
+        其他人说的话 → 默认 private（对方自己的事，同样只给这个人看）
+    两者都是 private，区别只在于"谁能看到它"由 owner 决定。
 
     `self_names`：**角色自己**的名字与自称（别人叫她什么）。必须传 ——
     否则模型分不清"对方发来一句「肥鱼」"是打招呼还是自我介绍，
@@ -841,6 +1494,8 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
             chunk_ids.extend(cids)
             tag = ",".join(str(c) for c in cids) or "-"
             lines.append(f"[{i}] (chunk {tag}) {who}：{r['text'][:400]}")
+        # 锚点表没有 owner 列 —— 锚点是"这个名字指的是谁"，天然共享；
+        # 真正的隔离在 facts.owner，不在这里。所以这里不加 owner 条件。
         names = [n[0] for n in conn.execute(
             "SELECT name FROM anchors WHERE bank=?", (bank,)).fetchall()]
         self_line = "、".join(n for n in self_names if n) or "（未配置）"
@@ -865,6 +1520,10 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
         added = repaired = 0
         for f in facts:
             f.source_chunks = [c for c in f.source_chunks if c in valid_chunks] or chunk_ids[:1]
+            # 归属由调用方给定，不由模型决定 —— 模型可能把别人的事写到
+            # 另一个人名下，而"归属错了"是比"记错了"更难发现的问题。
+            if not f.owner:
+                f.owner = owner
             ok, _fid, _err = remember(path, bank, f)
             if ok:
                 added += 1

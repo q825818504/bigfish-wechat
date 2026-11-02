@@ -31,6 +31,9 @@ if _ROOT not in sys.path:
 from bigfish import memory as M  # noqa: E402
 from bigfish import vault as V  # noqa: E402
 
+# 测试用 owner：私聊「老爸」
+OWNER = "private:wechat:test-dad"
+
 PASS = 0
 FAIL = 0
 FAILED: list[str] = []
@@ -82,7 +85,7 @@ def t_schema(tmp: str) -> None:
     has = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
-    check("schema 版本 = 2", ver == M.SCHEMA_VERSION, str(ver))
+    check("schema 版本 = 3", ver == M.SCHEMA_VERSION, str(ver))
     check("事实表存在", "facts" in has)
     check("事件表存在", "fact_events" in has)
     check("原文表也还在", {"messages", "chunks", "search_index"} <= has)
@@ -116,6 +119,17 @@ def t_schema(tmp: str) -> None:
     conn.close()
     check("迁移补上了 facts", "facts" in tables, str(sorted(tables)))
     check("原文没丢", M.health(old, "dafeiyu").get("messages") == 1)
+    # 迁移必须幂等：重复调用不能抛 "duplicate column name"
+    ok2, err2 = M.migrate(old)
+    check("重复迁移不报错（幂等）", ok2, err2)
+    ok3, err3 = M.migrate(old)
+    check("第三次迁移仍然幂等", ok3, err3)
+    # 迁移后 facts 必须有 v3 的四列
+    conn = sqlite3.connect(old)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(facts)")}
+    conn.close()
+    check("迁移补上了 owner/visibility", {"owner", "visibility", "platform", "pinned"} <= cols,
+          str(sorted(cols)))
     # 迁移后应当能补索引
     r = M.rebuild_derived(old)
     check("老库能重建索引", r.get("ok") and r.get("chunks") == 1, str(r))
@@ -127,20 +141,23 @@ def t_facts(tmp: str) -> None:
     M.ensure_schema(db)
 
     ok, fid, err = M.remember(db, "dafeiyu", M.Fact(
-        predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7))
+        predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7,
+        owner=OWNER))
     check("新增一条", ok and fid, err)
     got = M.list_facts(db, "dafeiyu")["items"]
     check("列表里有一条 active", len(got) == 1 and got[0]["status"] == "active", str(got))
 
     ok, fid2, err = M.remember(db, "dafeiyu", M.Fact(
-        predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7))
+        predicate="饮食偏好", object="不喝咖啡", anchor="老爸", confidence=0.7,
+        owner=OWNER))
     check("重复提及是幂等（同 id）", ok and fid2 == fid, f"{fid} vs {fid2}")
     got = M.list_facts(db, "dafeiyu")["items"]
     check("重复提及不新增行", len(got) == 1, str(len(got)))
     check("重复提及提高置信度", got[0]["confidence"] > 0.7, got[0]["confidence"])
 
     ok, fid3, err = M.remember(db, "dafeiyu", M.Fact(
-        predicate="饮食偏好", object="改喝无糖豆浆", anchor="老爸", confidence=0.85))
+        predicate="饮食偏好", object="改喝无糖豆浆", anchor="老爸", confidence=0.85,
+        owner=OWNER))
     check("不同 object → 纠正，产生新行", ok and fid3 != fid, f"{fid} {fid3}")
     allf = M.list_facts(db, "dafeiyu")["items"]
     by_id = {f["id"]: f for f in allf}
@@ -150,14 +167,14 @@ def t_facts(tmp: str) -> None:
     check("新的是 active", by_id[fid3]["status"] == "active")
     check("active 只留一条", len(M.list_facts(db, "dafeiyu", status="active")["items"]) == 1)
     check("提示词只用 active",
-          "无糖豆浆" in M.facts_for_prompt(db, "dafeiyu")
-          and "不喝咖啡" not in M.facts_for_prompt(db, "dafeiyu"))
+          "无糖豆浆" in M.facts_for_prompt(db, "dafeiyu", owner=OWNER, tier=M.TIER_OWNER)
+          and "不喝咖啡" not in M.facts_for_prompt(db, "dafeiyu", owner=OWNER, tier=M.TIER_OWNER))
 
     ok, err = M.forget_fact(db, "dafeiyu", fid3, "用户要求")
     check("遗忘成功", ok, err)
     by_id = {f["id"]: f for f in M.list_facts(db, "dafeiyu")["items"]}
     check("遗忘后是 forgotten", by_id[fid3]["status"] == "forgotten", by_id[fid3]["status"])
-    check("遗忘后不再注入", M.facts_for_prompt(db, "dafeiyu") == "")
+    check("遗忘后不再注入", M.facts_for_prompt(db, "dafeiyu", owner=OWNER, tier=M.TIER_OWNER) == "")
     check("遗忘仍然查得到（行还在）", fid3 in by_id)
 
     ev = M.fact_events(db, "dafeiyu")
@@ -166,9 +183,9 @@ def t_facts(tmp: str) -> None:
           {"add", "correct", "forget"} <= kinds, str(kinds))
 
     # 空谓词/空对象必须被拒
-    ok, _f, err = M.remember(db, "dafeiyu", M.Fact(predicate="", object="x"))
+    ok, _f, err = M.remember(db, "dafeiyu", M.Fact(predicate="", object="x", owner=OWNER))
     check("空 predicate 被拒", not ok, err)
-    ok, _f, err = M.remember(db, "dafeiyu", M.Fact(predicate="x", object=""))
+    ok, _f, err = M.remember(db, "dafeiyu", M.Fact(predicate="x", object="", owner=OWNER))
     check("空 object 被拒", not ok, err)
 
 
@@ -300,12 +317,14 @@ def t_reflect(tmp: str) -> None:
             "skip_reason": ""}, ensure_ascii=False)
 
     r = M.reflect_on_session(db, "dafeiyu", "wechat:dad", fake,
+                          owner=OWNER, tier=M.TIER_OWNER,
                           self_names=["大肥鱼"])
     check("反思成功", r.get("ok"), str(r))
     check("产出 1 条事实", r.get("added") == 1, str(r))
     check("调了一次模型", calls["n"] == 1, str(calls))
 
     r2 = M.reflect_on_session(db, "dafeiyu", "wechat:dad", fake,
+                          owner=OWNER, tier=M.TIER_OWNER,
                           self_names=["大肥鱼"])
     check("没有新消息时不重复反思", r2.get("ok") and r2.get("added") == 0, str(r2))
 
@@ -321,9 +340,11 @@ def t_reflect(tmp: str) -> None:
 
     V.capture_message("wechat:dad", "r3", "user", "还有一句新话", db_path=db)
     r3 = M.reflect_on_session(db, "dafeiyu", "wechat:dad", boom,
+                          owner=OWNER, tier=M.TIER_OWNER,
                           self_names=["大肥鱼"])
     check("模型失败 → 报 ok=False", not r3.get("ok"), str(r3))
     r4 = M.reflect_on_session(db, "dafeiyu", "wechat:dad", fake,
+                          owner=OWNER, tier=M.TIER_OWNER,
                           self_names=["大肥鱼"])
     check("失败后水位没推进，下次还能重试", r4.get("ok") and r4.get("messages", 0) >= 1, str(r4))
 
@@ -355,6 +376,136 @@ def t_cli(tmp: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
+def t_isolation(tmp: str) -> None:
+    section("隔离：主人 vs 陌生人，私密永不外泄")
+    db = os.path.join(tmp, "iso.sqlite3")
+    M.ensure_schema(db)
+
+    me = M.owner_of_private("owner-wxid")
+    other = M.owner_of_private("stranger-wxid")
+
+    # 主人两条：一条私密、一条可共享
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="身体状况", object="上个月做了个小手术", anchor="我",
+        confidence=0.9, owner=me, visibility=M.VIS_PRIVATE))
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="饮食偏好", object="爱吃辣", anchor="我",
+        confidence=0.8, owner=me, visibility=M.VIS_SHARED))
+    # 陌生人自己一条
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="职业", object="做设计的", anchor="对方",
+        confidence=0.8, owner=other, visibility=M.VIS_PRIVATE))
+
+    # 主人看自己：能看私密与共享；**但看不到别人的 private**
+    # （主人权限管的是"我的东西给不给别人看"，不是"我能不能翻别人的"）
+    own_view = M.list_facts(db, "dafeiyu", owner=me, tier=M.TIER_OWNER)["items"]
+    objs = {f["object"] for f in own_view}
+    check("主人看得到自己的私密", "上个月做了个小手术" in objs, str(objs))
+    check("主人看得到自己的共享", "爱吃辣" in objs, str(objs))
+    check("主人也看不到别人的私密", "做设计的" not in objs, str(objs))
+
+    # 陌生人看：只能拿到 shared，拿不到主人的 private
+    other_view = M.list_facts(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)["items"]
+    objs2 = {f["object"] for f in other_view}
+    check("陌生人看得到共享（爱吃辣）", "爱吃辣" in objs2, str(objs2))
+    check("陌生人拿不到主人私密", "上个月做了个小手术" not in objs2, str(objs2))
+    check("陌生人看得到自己的", "做设计的" in objs2, str(objs2))
+
+    # 注入函数必须走同一套规则
+    prompt_other = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
+    check("注入：陌生人拿不到私密", "手术" not in prompt_other, prompt_other)
+    check("注入：陌生人能拿到共享", "爱吃辣" in prompt_other, prompt_other)
+
+    # 没 owner 就不注入（宁可空缺也不要瞎给）
+    check("缺 owner 时不注入", M.facts_for_prompt(db, "dafeiyu", owner="", tier="") == "")
+
+    # 主人默认值不能是 owner
+    check("读不到等级时默认 guest",
+          M.owner_tier(db, "private:wechat:nobody") == M.TIER_GUEST)
+
+    # 非数字 owner：昵称不该能当 key（只校验 id 非空）
+    try:
+        M.owner_of_private("")
+        check("空 owner 被拒", False)
+    except ValueError:
+        check("空 owner 被拒", True)
+
+    # 升级 visibility 是显式动作，且会留痕
+    fid = [f["id"] for f in M.list_facts(db, "dafeiyu", query="手术")["items"]][0]
+    ok, err = M.set_visibility(db, "dafeiyu", fid, M.VIS_SHARED, by="owner")
+    check("可以显式改成共享", ok, err)
+    after = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
+    check("改共享后陌生人可见", "手术" in after, after)
+    ev = [e["kind"] for e in M.fact_events(db, "dafeiyu")]
+    check("改可见性留了事件", "visibility" in ev, str(ev))
+
+
+def t_pinned(tmp: str) -> None:
+    section("置顶：独立预算，不被普通检索挤掉")
+    db = os.path.join(tmp, "pin.sqlite3")
+    M.ensure_schema(db)
+    me = M.owner_of_private("p")
+    ok, fid, _ = M.remember(db, "dafeiyu", M.Fact(
+        predicate="称呼", object="要叫她爸爸", anchor="我", confidence=0.9, owner=me))
+    check("写入一条", ok and fid)
+    # 再塞一堆普通事实
+    for i in range(20):
+        M.remember(db, "dafeiyu", M.Fact(
+            predicate=f"杂项{i}", object=f"随便什么{i}", confidence=0.5, owner=me))
+    ok, err = M.pin_fact(db, "dafeiyu", fid, pinned=True)
+    check("置顶成功", ok, err)
+    text = M.facts_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER,
+                              limit=3, pinned_limit=1)
+    check("置顶的排在前面且有星标", text.startswith("- ★"), text[:60])
+    check("置顶内容出现", "要叫她爸爸" in text, text[:120])
+
+    ok, err = M.pin_fact(db, "dafeiyu", fid, pinned=False)
+    check("取消置顶", ok, err)
+    text2 = M.facts_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER,
+                               limit=3, pinned_limit=1)
+    check("取消后没有星标", "★" not in text2, text2[:60])
+
+
+def t_habits(tmp: str) -> None:
+    section("习惯：说够三次且在三个不同日期才算")
+    db = os.path.join(tmp, "habit.sqlite3")
+    M.ensure_schema(db)
+    me = M.owner_of_private("h")
+
+    # 同一天说三次：不够格（这就是"今天说了三遍好困"不应该变习惯）
+    day1 = 1_790_000_000_000
+    for i in range(3):
+        M.observe_habit(db, "dafeiyu", me, "好困啊想睡觉", at=day1 + i * 1000)
+    txt = M.habits_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER)
+    check("同一天说三次不算习惯", txt == "", repr(txt))
+
+    # 再跨两天 → 够格
+    M.observe_habit(db, "dafeiyu", me, "好困啊想睡觉", at=day1 + 86_400_000)
+    M.observe_habit(db, "dafeiyu", me, "好困啊想睡觉", at=day1 + 2 * 86_400_000)
+    txt2 = M.habits_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER)
+    check("跨三天后够格", "好困" in txt2, repr(txt2))
+    check("注入的是原话样本不是结论", "说过" in txt2 and "次" in txt2, txt2[:60])
+
+    # 别的 owner 看不到
+    other = M.owner_of_private("h2")
+    check("别的 owner 看不到", M.habits_for_prompt(db, "dafeiyu", owner=other,
+                                                   tier=M.TIER_GUEST) == "")
+
+    # 衰减：放很久以后，评分应下降
+    before = M.refresh_habits(db, "dafeiyu", me, now=day1 + 3 * 86_400_000)
+    score_now = [r for r in [before]]
+    check("重组成功", before.get("ok"), str(before))
+    later = M.refresh_habits(db, "dafeiyu", me,
+                             now=day1 + 3 * 86_400_000 + 300 * 86_400_000)
+    check("放 300 天后仍在（未超上限）", later.get("total", 0) >= 1, str(later))
+    import sqlite3 as _s3
+    c = _s3.connect(db)
+    sc = c.execute("SELECT score FROM habits").fetchone()[0]
+    c.close()
+    check("衰减后评分变低", sc < 3.0, f"score={sc}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 def main() -> int:
     print("=" * 66)
     print("记忆层自检")
@@ -372,6 +523,9 @@ def main() -> int:
         t_session_delete(tmp)
         t_anchor(tmp)
         t_reflect(tmp)
+        t_isolation(tmp)
+        t_pinned(tmp)
+        t_habits(tmp)
         t_health(tmp)
         t_cli(tmp)
     finally:
