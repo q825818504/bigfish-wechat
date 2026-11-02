@@ -462,9 +462,6 @@ class UiaSender:
             return False
         time.sleep(0.3)
 
-        edit.SetFocus()
-        time.sleep(0.2)
-
         gui = None
         box = None
         try:
@@ -476,16 +473,33 @@ class UiaSender:
         for n in range(max(1, attempts)):
             before = self._input_region_signature(gui, box)
 
+            # 清空。这里仍然用控件级 SendKeys —— 清空是纯文本操作，
+            # 控件自己处理，不需要走系统队列。
             edit.SendKeys("{Ctrl}a{Delete}", waitTime=0.1)
-            time.sleep(0.35)      # ⚠ 别急着粘：Delete 可能晚到，把刚粘的删掉
+            time.sleep(0.35)      # 别急着粘：Delete 可能晚到，把刚粘的删掉
             self._restore_clipboard_files(path)
-            edit.SendKeys("{Ctrl}v", waitTime=0.1)
+
+            # ═══ 关键：用**真实键盘事件**粘贴 ═══
+            #
+            #   edit.SendKeys("{Ctrl}v") 是控件级投递，对文本有效、对文件无效。
+            #   实测（2026-11-02）：同一张 GIF，用户手动 Ctrl+V 能贴进输入框，
+            #   而 SendKeys 投递的 Ctrl+V 什么都不发生 —— 输入框前后像素
+            #   一个都没变，截图里也是空的。
+            #
+            #   差别在消息从哪个队列进：SendKeys 直接写进那个 Edit 控件，
+            #   微信的 Qt 主循环根本不参与；文件是「把文件对象放进输入框」
+            #   这种富操作，得由主循环自己处理，控件级消息会被直接忽略。
+            #
+            #   WinInput.key 走 keybd_event，进的是系统输入队列，和人手一样。
+            if not self._real_paste(gui, box):
+                self._warn("真实 Ctrl+V 投递失败（拿不到键盘输入器）")
 
             changed, after = self._wait_input_area_change(
                 gui, box, before, wait=3.0)
 
             if changed or self._value_has_object(edit):
-                edit.SendKeys("{Enter}", waitTime=0.05)
+                # 回车也走真实键盘 —— 同一个理由，控件级回车对附件无效。
+                self._real_enter(gui)
                 return True
 
             if n < attempts - 1:
@@ -499,6 +513,40 @@ class UiaSender:
         self._warn(
             f"粘贴三次都没让输入框发生变化，判定失败：{os.path.basename(path)}")
         return False
+
+    # ── 真实键盘 ────────────────────────────────────────────────────
+
+    def _real_paste(self, gui, box) -> bool:
+        """把焦点点进输入框，然后发真实的 Ctrl+V。
+
+        为什么要先点：keybd_event 发的是**全局**按键，谁有焦点谁收。
+        控件级 SendKeys 不受焦点影响，真实按键受影响 —— 这是换路线
+        必须补上的一步，否则按键会打到最后活跃的那个窗口里去。
+        """
+        try:
+            if gui is not None and box:
+                gui.focus_input(box)
+                time.sleep(0.25)
+            from wechatauto.guia import WinInput
+
+            WinInput().key(0x56, ctrl=True)     # VK_V
+            time.sleep(0.5)
+            return True
+        except Exception as exc:
+            self._warn(f"真实 Ctrl+V 失败：{exc}")
+            return False
+
+    def _real_enter(self, gui) -> bool:
+        """真实回车。附件提交同样需要走系统输入队列。"""
+        try:
+            from wechatauto.guia import WinInput
+
+            WinInput().key(0x0D)                # VK_RETURN
+            time.sleep(1.0)
+            return True
+        except Exception as exc:
+            self._warn(f"真实回车失败：{exc}")
+            return False
 
     # ── 草稿判据 ────────────────────────────────────────────────────
 

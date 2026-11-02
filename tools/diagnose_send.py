@@ -95,6 +95,29 @@ def snap(gui, tag, outdir):
         return ""
 
 
+def sig(gui, box):
+    """输入框区域的灰度指纹，用来比粘贴前后变没变。"""
+    if not box:
+        return None
+    try:
+        x0, y0, x1, y1 = box
+        rel = (x0 + 4, y0 + 4, x1 - 4, y1 - 4)
+        return gui._grab_screen(gui._rel_to_screen(rel)).convert("L").resize((48, 16))
+    except Exception:
+        return None
+
+
+def sig_diff(a, b) -> float:
+    if a is None or b is None:
+        return -1.0
+    try:
+        x = list(a.getdata())
+        y = list(b.getdata())
+        return sum(abs(p - q) for p, q in zip(x, y)) / max(1, len(x))
+    except Exception:
+        return -1.0
+
+
 def foreground_title() -> str:
     """当前前台窗口标题。用来确认"提到前面的到底是不是微信"。"""
     try:
@@ -200,7 +223,7 @@ def main() -> int:
         edit.SendKeys("{Ctrl}v", waitTime=0.1)
         time.sleep(1.5)
 
-        show("粘贴后 Value", val())
+        show("控件级 SendKeys 粘贴后 Value", val())
         b = box()
         print(f"  输入框矩形: {b}")
         if b:
@@ -211,68 +234,92 @@ def main() -> int:
                       f"{gui._input_box_has_text(b)}")
             except Exception as exc:
                 print(f"  像素检测失败：{exc}")
-        snap(gui, "1-粘贴后", outdir)
+        snap(gui, "1-控件级粘贴", outdir)
 
         # ══════════════════════════════════════════════════
-        print("\n── 步骤 2a：回车发送（UIA SendKeys 路线）──")
-        edit.SendKeys("{Enter}", waitTime=0.05)
+        print("\n── 步骤 2：真实键盘 Ctrl+V（keybd_event，走系统输入队列）──")
+        print("   已知：控件级 SendKeys 对文件无效，人手 Ctrl+V 有效。")
+        print("   差别在消息从哪个队列进 —— 这一步验证换队列是否就够了。")
+
+        from wechatauto.guia import WinInput
+
+        b = box()
+        before_sig = sig(gui, b)
+        if b:
+            try:
+                gui.focus_input(b)          # 真实按键吃焦点，必须先点进输入框
+                time.sleep(0.25)
+            except Exception as exc:
+                print(f"     聚焦失败：{exc}")
+        WeChatGUI.copy_files_to_clipboard([gif])   # 重新写一次，保险
+        time.sleep(0.2)
+        WinInput().key(0x56, ctrl=True)             # VK_V
+        time.sleep(1.5)
+
+        show("真实 Ctrl+V 后 Value", val())
+        after_sig = sig(gui, b)
+        print(f"  输入框区域变化：{sig_diff(before_sig, after_sig):.1f}"
+              f"（>6 表示进了东西）")
+        if b:
+            try:
+                print(f"  彩色像素草稿 : {gui._input_box_has_color_draft(b, wait=2.0)}")
+                print(f"  深色像素有字 : {gui._input_box_has_text(b)}")
+            except Exception:
+                pass
+        snap(gui, "2-真实粘贴", outdir)
+
+        # ══════════════════════════════════════════════════
+        print("\n── 步骤 3：真实回车发送 ──")
+        WinInput().key(0x0D)                        # VK_RETURN
         time.sleep(2.0)
         show("回车后 Value", val())
-        snap(gui, "2a-回车后", outdir)
-        after_a, _ = db_latest(gui)
-        print(f"  数据库：{after_a}")
-        sent_a = after_a and before and after_a[0][1] > before[0][1]
-        print(f"  → 发了新消息？{'是' if sent_a else '否'}")
+        snap(gui, "3-真实回车后", outdir)
+        after_c, _ = db_latest(gui)
+        print(f"  数据库：{after_c}")
+        sent_c = after_c and before and after_c[0][1] > before[0][1]
+        print(f"  → 发了新消息？{'是' if sent_c else '否'}")
+        if sent_c:
+            print(f"     新消息类型：{after_c[0][0]!r}"
+                  f"（'动画表情' 才是对的）")
 
         # ══════════════════════════════════════════════════
-        if not sent_a:
-            print("\n── 步骤 2b：换成点「发送」按钮 ──")
-            print("  （UIA SendKeys 投递的回车可能没进到微信的输入框）")
-            edit.SetFocus()
-            time.sleep(0.2)
-            edit.SendKeys("{Ctrl}a{Delete}", waitTime=0.1)
-            time.sleep(0.3)
-            # 重新写一次剪贴板 —— 上一步可能已经把它消耗/清空了
-            WeChatGUI.copy_files_to_clipboard([gif])
-            time.sleep(0.3)
-            edit.SendKeys("{Ctrl}v", waitTime=0.1)
-            time.sleep(1.5)
-            show("重新粘贴后 Value", val())
+        if not sent_c:
+            print("\n── 步骤 3b：换成点「发送」按钮 ──")
+            print("  （真实回车也可能不被认，那就只剩点按钮）")
             b = box()
+            before_sig = sig(gui, b)
             if b:
-                try:
-                    print(f"  彩色像素草稿: {gui._input_box_has_color_draft(b, wait=2.0)}")
-                    print(f"  深色像素有字: {gui._input_box_has_text(b)}")
-                except Exception:
-                    pass
-            snap(gui, "2b-重新粘贴", outdir)
+                gui.focus_input(b)
+                time.sleep(0.25)
+            WeChatGUI.copy_files_to_clipboard([gif])
+            time.sleep(0.2)
+            WinInput().key(0x56, ctrl=True)
+            time.sleep(1.5)
+            print(f"  重新粘贴后区域变化："
+                  f"{sig_diff(before_sig, sig(gui, b)):.1f}")
+            snap(gui, "3b-重新粘贴", outdir)
 
-            clicked = False
             try:
-                # ⚠ 不能直接调 click_send()：它先查 _pending_text_ok(pending)，
-                #   而 _pending_text 只有 input_text() 走过才会被设上。
-                #   我们这条路是直接塞的剪贴板文件，没经过 input_text，
-                #   所以 pending 永远是 None，click_send 会立刻返回 False
-                #   —— 看起来像"发送按钮没反应"，实际是前置检查没过。
                 box_now = gui.get_input_box()
-                print(f"  _input_box_has_text({box_now}) → "
+                print(f"  _input_box_has_text → "
                       f"{gui._input_box_has_text(box_now)}")
                 clicked = gui.click_send()
                 print(f"  click_send() → {clicked}")
             except Exception as exc:
                 print(f"  click_send 失败：{exc}")
             time.sleep(2.0)
-            snap(gui, "2b-点发送后", outdir)
-            after_b, _ = db_latest(gui)
-            print(f"  数据库：{after_b}")
-            sent_b = after_b and before and after_b[0][1] > before[0][1]
-            print(f"  → 发了新消息？{'是' if sent_b else '否'}")
+            snap(gui, "3b-点发送后", outdir)
+            after_d, _ = db_latest(gui)
+            print(f"  数据库：{after_d}")
+            sent_d = after_d and before and after_d[0][1] > before[0][1]
+            print(f"  → 发了新消息？{'是' if sent_d else '否'}")
 
         print("\n" + "=" * 72)
         print("结论怎么读：")
-        print("  粘贴后 Value 空 + 截图里看得见缩略图 → 草稿在，判据错")
-        print("  粘贴后截图也空                      → 粘贴根本没进去")
-        print("  回车无效但点发送有效                → 回车投递有问题")
+        print("  步骤2 区域变化 >6 且步骤3 有新增  → 换队列就够了，改代码")
+        print("  步骤2 区域变化 ~0                → 真实 Ctrl+V 也没进去，"
+              "不是队列问题")
+        print("  步骤2 变了但步骤3 无新增          → 粘贴 OK，提交要换手法")
         print(f"\n看图：{outdir}")
         print("=" * 72)
     finally:

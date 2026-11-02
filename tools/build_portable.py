@@ -1,4 +1,4 @@
-"""生成 v0.2.0 的发布附件：便携版 zip + 文件清单。
+"""生成 v0.2.1 的发布附件：便携版 zip + 文件清单。
 
 产物放到 release/ 下（在 .gitignore 里，不进仓库）。
 """
@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST = os.path.join(ROOT, 'dist', 'BigFish')
 OUT = os.path.join(ROOT, 'release')
-VERSION = '0.2.0'
+VERSION = '0.2.1'
 
 if not os.path.isdir(DIST):
     sys.exit('dist/BigFish 不存在，先打包')

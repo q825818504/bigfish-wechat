@@ -209,14 +209,21 @@ def _open_block(owner: str, tier: str, question: str) -> str:
     """「关于别人、但可以说」的那一小段。
 
     场景：B 问「你主人喜欢吃什么呀」。
-    这时候 owner 是 B（当前会话），但要回答的是**主人**的事，
-    所以不能从 B 的池里找，要去主人的开放信息里找。
 
-    实现上走 owner_said_about：只给 shared + 白名单话题，
-    其余一条都不给。判定在 memory 层做完了，这里只负责"问的是谁"。
+    ⚠ 这一段和 `facts_for_prompt` 里的"全库开放信息"**是两条路，不是重复**：
+        · facts_for_prompt  把开放信息当作**背景**塞进去（她随时可能用到）
+        · 这里        只挑**跟这一问对得上**的那几条，单独成一节
 
-    谁是"主人"由调用方给（self.owner_id）；没绑定主人时这段整体跳过 ——
-    没有主人就无所谓"关于主人"，凭空塞一段反而是错的。
+    为什么还要单独一节：
+        如果只靠背景，她可能理解成"这些是我知道的、我说不说都行"，
+        于是被问到"你主人爱吃啥"时反而答"我哪知道"。
+        给出一节写着"可以告诉别人的事"，她才知道这句能接。
+
+    `question` 用来挑话题：问吃 → 只给食物/口头禅；问爱好 → 给爱好。
+    挑不出来就把全部开放信息给上（宁可多给一点，也不要让她该答的时候哑火）——
+    反正能进这一节的**已经全是**过了白名单的。
+
+    谁是"主人"由 _OWNER_STATE 给；没绑定主人时整段跳过。
     """
     try:
         from bigfish import memory as M, vault as V
@@ -228,10 +235,41 @@ def _open_block(owner: str, tier: str, question: str) -> str:
         if owner == main:
             # 跟自己主人说话，"关于主人"就是他自己，已经在上面那段里了
             return ""
-        txt = M.owner_said_about(db, "dafeiyu", owner, main, question)
-        return txt
+        items = M.open_facts_for(db, "dafeiyu", main, limit=20)
+        if not items:
+            return ""
+        # 按问题挑话题：命中就收窄，没命中就全给（全是白名单内的，不会漏禁区）
+        q = (question or "").strip()
+        if q:
+            hit = [i for i in items if _topic_hits(i.get("topic") or "", q)]
+            if hit:
+                items = hit
+        return "\n".join(f"- {i['predicate']}：{i['object']}" for i in items[:6])
     except Exception:
         return ""
+
+
+#: 话题 → 触发词。问题里出现这些字，就认为在问这一类。
+#:
+#: 只用来**收窄**，不用来放行 —— 判定"能不能说"的唯一依据是 topic 白名单，
+#: 那张表在 memory 层。这里挑错了最多是"多给一条"或"少给一条"，
+#: 不会让禁区内容混进来。
+_TOPIC_WORDS = {
+    "食物": ("吃", "饭", "菜", "辣", "甜", "喝", "零食", "口味", "烧烤", "奶茶"),
+    "爱好": ("爱好", "喜欢玩", "平时", "游戏", "看剧", "听歌", "运动", "兴趣"),
+    "作息": ("睡", "几点", "熬夜", "起", "作息", "休息"),
+    "性格": ("性格", "脾气", "什么脾气", "好相处", "好不好"),
+    "口头禅": ("口头禅", "常说", "老说"),
+    "称呼": ("称呼", "叫什么", "怎么叫", "叫我"),
+}
+
+
+def _topic_hits(topic: str, question: str) -> bool:
+    """这个问题是不是在问这一类事。"""
+    for word in _TOPIC_WORDS.get(topic, ()):
+        if word in question:
+            return True
+    return False
 
 
 class _OwnerState:

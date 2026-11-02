@@ -1769,24 +1769,68 @@ def pool_summary(path: str, bank: str, *, main_owner: str = "") -> Dict[str, Any
     except Exception:
         return out
     try:
+        # ⚠ 这里的"原文条数"要按 owner 直接匹配，不能靠 owners.external_id ——
+        #   老库里 external_id 可能是空的（ensure_owner 早期不写它），
+        #   用 session=external_id 匹配会一律得 0，看着像"这个池没聊过"。
+        #   改成用 owner 的后缀（:wxid_xxx）去撞 messages.session。
         rows = conn.execute(
             "SELECT o.owner, o.kind, o.platform, o.display_name, o.tier, "
             "(SELECT COUNT(*) FROM facts f WHERE f.bank=? AND f.owner=o.owner "
-            " AND f.status='active') AS facts, "
-            "(SELECT COUNT(*) FROM messages m WHERE m.bank=? AND m.session=o.external_id) AS msgs "
-            "FROM owners o ORDER BY facts DESC", (bank, bank)).fetchall()
+            " AND f.status='active') AS facts "
+            "FROM owners o ORDER BY facts DESC", (bank,)).fetchall()
+        # 再单独扫一遍 messages，按 owner 后缀归计数
+        msg_by_owner: Dict[str, int] = {}
+        try:
+            for r in conn.execute(
+                    "SELECT session, COUNT(*) AS n FROM messages WHERE bank=? "
+                    "GROUP BY session", (bank,)).fetchall():
+                sess = str(r["session"] or "")
+                for prefix in ("wechat:",):
+                    if sess.startswith(prefix):
+                        key = owner_of_private(sess[len(prefix):])
+                        msg_by_owner[key] = msg_by_owner.get(key, 0) + int(r["n"])
+                key_g = owner_of_group(sess)
+                msg_by_owner[key_g] = msg_by_owner.get(key_g, 0) + int(r["n"])
+        except Exception:
+            msg_by_owner = {}
         pools = []
         for r in rows:
+            # 名字兜底顺序：display_name → owner 的最后一段 → 整个 owner
+            # ⚠ 老库里 display_name 可能是空的、external_id 也没写，
+            #   直接拿 owner.split 会在 "private:wechat:" 这种残缺键上切出空串，
+            #   界面上就显示成 "private:wechat"。所以最后还要再兜一层。
+            tail = (r["owner"] or "").rsplit(":", 1)[-1].strip()
+            name = r["display_name"] or tail or (r["owner"] or "（未知）")
             pools.append({
                 "owner": r["owner"],
                 "kind": r["kind"],
                 "platform": r["platform"],
-                "name": r["display_name"] or r["external_id"] or r["owner"],
+                "name": name,
                 "tier": r["tier"],
                 "facts": int(r["facts"] or 0),
-                "messages": int(r["msgs"] or 0),
+                "messages": int(msg_by_owner.get(r["owner"], 0)),
                 "isMain": r["owner"] == main_owner,
             })
+        # 有记忆但 owners 表里还没有的（reflect 直接写过、没走 ensure_owner）
+        known = {p["owner"] for p in pools}
+        for ow in _all_owners(path):
+            if ow in known:
+                continue
+            cnt = 0
+            try:
+                cnt = conn.execute(
+                    "SELECT COUNT(*) FROM facts WHERE bank=? AND owner=? "
+                    "AND status='active'", (bank, ow)).fetchone()[0]
+            except Exception:
+                pass
+            kind = "group" if ow.startswith("group:") else "private"
+            pools.append({
+                "owner": ow, "kind": kind, "platform": "wechat",
+                "name": ow.rsplit(":", 1)[-1], "tier": TIER_GUEST,
+                "facts": int(cnt), "messages": int(msg_by_owner.get(ow, 0)),
+                "isMain": ow == main_owner,
+            })
+        pools.sort(key=lambda p: (0 if p["isMain"] else 1, -p["facts"]))
         out["pools"] = pools
         out["total"] = len(pools)
         return out

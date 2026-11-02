@@ -363,3 +363,84 @@ probe_running_accounts()
 
 这是唯一与真实进程挂上钩、又不需要读加密内容的信号。
 （mtime / msvcrt 锁 / sqlite BEGIN IMMEDIATE 都试过，全部无效，详见 decisions D-33）
+
+---
+
+## v0.2.1：记忆的边界
+
+### 事实的三个新维度
+
+```
+facts
+  owner       属于谁       private:wechat:<id> / group:wechat:<id>
+  visibility  谁能看见     private / shared / public
+  origin      在哪儿说的   private / group:<群id> / (空=不知道)
+  topic       讲的哪类事   19 个值，分白/黑/灰三档
+```
+
+`origin` 必须和 `owner` 分开存。群聊双写之后，同一句话在「人池」和「群池」
+各有一份 —— **owner 不同，但 origin 相同**。只有分开存，才说得清
+"这句话是在群里说的"。
+
+### 群聊双写
+
+```
+                  ┌──────────────┐
+群里 A 说一句 ────┤ 反思产出事实  │
+                  └──────┬───────┘
+                         │
+              ┌──────────┴──────────┐
+              ▼                     ▼
+      A 的私聊池              群 C 的池
+      (一定写)          (只有不算私密的才写)
+    origin=group:C          origin=group:C
+```
+
+判定「不算私密」：
+
+```python
+publicish = visibility in (shared, public) or topic_allowed(topic)
+```
+
+两个"公开信号"有一个就够 —— 标了 shared 已经是显式授权，不必再打标签。
+
+### 两套判定必须分开
+
+这是本版最容易踩错的地方：
+
+| 函数 | 回答 | 看 tier 吗 |
+|---|---|---|
+| `visible_visibilities(tier)` | 谁在**界面/提示词**里看得见 | 看（主人=全部） |
+| `open_facts_for(owner)` | 她**说得出**哪些 | **不看**（所有人只看开放信息） |
+
+`facts_for_prompt` 永远只装两样东西：
+**「你自己的」+「所有人的开放信息」**，主人也不例外。
+
+因为「跟 A 说话时脑子里装着 B 的秘密」和「B 能不能看到」是两件事。
+
+### 三道闸门
+
+```
+第一道：owner + visibility     谁能看见这条事实
+第二道：topic 白名单            这条能不能说给外人
+第三道：guard 插件             被追问时守住（不点头、不否认）
+```
+
+少任何一道都会漏：
+- 只有第一道 → 标了 shared 的住址会被端出去
+- 只有前两道 → 「你主人是不是住在朝阳区？」试一下就出来了
+
+### 印象页的数据流
+
+```
+impression_board()
+  ├── owners 表 → 谁都在这一格
+  ├── impressions 表 → 你手写的评语（模型不参与）
+  └── open_facts_for() → 开放信息清单（实时查，不存副本）
+```
+
+开放信息**不存副本**是刻意的：存一份就等于给"她准备说什么"开了第二个真源，
+两边一定会漂。
+
+「删除」= `revoke_open()` = visibility 退回 private + topic 清空。
+**不是 `forget_fact()`** —— 事实还在，她照样拿它当结论，只是不再对外提。
