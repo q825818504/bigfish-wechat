@@ -34,19 +34,7 @@ function toast(text) {
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = text;
-  async function renameAccount(acc) {
-  const cur = ((S.accountList || []).find((a) => a.account === acc) || {});
-  const name = prompt('给这个微信号起个名字（只影响界面显示）：',
-    cur.nick || '');
-  if (name === null) return;
-  try {
-    const r = JSON.parse(await S.bridge.rename_account(acc, name));
-    if (!r.ok) return toast(r.error || '改名失败');
-    toast('已改名');
-    await pickAccount();   // 重画弹窗（会重新拉列表）
-  } catch (e) { toast('改名失败'); }
-}
-
+  
 $('#toastWrap').appendChild(el);
   setTimeout(() => {
     el.classList.add('out');
@@ -420,29 +408,19 @@ async function pickAccount() {
       '连一个没启动的号没有意义，它的消息读不到、也发不出去。<br>' +
       '请先打开微信并登录，再回来点「选择账号」。</p></div>';
   } else {
+    // 每行只留必要信息：昵称、wxid、最后活跃。
+    // 不再有头像圈（只是一个装饰点，占地方）、
+    // 不再有改名按钮（暂时不需要）。
     box.innerHTML = list.map((a) => {
-      // 显示名优先：手填的备注 > 已知昵称/alias > wxid
       const title = a.nick || a.wxid;
       const sub = a.nick ? a.wxid + ' · ' : '';
-      // 「正在运行」= 这个号的数据库正被微信进程占用。
-      // 这是唯一与真实进程挂钩的信号，比"最后活跃时间"可靠得多
-      // （多开时 A 号十分钟前刚写过，可能比正在聊的 B 号时间还近）。
-      const run = a.running
-        ? '<span class="tag ok" style="margin-left:8px">● 正在运行</span>'
-        : '<span class="tag" style="margin-left:8px">未启动</span>';
-      // 头像只放一个符号，不放昵称首字 ——
-      // 放了就跟右边那行名字重复（截图里"四条"出现两次）。
-      return `<div class="session-item">
-        <span class="chat-avatar">●</span>
-        <div class="session-main" data-acc="${esc(a.account)}" style="cursor:pointer">
-          <div class="session-name">${esc(title)}${run}
-            ${a.isSaved ? '<span class="tag" style="margin-left:6px">上次用的</span>' : ''}
-            ${a.chats ? `<span class="tag" style="margin-left:6px">${a.chats} 个会话</span>` : ''}
+      return `<div class="session-item account-row" data-acc="${esc(a.account)}">
+        <div class="session-main">
+          <div class="session-name">${esc(title)}
+            <span class="tag ok" style="margin-left:8px">● 正在运行</span>
           </div>
           <div class="session-sub">${esc(sub)}最后活跃 ${esc(a.lastActivity)}</div>
         </div>
-        <button class="btn btn-sm" data-rename="${esc(a.account)}"
-                title="给这个号起个好认的名字">改名</button>
       </div>`;
     }).join('');
   }
@@ -497,8 +475,6 @@ $('#btnPickAccount').addEventListener('click', pickAccount);
 if ($('#btnSaveWatch')) $('#btnSaveWatch').addEventListener('click', saveWatch);
 $('#btnLoadChats').addEventListener('click', doLoadChats);
 document.addEventListener('click', (e) => {
-  const rn = e.target.closest('[data-rename]');
-  if (rn) { renameAccount(rn.dataset.rename); return; }
   const a = e.target.closest('[data-acc]');
   if (a) { chooseAccount(a.dataset.acc); return; }
   if (e.target.closest('#accountModalClose') || e.target.id === 'accountModal') {
