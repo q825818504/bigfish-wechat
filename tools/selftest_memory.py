@@ -506,6 +506,83 @@ def t_habits(tmp: str) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
+def t_person(tmp: str) -> None:
+    section("person：跨平台同一个人，只能由人认领")
+    db = os.path.join(tmp, "person.sqlite3")
+    M.ensure_schema(db)
+
+    wx = M.owner_of_private("wxid_me")
+    bl = M.owner_of_private("12345", platform="bilibili")
+    st = M.owner_of_private("wxid_stranger")
+
+    # 两个平台各写一条私密
+    M.ensure_owner(db, "dafeiyu", wx, display_name="老爸", tier=M.TIER_OWNER)
+    M.ensure_owner(db, "dafeiyu", bl, display_name="B站的老爸", tier=M.TIER_OWNER,
+                   platform="bilibili")
+    M.ensure_owner(db, "dafeiyu", st, display_name="路人", tier=M.TIER_GUEST)
+    M.remember(db, "dafeiyu", M.Fact(predicate="微信里说的", object="最近失眠",
+                                     owner=wx))
+    M.remember(db, "dafeiyu", M.Fact(predicate="B站里说的", object="在追某部番",
+                                     owner=bl, platform="bilibili"))
+    M.remember(db, "dafeiyu", M.Fact(predicate="路人的事", object="他开了家店",
+                                     owner=st))
+
+    # 认领前：两个平台互相看不见
+    t_wx = M.facts_for_prompt(db, "dafeiyu", owner=wx, tier=M.TIER_OWNER)
+    t_bl = M.facts_for_prompt(db, "dafeiyu", owner=bl, tier=M.TIER_OWNER)
+    check("认领前：微信看不到 B站的", "追某部番" not in t_wx, t_wx)
+    check("认领前：B站看不到微信的", "失眠" not in t_bl, t_bl)
+
+    # 建 person 并挂上去
+    ok, pid, err = M.create_person(db, "老爸", "同一个人")
+    check("建 person", ok and pid, err)
+    ok, err = M.link_owner(db, wx, pid)
+    check("把微信挂上去", ok, err)
+    ok, err = M.link_owner(db, bl, pid)
+    check("把 B站也挂上去", ok, err)
+
+    # 认领后：互相能看到
+    t_wx2 = M.facts_for_prompt(db, "dafeiyu", owner=wx, tier=M.TIER_OWNER)
+    t_bl2 = M.facts_for_prompt(db, "dafeiyu", owner=bl, tier=M.TIER_OWNER)
+    check("微信能看到 B站的记忆了", "追某部番" in t_wx2, t_wx2)
+    check("B站能看到微信的记忆了", "失眠" in t_bl2, t_bl2)
+
+    # 但别人的私密仍然不可见
+    check("别人的私密仍不可见（微信）", "开了家店" not in t_wx2, t_wx2)
+    check("别人的私密仍不可见（B站）", "开了家店" not in t_bl2, t_bl2)
+
+    # 陌生人视角：认领不影响"别人能不能看我的"
+    t_st = M.facts_for_prompt(db, "dafeiyu", owner=st, tier=M.TIER_GUEST)
+    check("陌生人看不到认领者的私密", "失眠" not in t_st and "追某部番" not in t_st, t_st)
+
+    # 合并事件留痕
+    import sqlite3 as _s3
+    c = _s3.connect(db)
+    kinds = [r[0] for r in c.execute("SELECT kind FROM person_events")]
+    c.close()
+    check("合并留了事件", "create" in kinds and kinds.count("link") == 2, str(kinds))
+
+    # 解除认领：又互相看不见
+    ok, err = M.unlink_owner(db, bl)
+    check("解除认领", ok, err)
+    t_wx3 = M.facts_for_prompt(db, "dafeiyu", owner=wx, tier=M.TIER_OWNER)
+    check("解除后又互相看不见", "追某部番" not in t_wx3, t_wx3)
+
+    # 列表
+    persons = M.list_persons(db)
+    check("list_persons 有结果", len(persons) >= 1, str(persons)[:80])
+
+    # 老事实不搬家：认领后，之前写的 facts.person 保持写入时的值
+    c = _s3.connect(db)
+    c.row_factory = _s3.Row
+    rows = [dict(r) for r in c.execute(
+        "SELECT owner, person, person_at_write FROM facts ORDER BY id")]
+    c.close()
+    check("B站那条写入时还没 person", rows[1]["person_at_write"] == "",
+          str(rows[1]))
+
+
+# ══════════════════════════════════════════════════════════════════════
 def main() -> int:
     print("=" * 66)
     print("记忆层自检")
@@ -526,6 +603,7 @@ def main() -> int:
         t_isolation(tmp)
         t_pinned(tmp)
         t_habits(tmp)
+        t_person(tmp)
         t_health(tmp)
         t_cli(tmp)
     finally:

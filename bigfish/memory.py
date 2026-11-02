@@ -58,10 +58,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 #   1  原文四表（MemoryStore 兼容）
 #   2  事实层 + 反思 + 锚点元数据
 #   3  多 owner 隔离 + 行为习惯 + 置顶 + visibility
+#   4  person：跨平台同一个人
 # 只在 migrate() 里推进，不靠文件名或 PRAGMA 之外的任何状态。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
-# 老库（v1/v2）没有这些列，migrate() 用 ALTER TABLE 补。
+# 老库（v1/v2/v3）没有这些列，migrate() 用 ALTER TABLE 补。
 # SQLite 的 ADD COLUMN 是常数时间，不影响已有行。
 FACT_COLUMNS_V3: Tuple[Tuple[str, str], ...] = (
     # 这条事实属于哪个 owner（private:<platform>:<chat> 或 group:<platform>:<id>）
@@ -72,6 +73,15 @@ FACT_COLUMNS_V3: Tuple[Tuple[str, str], ...] = (
     ("platform", "TEXT NOT NULL DEFAULT 'wechat'"),
     # 置顶标记。置顶的事实进独立预算，不跟普通检索抢名额
     ("pinned", "INTEGER NOT NULL DEFAULT 0"),
+    # v4：这条事实属于哪个"人"（跨平台）。空 = 还没认领，按 owner 单独算。
+    ("person", "TEXT NOT NULL DEFAULT ''"),
+    # v4：写入时就记下当时的 person —— 之后 owner 改认领了，
+    # 老事实不会跟着跑。记忆归属要稳定，不能因为改绑定就整体搬家。
+    ("person_at_write", "TEXT NOT NULL DEFAULT ''"),
+)
+
+OWNER_COLUMNS_V4: Tuple[Tuple[str, str], ...] = (
+    ("person", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -184,7 +194,34 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         display_name TEXT NOT NULL DEFAULT '',
         tier TEXT NOT NULL DEFAULT 'guest',
         first_seen INTEGER NOT NULL DEFAULT 0,
-        last_seen INTEGER NOT NULL DEFAULT 0)""",
+        last_seen INTEGER NOT NULL DEFAULT 0,
+        person TEXT NOT NULL DEFAULT '')""",
+    "CREATE INDEX IF NOT EXISTS owners_person ON owners(person)",
+
+    # ── v4：person（跨平台同一个人）─────────────────────────────────
+    #
+    # 问题：同一个人在微信是 wxid_xxx，在 B站是 UID 12345。
+    # 两套 id 天然对不上 —— 它们在各自的平台里就是两个账号。
+    #
+    # 三种方案，只有第三种能用：
+    #   ① 猜：昵称相同就合并 → 昵称会撞、会改，等于随机把人搞混
+    #   ② 让模型判断：它一定会说"是的，看起来像同一个人" → 不可控
+    #   ③ **人确认**：主人在界面上手动把一个身份挂到某个 person 上
+    #
+    # 所以 person 是一张"人工认领"的表。没有自动合并，一条都没有。
+    """CREATE TABLE IF NOT EXISTS persons (
+        person TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0)""",
+
+    # 合并事件：把 A 并进 B 必须留痕，否则以后没人说得清
+    # "为什么 B站那个人能看到我微信里的记忆"。
+    """CREATE TABLE IF NOT EXISTS person_events (
+        id INTEGER PRIMARY KEY, at INTEGER NOT NULL,
+        kind TEXT NOT NULL, person TEXT NOT NULL DEFAULT '',
+        owner TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '')""",
 
     # ── v3：行为习惯 ──────────────────────────────────────────────────
     #
@@ -356,11 +393,7 @@ def migrate(path: str) -> Tuple[bool, str]:
             #    引用了新列 → "no such column: owner"。
             #    所以必须先 ALTER，再跑建表语句（建表语句对老表是空操作，
             #    对新表会建出完整结构）。
-            if _columns(conn, "facts"):
-                existing = _columns(conn, "facts")
-                for name, decl in FACT_COLUMNS_V3:
-                    if name not in existing:
-                        conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
+            _add_missing_columns(conn)
 
             # ② 建所有派生的新表（CREATE TABLE IF NOT EXISTS）
             for stmt in DERIVED_STATEMENTS:
@@ -389,15 +422,29 @@ def migrate(path: str) -> Tuple[bool, str]:
 
 
 def ensure_schema(path: str) -> Tuple[bool, str]:
-    """建库（不存在就建全量）+ 迁移（存在就补齐）。"""
+    """建库（不存在就建全量）+ 迁移（存在就补齐）。
+
+    ⚠ 两步都会跑，而且**建表之前先补列**。
+      只跑 all_statements() 是不够的：CREATE TABLE IF NOT EXISTS 对已经存在的
+      旧 facts 表什么都不做，列还是老的 —— 于是写入时报
+      "table facts has no column named person"。
+      这个坑踩过两次（v3 一次、v4 一次），所以这里直接复用 migrate() 的逻辑，
+      不再维护第二份。
+    """
     try:
         d = os.path.dirname(path)
         if d:
             os.makedirs(d, exist_ok=True)
         conn = sqlite3.connect(path, timeout=10)
         try:
+            # ① 老库补列（先于建表 —— 顺序反了就会踩上面那个坑）
+            _add_missing_columns(conn)
+            # ② 建表
             for stmt in all_statements():
                 conn.execute(stmt)
+            # ③ 再补一次：新库刚建出来的表已经是全列，这里是空操作；
+            #    但万一 all_statements 里漏了某列，这一步能兜住。
+            _add_missing_columns(conn)
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             conn.commit()
         finally:
@@ -405,6 +452,20 @@ def ensure_schema(path: str) -> Tuple[bool, str]:
         return True, ""
     except Exception as exc:
         return False, str(exc)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """给已有表补上 v3/v4 新增的列。表不存在就跳过。"""
+    existing = _columns(conn, "facts")
+    if existing:
+        for name, decl in FACT_COLUMNS_V3:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
+    existing_o = _columns(conn, "owners")
+    if existing_o:
+        for name, decl in OWNER_COLUMNS_V4:
+            if name not in existing_o:
+                conn.execute(f"ALTER TABLE owners ADD COLUMN {name} {decl}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -534,6 +595,7 @@ def ensure_owner(path: str, bank: str, owner: str, *, display_name: str = "",
     """登记一个 owner（第一次见到这个人时调用）。已存在的只更新 last_seen。
 
     tier 只由主人/管理员改，这里不提供"自己升级自己"的入口。
+    person 列不动 —— 认领是人的动作，不是登记的副作用。
     """
     now = now or _now_ms()
     try:
@@ -555,6 +617,185 @@ def ensure_owner(path: str, bank: str, owner: str, *, display_name: str = "",
         return True, ""
     except Exception as exc:
         return False, str(exc)
+    finally:
+        conn.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# person —— 跨平台"同一个人"
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 规则只有一条：**认领必须由人做，系统一次都不猜。**
+#
+# 同一个人在微信是 wxid_xxx、在 B站是 UID 12345，两套 id 在各自平台里
+# 就是两个账号，没有任何技术手段能可靠地把它们关联起来 ——
+# 昵称会撞会改，头像可以换，让模型判断更是灾难（它一定会说"看起来是同一个人"）。
+#
+# 所以这里是纯人工操作：主人在界面上点"这两个是同一人"，系统才合。
+# 合错的代价（A 看到 B 的记忆）远大于不合的代价（记忆散着）。
+
+
+def person_of_owner(owner: str) -> str:
+    """某个 owner 属于哪个 person。没认领过就返回空串。
+
+    注意：**空串是合法答案**，表示"这个人还没被认领"。
+    这不是错误状态 —— 单个平台使用时根本不需要 person 表。
+    """
+    return ""
+
+
+def create_person(path: str, display_name: str = "", note: str = "") -> Tuple[bool, str, str]:
+    """建一个 person。返回 (ok, person_id, error)。"""
+    pid = "p_" + hashlib.sha1(
+        f"{display_name}|{_now_ms()}".encode("utf-8")).hexdigest()[:12]
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, "", str(exc)
+    try:
+        now = _now_ms()
+        with conn:
+            conn.execute(
+                "INSERT INTO persons(person,display_name,note,created_at,updated_at) "
+                "VALUES(?,?,?,?,?)",
+                (pid, (display_name or "")[:80], (note or "")[:400], now, now))
+            conn.execute(
+                "INSERT INTO person_events(at,kind,person,owner,reason) VALUES(?,?,?,?,?)",
+                (now, "create", pid, "", (display_name or "")[:120]))
+        return True, pid, ""
+    except Exception as exc:
+        return False, "", str(exc)
+    finally:
+        conn.close()
+
+
+def link_owner(path: str, owner: str, person: str) -> Tuple[bool, str]:
+    """把一个平台账号挂到某个 person 上。**这是唯一的合并入口。**
+
+    挂完之后：
+      · 该 owner 之前所有的记忆，注入时按 person 汇总（能看到他别的账号的记忆）
+      · **已经写下的老事实不搬家** —— facts.person 是写入时记的，保持原样。
+        理由见 facts 表注释：记忆归属要稳定，不能因为改绑定就整体迁移。
+
+    如果这个 owner 已经挂在别的 person 上，会先摘下来（一个人只能属于一个人）。
+    """
+    if not owner or not person:
+        return False, "owner / person 不能为空"
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            if not conn.execute("SELECT 1 FROM persons WHERE person=?",
+                                (person,)).fetchone():
+                return False, "没有这个 person"
+            prev = conn.execute("SELECT person FROM owners WHERE owner=?",
+                                (owner,)).fetchone()
+            if prev is None:
+                return False, "没有这个 owner（还没跟他聊过）"
+            conn.execute("UPDATE owners SET person=? WHERE owner=?", (person, owner))
+            _now = _now_ms()
+            conn.execute(
+                "INSERT INTO person_events(at,kind,person,owner,reason) VALUES(?,?,?,?,?)",
+                (_now, "link", person, owner,
+                 f"from={(prev['person'] or '-')} to={person}"[:200]))
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def unlink_owner(path: str, owner: str) -> Tuple[bool, str]:
+    """把某个平台账号从 person 上摘下来。记忆不动，只是不再合并展示。"""
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            row = conn.execute("SELECT person FROM owners WHERE owner=?",
+                               (owner,)).fetchone()
+            if row is None:
+                return False, "没有这个 owner"
+            conn.execute("UPDATE owners SET person='' WHERE owner=?", (owner,))
+            conn.execute(
+                "INSERT INTO person_events(at,kind,person,owner,reason) VALUES(?,?,?,?,?)",
+                (_now_ms(), "unlink", row["person"] or "", owner, "manual"))
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def list_persons(path: str) -> List[Dict[str, Any]]:
+    """列出所有 person 与挂在下面的平台账号。界面用来展示合并关系。"""
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return []
+    try:
+        persons = conn.execute(
+            "SELECT * FROM persons ORDER BY updated_at DESC").fetchall()
+        out = []
+        for p in persons:
+            identities = conn.execute(
+                "SELECT owner,platform,display_name,tier FROM owners WHERE person=? "
+                "ORDER BY platform, owner", (p["person"],)).fetchall()
+            out.append({
+                "person": p["person"],
+                "name": p["display_name"] or "",
+                "note": p["note"] or "",
+                "identities": [{
+                    "owner": i["owner"], "platform": i["platform"],
+                    "name": i["display_name"] or "", "tier": i["tier"],
+                } for i in identities],
+            })
+        # 未认领的账号单独列出，界面才知道"这些还没并"
+        loose = conn.execute(
+            "SELECT owner,platform,display_name,tier FROM owners "
+            "WHERE person IS NULL OR person='' ORDER BY last_seen DESC").fetchall()
+        return out + [{
+            "person": "", "name": "（未认领）", "note": "",
+            "identities": [{
+                "owner": i["owner"], "platform": i["platform"],
+                "name": i["display_name"] or "", "tier": i["tier"],
+            } for i in loose],
+        }] if loose else out
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def owner_persons(path: str, owner: str) -> List[str]:
+    """这个 owner 归属于哪些 person 键。
+
+    返回一个**列表**而不是单个值，因为注入时的查询条件是
+    `owner IN (...) OR person IN (...)` —— 把"同一个人在所有平台的账号"
+    一次性展开，SQL 侧就不用做子查询了。
+    """
+    if not owner:
+        return []
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return [owner]
+    try:
+        row = conn.execute("SELECT person FROM owners WHERE owner=?",
+                           (owner,)).fetchone()
+        person = (row["person"] if row else "") or ""
+        if not person:
+            return [owner]
+        rows = conn.execute("SELECT owner FROM owners WHERE person=?",
+                            (person,)).fetchall()
+        return [r["owner"] for r in rows] or [owner]
+    except Exception:
+        return [owner]
     finally:
         conn.close()
 
@@ -620,23 +861,28 @@ def visible_visibilities(tier: str) -> Tuple[str, ...]:
     return (VIS_SHARED, VIS_PUBLIC)
 
 
-def scope_filter(owner: str, tier: str) -> Tuple[str, List[str]]:
+def scope_filter(owner: str, tier: str,
+                 also_owners: Sequence[str] = ()) -> Tuple[str, List[str]]:
     """把 owner + tier 翻成一条 SQL 条件。
 
     规则只有两条，按顺序：
 
-        ① 属于我的（owner = 我）：**全部可见**，不管它是什么级别
+        ① 属于我的：**全部可见**，不管它是什么级别
            —— 别人的私密只对我不可见，我自己的私密我当然看得见。
         ② 不属于我的：只给 shared / public
 
-    ⚠ 最早这里是"先按级别筛，再按 owner 筛"，结果陌生人连
-      **自己刚说的那条 private** 都看不到 —— 逻辑对了但语义错了。
-      "私密"保护的是"别人看不到我的"，不是"我自己也看不到"。
+    `also_owners`：同一个人的**其它平台账号**（person 展开的结果）。
+    微信里的我看 B站里那个我聊过的东西，靠的就是它。
+
+    ⚠ 只传"同一个 person 名下的账号"。**绝不能**把 shared 逻辑和它混起来：
+      "我别的账号" 和 "别人的 shared" 是两回事，混了就是越权。
     """
     vis = visible_visibilities(tier)
     placeholders = ",".join("?" * len(vis))
-    clause = f"(owner = ? OR visibility IN ({placeholders}))"
-    return clause, [owner, *vis]
+    mine = [owner] + [o for o in (also_owners or ()) if o and o != owner]
+    mine_marks = ",".join("?" * len(mine))
+    clause = f"(owner IN ({mine_marks}) OR visibility IN ({placeholders}))"
+    return clause, [*mine, *vis]
 
 
 @dataclass
@@ -711,15 +957,29 @@ def _find_same(conn: sqlite3.Connection, bank: str, fact: Fact) -> Optional[sqli
 _INSERT_FACT = (
     "INSERT INTO facts(bank,anchor,predicate,object,confidence,status,"
     "source_chunks,evidence,created_at,updated_at,note,"
-    "owner,visibility,platform,pinned) "
-    "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?)")
+    "owner,visibility,platform,pinned,person,person_at_write) "
+    "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?)")
+
+
+def _person_of(conn: sqlite3.Connection, owner: str) -> str:
+    """查这个 owner 现在挂在哪个 person 上。查不到返回空串。"""
+    if not owner:
+        return ""
+    try:
+        row = conn.execute("SELECT person FROM owners WHERE owner=?",
+                           (owner,)).fetchone()
+        return (row["person"] if row else "") or ""
+    except Exception:
+        return ""
 
 
 def _insert_fact(conn: sqlite3.Connection, bank: str, fact: Fact, now: int) -> int:
+    person = _person_of(conn, fact.owner)
     cur = conn.execute(_INSERT_FACT, (
         bank, fact.anchor, fact.predicate, fact.object, fact.confidence,
         json.dumps(fact.source_chunks), fact.evidence, now, now, fact.note,
-        fact.owner, fact.visibility, fact.platform, 1 if fact.pinned else 0))
+        fact.owner, fact.visibility, fact.platform, 1 if fact.pinned else 0,
+        person, person))
     return int(cur.lastrowid)
 
 
@@ -809,13 +1069,15 @@ def forget_fact(path: str, bank: str, fact_id: int, reason: str = "") -> Tuple[b
 
 def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
                query: str = "", limit: int = 100, offset: int = 0,
-               owner: str = "", tier: str = "") -> Dict[str, Any]:
+               owner: str = "", tier: str = "",
+               also_owners: Sequence[str] = ()) -> Dict[str, Any]:
     """列/搜事实。
 
     两种调用方式：
       · **管理视角**（owner 与 tier 都为空）：看得见全部，UI 的管理页用。
       · **说话视角**（传了 owner 和 tier）：只返回这个人有权看到的事实，
         走 scope_filter() 那条唯一的隔离判断。
+        `also_owners` 传同一个人的其它平台账号，实现跨平台记忆汇总。
 
     ⚠ 管理视角只能给 UI 用。任何注入到提示词的路径**必须**传 owner+tier，
       否则等于把所有人的私密内容摆到台面上。
@@ -824,7 +1086,7 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
         return {"items": [], "total": 0}
     where, params = ["bank = ?"], [bank]
     if owner and tier:
-        clause_extra, extra_params = scope_filter(owner, tier)
+        clause_extra, extra_params = scope_filter(owner, tier, also_owners)
         where.append(clause_extra)
         params += extra_params
     if status in (ACTIVE, SUPERSEDED, FORGOTTEN):
@@ -1050,19 +1312,25 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
          "你叫她爸爸"和"今天下雨"不该抢同一个名额。
       3. 非主人会看到 owner 是别人、但 visibility=shared 的条目 ——
          这就是"她知道你喜欢吃辣，但不知道你昨天住院了"的实现方式。
+      4. **跨平台**：她自己在这里查出这个人的所有平台账号
+         （owner_persons），一起交给 scope_filter。调用方不需要知道
+         person 表的存在 —— 少一个参数就少一处漏。
     """
     if not owner or not tier:
         return ""
-    vis = visible_visibilities(tier)
-    placeholders = ",".join("?" * len(vis))
+    # 这个人在所有平台的账号。没认领时就是他自己一个。
+    siblings = [o for o in owner_persons(path, owner) if o and o != owner]
 
     # ① 置顶：独立预算，先占位
     pinned = list_facts(path, bank, status=ACTIVE, owner=owner, tier=tier,
+                        also_owners=siblings,
                         limit=max(1, pinned_limit)).get("items") or []
     # ② 普通：剩下的名额
     normal = list_facts(path, bank, status=ACTIVE, owner=owner, tier=tier,
+                        also_owners=siblings,
                         limit=max(1, limit)).get("items") or []
 
+    mine = {owner, *siblings}
     seen, lines = set(), []
     for item in [i for i in pinned if i.get("pinned")] + normal:
         fid = item.get("id")
@@ -1071,7 +1339,8 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
         seen.add(fid)
         if len(lines) >= limit + pinned_limit:
             break
-        who = item["anchor"] or ("我" if item["owner"] == owner else "别人")
+        # "我"= 这个人自己的（任何一个平台账号），"别人"= 别的 owner 分享出来的
+        who = item["anchor"] or ("我" if item["owner"] in mine else "别人")
         conf = item["confidence"]
         mark = "" if conf >= 0.7 else "（不确定）"
         star = "★" if item.get("pinned") else ""

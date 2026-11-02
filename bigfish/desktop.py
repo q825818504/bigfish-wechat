@@ -1588,9 +1588,8 @@ class Backend(QObject):
     def add_identity(self, platform: str, external_id: str, is_owner: bool) -> str:
         """给某个人补一个别的平台身份（B站 UID / 抖音号 / 手机号）。
 
-        现在的实现是"为一个新身份建一条 owner 记录"。真正的跨平台合并
-        （同一个人的微信 + B站 归为一个人）需要一层 person 表，
-        那是下一轮的事 —— 这里先把入口留出来，不做假合并。
+        现在这是"新建一条 owner 记录"，**不会自动合并** ——
+        要把微信和 B站认成同一个人，用下面的 link_person。
         """
         try:
             from bigfish import memory as M, vault as V
@@ -1610,6 +1609,83 @@ class Backend(QObject):
                            tier=M.TIER_OWNER if is_owner else M.TIER_KNOWN,
                            platform=plat)
             return json.dumps({"ok": True, "owner": owner}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── person：跨平台同一个人 ──────────────────────────────────────
+    #
+    # 这里的每一个操作都**只能由人做**。没有任何"自动识别是同一个人"的
+    # 逻辑 —— 合错的代价（A 看到 B 的私密）远大于不合的代价（记忆散着）。
+
+    @Slot(result=str)
+    def list_persons(self) -> str:
+        """列出所有人格身份组：哪些平台账号被认成同一个人，哪些还没认领。"""
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            return json.dumps({"persons": M.list_persons(db or "")},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"persons": [], "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def create_person(self, display_name: str) -> str:
+        """建一个空的身份组。之后把平台账号挂上去。"""
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            if not db:
+                return json.dumps({"ok": False, "error": "数据目录未确定"},
+                                  ensure_ascii=False)
+            M.ensure_schema(db)
+            ok, pid, err = M.create_person(db, display_name or "未命名")
+            return json.dumps({"ok": ok, "person": pid, "error": err},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, str, result=str)
+    def link_person(self, platform: str, external_id: str, person: str) -> str:
+        """把一个平台账号挂到身份组上。
+
+        如果这个账号还不在库里（从没聊过），先建一条 owner 记录再挂 ——
+        否则用户填了 B站 UID 却什么也没发生，会以为是坏了。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            plat = (platform or "").strip().lower()
+            eid = (external_id or "").strip()
+            pid = (person or "").strip()
+            if not plat or not eid or not pid:
+                return json.dumps({"ok": False, "error": "平台 / id / 身份组都要填"},
+                                  ensure_ascii=False)
+            db = V.memory_db_path()
+            if not db:
+                return json.dumps({"ok": False, "error": "数据目录未确定"},
+                                  ensure_ascii=False)
+            M.ensure_schema(db)
+            owner = M.owner_of_private(eid, platform=plat)
+            # 先确保存在（不存在就以"熟人"建，不用 guest 也不自动给 owner）
+            M.ensure_owner(db, "dafeiyu", owner, platform=plat, tier=M.TIER_KNOWN)
+            ok, err = M.link_owner(db, owner, pid)
+            return json.dumps({"ok": ok, "owner": owner, "error": err},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def unlink_person(self, owner: str) -> str:
+        """把某个平台账号从身份组上摘下来。记忆不动。"""
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            ok, err = M.unlink_owner(db or "", (owner or "").strip())
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 

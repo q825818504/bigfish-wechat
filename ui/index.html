@@ -586,6 +586,59 @@
           </div>
         </div>
 
+        <div class="card" style="margin-top:16px" id="personCard">
+          <div class="card-head">
+            <h2>同一个人的多个账号</h2>
+            <span class="tag" id="personTag">—</span>
+          </div>
+          <div class="card-desc" style="margin-bottom:12px">
+            <strong>为什么需要这一步。</strong>
+            你在微信是 <code>wxid_xxx</code>，在 B 站是 <code>UID 12345</code>，
+            在抖音是另一串数字 —— 这些在各自平台里就是三个账号，
+            <strong>没有任何技术手段能可靠地把它们认成同一个人</strong>
+            （昵称会撞会改，头像能换，让模型判断更是灾难）。
+            <br>
+            所以这里<strong>只由你手动认领</strong>。把两个平台账号挂到同一个身份组下，
+            她才会在微信里想起你在 B 站说过的话。
+            <br><br>
+            <strong>认领之后不会发生什么：</strong>
+            已经记下的事实不会搬家（归属稳定），
+            别人的私密仍然看不到 —— 认领只影响"你自己的账号之间"，不影响"别人能不能看你"。
+          </div>
+
+          <div class="form" style="margin-bottom:12px">
+            <div class="field full">
+              <label>建一个身份组</label>
+              <div class="path-row">
+                <input type="text" id="personName" placeholder="比如：老爸" style="flex:1">
+                <button class="btn btn-primary" id="btnCreatePerson">建立</button>
+              </div>
+            </div>
+            <div class="field full">
+              <label>把平台账号挂上去</label>
+              <div class="path-row">
+                <select id="linkPerson">
+                  <option value="">（先建一个身份组）</option>
+                </select>
+                <select id="linkPlatform">
+                  <option value="wechat">微信</option>
+                  <option value="bilibili">B 站</option>
+                  <option value="douyin">抖音</option>
+                  <option value="phone">手机号</option>
+                </select>
+                <input type="text" id="linkValue" placeholder="wxid / UID / 手机号" style="flex:1">
+                <button class="btn btn-sm" id="btnLinkPerson">挂上去</button>
+              </div>
+              <small>没聊过的 id 会自动建一条记录；挂上去后她的记忆就会跨平台汇总。</small>
+            </div>
+          </div>
+
+          <div class="session-list" id="personList">
+            <div class="empty" style="padding:12px 0"><p>读取中…</p></div>
+          </div>
+        </div>
+
+
         <div class="card" style="margin-top:16px">
           <div class="card-head">
             <h2>她认定的事</h2>

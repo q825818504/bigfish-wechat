@@ -59,7 +59,7 @@ function go(page) {
 
   if (page === 'soul' && !S.soul) loadSoul();
   if (page === 'mood') loadMood();
-  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); }
+  if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); loadPersons(); }
   if (page === 'data') loadDataRoot();
 }
 
@@ -1286,6 +1286,131 @@ async function setVisibility(factId, vis) {
   } catch (e) { toast('修改失败'); }
 }
 
+/* ── 跨平台身份组 ──
+ *
+ * 每个身份组 = 一个人在他所有平台的账号。
+ * 挂上去之后，facts_for_prompt 会自动展开成"这个人所有账号"，记忆汇总。
+ */
+
+async function loadPersons() {
+  if (!S.bridge || !S.bridge.list_persons) return;
+  try {
+    const d = JSON.parse(await S.bridge.list_persons());
+    const list = $('#personList');
+    const sel = $('#linkPerson');
+    if (!list) return;
+    const persons = (d.persons || []).filter((p) => p.person);
+    const loose = (d.persons || []).find((p) => !p.person);
+
+    // 下拉
+    if (sel) {
+      sel.innerHTML = persons.length
+        ? persons.map((p) => '<option value="' + esc(p.person) + '">' +
+            esc(p.name || p.person) + '</option>').join('')
+        : '<option value="">（先建一个身份组）</option>';
+    }
+    const tag = $('#personTag');
+    if (tag) tag.textContent = persons.length + ' 个';
+
+    // 列表
+    let html = '';
+    for (const p of persons) {
+      const ids = (p.identities || []).map((i) =>
+        '<div class="session-item" style="padding-left:12px">' +
+        '<div class="session-main">' +
+        '<div class="session-name">' + esc(i.name || i.owner.split(':').pop()) +
+        '<span class="health-tag" style="margin-left:6px">' +
+        esc(i.platform) + '</span>' +
+        '<span class="health-tag" style="margin-left:4px">' +
+        esc(TIER_LABEL[i.tier] || i.tier) + '</span></div>' +
+        '<div class="session-sub">' + esc(i.owner) + '</div></div>' +
+        '<button class="btn btn-sm" data-unlink="' + esc(i.owner) +
+        '">摘下来</button></div>').join('');
+      html += '<div class="session-item" style="flex-direction:column;align-items:stretch">' +
+        '<div class="session-main"><div class="session-name">' +
+        esc(p.name || p.person) + '<span class="health-tag ok" style="margin-left:6px">' +
+        (p.identities || []).length + ' 个账号</span></div>' +
+        '<div class="session-sub">' + esc(p.note || '') + '</div></div>' +
+        ids + '</div>';
+    }
+    if (loose && (loose.identities || []).length) {
+      html += '<div class="session-item" style="flex-direction:column;align-items:stretch">' +
+        '<div class="session-main"><div class="session-name">还没认领的账号' +
+        '<span class="health-tag warn" style="margin-left:6px">' +
+        loose.identities.length + '</span></div>' +
+        '<div class="session-sub">每个账号的记忆各自独立，互不可见</div></div>' +
+        loose.identities.slice(0, 20).map((i) =>
+          '<div class="session-item" style="padding-left:12px">' +
+          '<div class="session-main"><div class="session-name">' +
+          esc(i.name || i.owner.split(':').pop()) +
+          '<span class="health-tag" style="margin-left:6px">' + esc(i.platform) +
+          '</span></div><div class="session-sub">' + esc(i.owner) + '</div></div>' +
+          '</div>').join('') + '</div>';
+    }
+    list.innerHTML = html || '<div class="empty" style="padding:12px 0">' +
+      '<p>还没有任何账号。跟她聊几句，或从上面挂一个。</p></div>';
+  } catch (e) {
+    toast('读取身份组失败');
+  }
+}
+
+async function createPerson() {
+  const name = $('#personName') ? $('#personName').value.trim() : '';
+  if (!S.bridge) return;
+  try {
+    const r = JSON.parse(await S.bridge.create_person(name || '未命名'));
+    if (!r.ok) return toast(r.error || '创建失败');
+    toast('已建立「' + (name || '未命名') + '」');
+    if ($('#personName')) $('#personName').value = '';
+    loadPersons();
+  } catch (e) { toast('创建失败'); }
+}
+
+async function linkPerson() {
+  if (!S.bridge) return;
+  const pid = $('#linkPerson') ? $('#linkPerson').value : '';
+  const plat = $('#linkPlatform') ? $('#linkPlatform').value : '';
+  const val = $('#linkValue') ? $('#linkValue').value.trim() : '';
+  if (!pid) return toast('先建一个身份组');
+  if (!val) return toast('填一下平台 id');
+  try {
+    const r = JSON.parse(await S.bridge.link_person(plat, val, pid));
+    if (!r.ok) return toast(r.error || '挂载失败');
+    toast('已挂上去 · 记忆将从这刻起汇总');
+    if ($('#linkValue')) $('#linkValue').value = '';
+    loadPersons();
+    loadFacts();
+  } catch (e) { toast('挂载失败'); }
+}
+
+async function unlinkPerson(owner) {
+  if (!S.bridge) return;
+  const ok = confirm('把这个账号从身份组上摘下来？' + String.fromCharCode(10) +
+    String.fromCharCode(10) +
+    '记忆不会被删，只是不再跟另一个平台的账号合并展示。');
+  if (!ok) return;
+  try {
+    const r = JSON.parse(await S.bridge.unlink_person(owner));
+    if (!r.ok) return toast(r.error || '摘除失败');
+    toast('已摘下');
+    loadPersons();
+    loadFacts();
+  } catch (e) { toast('摘除失败'); }
+}
+
+const bindPersonUI = () => {
+  const on = (sel, ev, fn) => {
+    const el = $(sel);
+    if (el) el.addEventListener(ev, fn);
+  };
+  on('#btnCreatePerson', 'click', createPerson);
+  on('#btnLinkPerson', 'click', linkPerson);
+  document.addEventListener('click', (e) => {
+    const u = e.target.closest('[data-unlink]');
+    if (u) unlinkPerson(u.dataset.unlink);
+  });
+};
+
 const bindOwnerUI = () => {
   const on = (sel, ev, fn) => {
     const el = $(sel);
@@ -1328,6 +1453,7 @@ const bindFactUI = () => {
 };
 bindFactUI();
 bindOwnerUI();
+bindPersonUI();
 
 /* ────────── 数据目录 ────────── */
 
