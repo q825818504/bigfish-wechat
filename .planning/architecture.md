@@ -298,3 +298,68 @@ session scope 过滤。Python 重写必然产生偏差，结果是
 | 鲸落 | **一切**，含灵魂 | 只有备份 | 必须手输「鲸落」+ 强制备份 |
 
 鲸落删完如果数据目录空了，连目录一起删 ——「从没来过」应该是干净的。
+
+---
+
+## v0.2.0 架构：记忆四层 + 插件座位制
+
+### 模块地图（新增部分）
+
+```
+bigfish/
+  memory.py        记忆核心：原文/事实/习惯/身份 四层 + 检索 + 反思
+  plugins/         插件系统：座位校验、开关落盘、分发、清单
+    __init__.py      注册表（不含业务逻辑）
+    guard.py         末尾守卫（order 9990）
+    clock.py         时间感知（order 870）
+  wechat.py        多账号探测（probe_running_accounts）
+```
+
+### 记忆四层
+
+```
+原文层  messages / chunks / search_index     权威，可重建派生层
+事实层  facts                                可纠正 / 可遗忘 / 可置顶
+习惯层  habits                               三次 + 跨三天 + 衰减
+身份层  owners / persons                     谁是谁（跨平台）
+```
+
+派生层（`search_index` / `chunk_meta` / `facts` 索引）全部可抛弃重建，
+`rebuild_derived()` 一处收口。
+
+### 注入时的一次判断
+
+```
+facts_for_prompt(owner, tier)
+    → 展开 owner_persons(owner)          # 同一人的所有平台账号
+    → scope_filter(owner, tier, siblings)
+        WHERE owner IN (我的所有账号) OR visibility IN (shared, public)
+    → 置顶走独立预算，普通走常规预算
+```
+
+**只有这一处做隔离判断。** 其他任何地方再写一遍，迟早会出现两套规则。
+
+### 插件座位制
+
+system 段不再按 append 顺序拼，而是按**座位号**排序：
+
+```
+860 灵魂（内建）  870 生活   880 目标
+900 心情（内建）  920 关系   9990 守卫
+```
+
+插件注册时必须声明座位，占错直接抛错。
+理由：多段叠加时顺序决定语气，而"排到末尾"取决于 import 顺序 ——
+那是个跟内容无关的实现细节，不该影响她说话的方式。
+
+### 账号选择的进程探测
+
+```
+probe_running_accounts()
+    枚举 xwechat_files/<账号>/db_storage/message_0.db
+    CreateFileW(dwShareMode=0) 试开
+      失败 = ERROR_SHARING_VIOLATION = 微信正占着 = 这个号在运行
+```
+
+这是唯一与真实进程挂上钩、又不需要读加密内容的信号。
+（mtime / msvcrt 锁 / sqlite BEGIN IMMEDIATE 都试过，全部无效，详见 decisions D-33）

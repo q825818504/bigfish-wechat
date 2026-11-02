@@ -36,7 +36,7 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 GITHUB_API = "https://api.github.com/repos/{repo}/releases/latest"
 UA = f"bigfish-updater/{__version__}"
