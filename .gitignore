@@ -96,3 +96,6 @@ research/*.log
 packaging/build/
 packaging/output/
 packaging/*.zip
+
+# 发布附件（zip/manifest），从源码重新生成，不进仓库
+/release/
