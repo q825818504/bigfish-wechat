@@ -89,8 +89,14 @@ def main() -> int:
     print("表情包真机验证")
     print("=" * 68)
 
-    tmpdir = tempfile.mkdtemp(prefix="bigfish-live-sticker-")
-    gif = os.path.join(tmpdir, "live_test.gif")
+    # ⚠ 不能用 %TEMP%：微信拒绝从临时目录粘贴文件（2026-11-03 实测）。
+    #   这个测试要验的是"能不能发出去"，不是"临时目录能不能发"，
+    #   所以素材必须放在微信接受的路径上。
+    #   顺带这也是在验证 send_media 的 _materialize 会不会把它搬走。
+    from bigfish.wechat_sender import UiaSender
+
+    tmpdir = UiaSender._outbox_dir()
+    gif = os.path.join(tmpdir, "_live_test.gif")
     try:
         make_gif(gif)
         from PIL import Image
@@ -182,9 +188,10 @@ def main() -> int:
         print("   · 长按有没有「添加」→ 有就是原生表情")
 
     finally:
+        # 只删自己造的那个文件 —— tmpdir 现在是 _outbox，不是独占目录
         try:
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            if os.path.isfile(gif):
+                os.remove(gif)
         except Exception:
             pass
 

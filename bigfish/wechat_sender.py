@@ -338,6 +338,20 @@ class UiaSender:
         if not okf:
             raise SendError(f"媒体不可发送：{why}", kind="media")
 
+        # ⚠ 路径必须先"落地"到微信认可的位置。
+        #
+        # 2026-11-03 对照实验（tools/path_probe.py）：
+        #   同一张 gif、同一套粘贴代码，只有路径不同：
+        #       D:\大脑\表情测试\_pathtest.gif    → 彩色占比 10.3%，发出去是动画表情
+        #       %TEMP%\bigfish-pathtest-xxx\p.gif → 彩色占比 0.0%，什么都没发生
+        #   反复三次都是这个结果。
+        #
+        # 也就是说：**微信拒绝从临时目录粘贴文件**。
+        # 这解释了之前十几轮的全部失败 —— 我一直在用 %TEMP% 做测试图。
+        #
+        # 所以发送前先把它复制到数据目录下的 _outbox/。发完删掉副本。
+        real_path, cleanup = self._materialize(path)
+
         if not desktop_available():
             raise SendError(
                 "桌面已锁定或不可见，UIA 无法操作。\n"
@@ -375,7 +389,7 @@ class UiaSender:
         try:
             edit = self._chat_input_ctrl()
             if edit is not None:
-                ok = self._paste_media_uia(edit, path)
+                ok = self._paste_media_uia(edit, real_path)
                 if ok:
                     # ⚠ 不在这里返回成功。回车是按下去了，
                     #   发没发出去只有数据库知道。下面统一验。
@@ -393,7 +407,7 @@ class UiaSender:
         if not err or err.startswith("UIA 粘贴没"):
             try:
                 gui = self._gui()
-                res = gui.send_file(path, who=None)
+                res = gui.send_file(real_path, who=None)
                 gui_ok = bool(getattr(res, "is_success", None)) if hasattr(
                     res, "is_success") else bool(res)
                 if not gui_ok:
@@ -406,15 +420,23 @@ class UiaSender:
         #    这条路的教训：上一版 `return True` 是无条件的，
         #    于是"发送成功 3.3 秒"和"用户什么都没收到"同时成立。
         #    从那以后，这里只信数据库。
-        if self.verify_media_sent(who, path, before_seq=before_seq,
-                                  timeout=10.0):
-            return SendResult(ok=True, who=who, path=path, kind=kind,
-                              text=f"[{kind}]")
+        try:
+            if self.verify_media_sent(who, path, before_seq=before_seq,
+                                      timeout=10.0):
+                return SendResult(ok=True, who=who, path=path, kind=kind,
+                                  text=f"[{kind}]")
 
-        raise SendError(
-            f"媒体没能发出去（数据库 10 秒内没有新增）。"
-            f"{('原因：' + err) if err else ''}",
-            kind="send")
+            raise SendError(
+                f"媒体没能发出去（数据库 10 秒内没有新增）。"
+                f"{('原因：' + err) if err else ''}",
+                kind="send")
+        finally:
+            # 副本用完就删。失败也删 —— 留着只会越积越多。
+            if cleanup:
+                try:
+                    os.remove(cleanup)
+                except Exception:
+                    pass
 
     def _paste_media_uia(self, edit, path: str, attempts: int = 3) -> bool:
         """UIA 路线：CF_HDROP 写剪贴板 → 控件级 Ctrl+V → 判草稿 → 回车。
@@ -605,6 +627,103 @@ class UiaSender:
             f"粘贴 {attempts} 次都没让输入框发生变化，判定失败："
             f"{os.path.basename(path)}")
         return False
+
+    # ── 路径落地：把文件搬到微信认可的位置 ─────────────────────────
+
+    #: 出站暂存目录名（在数据目录下）
+    OUTBOX = "_outbox"
+
+    @staticmethod
+    def _temp_roots() -> list:
+        """系统临时目录的候选根。Windows 上有好几个，都要覆盖。"""
+        roots = []
+        for k in ("TEMP", "TMP"):
+            v = os.environ.get(k)
+            if v:
+                roots.append(os.path.abspath(v))
+        la = os.environ.get("LOCALAPPDATA")
+        if la:
+            roots.append(os.path.abspath(os.path.join(la, "Temp")))
+        roots.append(os.path.abspath("C:/Windows/Temp"))
+        # 去重 + 统一大小写，避免漏判
+        out, seen = [], set()
+        for r in roots:
+            key = os.path.normcase(r)
+            if key not in seen:
+                seen.add(key)
+                out.append(r)
+        return out
+
+    @classmethod
+    def _in_temp(cls, path: str) -> bool:
+        """这个路径是不是在系统临时目录下。
+
+        微信拒绝从临时目录粘贴文件（2026-11-03 对照实验确认），
+        所以这类路径必须先搬出来。
+        """
+        p = os.path.normcase(os.path.abspath(path))
+        for root in cls._temp_roots():
+            r = os.path.normcase(root)
+            if p == r or p.startswith(r + os.sep):
+                return True
+        return False
+
+    @staticmethod
+    def _outbox_dir() -> str:
+        """出站暂存目录：<数据目录>/_outbox。
+
+        为什么放数据目录而不是别处：
+          · 数据目录一定是用户自己选的、可写的、非临时的
+          · 搬家会把它一起带走，不会留下孤儿目录
+          · 和 stickers/ 同层，用户看得见、能自己清理
+        """
+        try:
+            from bigfish import vault
+
+            root = vault.resolve_data_root()
+        except Exception:
+            root = os.path.join(os.path.expanduser("~"), ".bigfish")
+        d = os.path.join(root, UiaSender.OUTBOX)
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    @classmethod
+    def _materialize(cls, path: str) -> tuple:
+        """确保文件在一个微信接受的路径上。返回 (可用路径, 需要删除的副本)。
+
+        只在必要时复制：
+          · 文件本来就不在临时目录 → 原样返回，cleanup 为空
+          · 在临时目录 → 复制到 _outbox，返回副本路径和它自己
+
+        不无条件复制的理由：表情库里的图本来就在数据目录，
+        每次发都复制一份纯属浪费（图多的用户一天几十次）。
+        """
+        p = os.path.abspath(path)
+        if not cls._in_temp(p):
+            return p, ""
+
+        try:
+            import shutil
+
+            d = cls._outbox_dir()
+            # 保留原扩展名（微信按扩展名判是不是表情）
+            stem = os.path.splitext(os.path.basename(p))[0]
+            ext = os.path.splitext(p)[1]
+            dst = os.path.join(d, f"{stem}{ext}")
+            n = 1
+            while os.path.exists(dst):
+                dst = os.path.join(d, f"{stem}_{n}{ext}")
+                n += 1
+            shutil.copy2(p, dst)
+            return dst, dst
+        except Exception as exc:
+            # 复制不出来就用原路径赌一把 —— 总比直接失败好，
+            # 万一那台机器的微信不介意临时目录呢。
+            try:
+                UiaSender._warn(f"复制到 _outbox 失败，直接用原路径：{exc}")
+            except Exception:
+                pass
+            return p, ""
 
     # ── 聚焦：三层一起上 ───────────────────────────────────────────
 
