@@ -121,11 +121,51 @@ def main() -> int:
             s = UiaSender()
             s.wake()
             chk("UIA 就绪", s.ready)
+
+            # 发送前先把基线 seq 记下来 —— 后面回读要靠它区分"新的"和"旧的"
+            before_seq = 0
+            try:
+                from wechatauto import WeChatDB
+
+                db = WeChatDB()
+                hits = db.search_contact("文件传输助手")
+                chat = hits[0]["username"] if hits else "filehelper"
+                msgs = db.get_messages(chat, limit=1)
+                before_seq = int(msgs[0]["sort_seq"]) if msgs else 0
+                print(f"     基线 seq = {before_seq}（chat={chat}）")
+            except Exception as exc:
+                print(f"     （基线读取跳过：{exc}）")
+
             r = s.send_media("文件传输助手", gif)
             dt = time.time() - t0
             chk("send_media 返回成功", bool(r.ok),
                 getattr(r, "detail", "") or "")
             print(f"     耗时 {dt:.1f}s")
+
+            # ---- 判据：库里落的是不是「动画表情」 ----
+            print("\n── 回读数据库（判据：类型必须是「动画表情」）──")
+            try:
+                from wechatauto import WeChatDB
+
+                db = WeChatDB()
+                hits = db.search_contact("文件传输助手")
+                chat2 = hits[0]["username"] if hits else "filehelper"
+                rows = db.get_messages(chat2, limit=6)
+                rows = sorted(rows, key=lambda x: int(x.get("sort_seq") or 0),
+                              reverse=True)
+                fresh = [x for x in rows
+                         if int(x.get("sort_seq") or 0) > before_seq]
+                print(f"     发送后新增 {len(fresh)} 条")
+                for x in fresh[:3]:
+                    print(f"       · type={x.get('type')!r} "
+                          f"sender_id={x.get('sender_id')}")
+                got = [str(x.get("type") or "") for x in fresh[:2]]
+                is_sticker = "动画表情" in got
+                chk("新增消息里有「动画表情」", is_sticker,
+                    f"读到 {got}。如果是「图片」，说明微信没把它当表情，"
+                    f"动图也不会动；如果一条都没有，说明粘贴没生效")
+            except Exception as exc:
+                chk("回读数据库", False, str(exc))
         except SendError as exc:
             chk("发送无异常", False, f"{exc}")
             return _summary()
@@ -133,34 +173,6 @@ def main() -> int:
             chk("发送无异常", False, f"{exc}")
             traceback.print_exc()
             return _summary()
-
-        # ---- 判据：库里落的是不是「动画表情」 ----
-        print("\n── 回读数据库（判据：类型必须是「动画表情」）──")
-        try:
-            from wechatauto import WeChatDB
-
-            db = WeChatDB()
-            chat = "filehelper"
-            hits = db.search_contact("文件传输助手")
-            if hits:
-                chat = hits[0]["username"]
-            rows = db.get_messages(chat, limit=6)
-            if not rows:
-                chk("读到了消息", False, "数据库里一条都没有")
-            else:
-                rows = sorted(rows, key=lambda r: int(r.get("sort_seq") or 0),
-                              reverse=True)
-                got_types = [str(r.get("type") or "") for r in rows[:4]]
-                print(f"     最近几条的类型：{got_types}")
-                is_sticker = any(t == "动画表情" for t in got_types[:2])
-                chk("最新消息是「动画表情」", is_sticker,
-                    f"读到的类型：{got_types}。如果是「图片」，"
-                    f"说明微信没把它当表情，动图也不会动")
-                if not is_sticker and "图片" in got_types[:2]:
-                    print("     ⚠ 落成了图片 —— GIF 这条路在当前微信版本上"
-                          "可能已经不支持了，需要换方案")
-        except Exception as exc:
-            chk("回读数据库", False, str(exc))
 
         print("\n── 手动确认（我看不到你的屏幕）──")
         print("  打开微信文件传输助手，看最新那条：")

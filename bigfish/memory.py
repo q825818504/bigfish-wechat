@@ -59,8 +59,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 #   2  事实层 + 反思 + 锚点元数据
 #   3  多 owner 隔离 + 行为习惯 + 置顶 + visibility
 #   4  person：跨平台同一个人
+#   5  origin（来源场景）+ topic（话题标签）+ 群聊双写 + 事实来源校验
 # 只在 migrate() 里推进，不靠文件名或 PRAGMA 之外的任何状态。
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # 老库（v1/v2/v3）没有这些列，migrate() 用 ALTER TABLE 补。
 # SQLite 的 ADD COLUMN 是常数时间，不影响已有行。
@@ -83,6 +84,46 @@ FACT_COLUMNS_V3: Tuple[Tuple[str, str], ...] = (
 OWNER_COLUMNS_V4: Tuple[Tuple[str, str], ...] = (
     ("person", "TEXT NOT NULL DEFAULT ''"),
 )
+
+# v5：来源场景 + 话题标签。
+#
+#   origin   这条事实是在哪儿说出来的
+#              private          私聊里说的
+#              group:<group_id> 群里说的（带群 id）
+#              unknown          老数据，不知道出处
+#
+#   topic    这条事实讲的是哪一类事。**只用于"能不能告诉外人"的判定**，
+#            不参与检索排序、不参与反思、不改置信度。
+#
+# 为什么 origin 要单独存，而不是从 owner 推：
+#   owner 是"归谁"（A 的池 / 群 C 的池），origin 是"在哪儿说的"。
+#   群聊双写之后，同一条事实在 A 池和 C 池各有一份，两份的 owner 不同，
+#   但 origin 都是 group:C —— 只有把两者分开存，才说得清"这是在群里说的"。
+FACT_COLUMNS_V5: Tuple[Tuple[str, str], ...] = (
+    ("origin", "TEXT NOT NULL DEFAULT ''"),
+    ("topic", "TEXT NOT NULL DEFAULT ''"),
+)
+
+# 话题白名单：**只有这些话题的 shared 事实才允许说给非主人听**。
+#
+# 这张表是「B 问主人爱吃什么 → 她可以答」和「B 问主人住哪 → 她拒绝」的分界线。
+# 定语用词统一放在常数里，反思提示词、UI 下拉、注入判定三处共用 ——
+# 三处各写一份就会出现"模型说的话题 UI 里选不出来"这种对不上的问题。
+TOPIC_WHITELIST: Tuple[str, ...] = ("食物", "爱好", "作息", "性格", "口头禅", "称呼")
+
+# 黑名单：明确不许外传的话题。白名单之外的**一律**按黑名单处理，
+# 这张表存在的意义是：UI 上有一个明确的"这条为什么不能说"，
+# 以及给注入判定一个可读的拒绝理由。
+TOPIC_BLACKLIST: Tuple[str, ...] = (
+    "住址", "工作", "行程", "身体", "金钱", "家人", "联系人", "隐私",
+)
+
+# 灰区：我按「宁缺毋滥」全部划到不放行（用户已确认）。
+# 单独列出来是为了以后想放开时，能一眼看到"当初是哪几条被我关掉的"，
+# 而不是从黑名单里猜。
+TOPIC_GRAY_REFUSED: Tuple[str, ...] = ("年龄", "职业", "城市", "情感", "近况")
+
+TOPICS: Tuple[str, ...] = TOPIC_WHITELIST + TOPIC_BLACKLIST + TOPIC_GRAY_REFUSED
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -151,11 +192,17 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         owner TEXT NOT NULL DEFAULT '',
         visibility TEXT NOT NULL DEFAULT 'private',
         platform TEXT NOT NULL DEFAULT 'wechat',
-        pinned INTEGER NOT NULL DEFAULT 0)""",
+        pinned INTEGER NOT NULL DEFAULT 0,
+        person TEXT NOT NULL DEFAULT '',
+        person_at_write TEXT NOT NULL DEFAULT '',
+        origin TEXT NOT NULL DEFAULT '',
+        topic TEXT NOT NULL DEFAULT '')""",
     "CREATE INDEX IF NOT EXISTS facts_bank_status ON facts(bank,status,id)",
     "CREATE INDEX IF NOT EXISTS facts_bank_anchor ON facts(bank,anchor,predicate)",
     "CREATE INDEX IF NOT EXISTS facts_owner ON facts(bank,owner,status,id)",
     "CREATE INDEX IF NOT EXISTS facts_vis ON facts(bank,visibility,status)",
+    "CREATE INDEX IF NOT EXISTS facts_origin ON facts(bank,origin,status)",
+    "CREATE INDEX IF NOT EXISTS facts_topic ON facts(bank,topic,visibility)",
     # 事实事件：记 → 改 → 忘，每一步都留痕。忘记不是删除。
     """CREATE TABLE IF NOT EXISTS fact_events (
         id INTEGER PRIMARY KEY, bank TEXT NOT NULL, fact INTEGER,
@@ -248,6 +295,22 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         fact INTEGER, text TEXT NOT NULL DEFAULT '',
         created_at INTEGER NOT NULL,
         UNIQUE(bank, owner, fact))""",
+
+    # ── v5：角色印象 ──────────────────────────────────────────────────
+    #
+    # 「我对这个人的印象」是一段**主人手写**的话，不是模型产出的。
+    # 所以它单独一张表，不塞进 owners（owners 是账号注册表，
+    # 混进自由文本以后导数据会很难看），也不塞进 facts（facts 有来源校验，
+    # 手写印象没有原文可指，塞进去会被来源校验直接拒掉）。
+    #
+    # 印象页里"开放信息"那一栏**不存这张表**，是实时从 facts 查出来的 ——
+    # 存一份就等于给"她准备说什么"开了第二个真源，两边一定会漂。
+    """CREATE TABLE IF NOT EXISTS impressions (
+        bank TEXT NOT NULL, owner TEXT NOT NULL,
+        note TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(bank, owner))""",
 )
 
 # 共享级别。**这是防泄露的唯一闸门**，任何注入都必须先过它。
@@ -410,6 +473,16 @@ def migrate(path: str) -> Tuple[bool, str]:
             conn.execute(
                 "UPDATE facts SET visibility = 'private' "
                 "WHERE visibility IS NULL OR visibility = ''")
+            # ④ v5：老数据的 origin / topic 一律留空 = "不知道出处 / 没打标签"。
+            #    ⚠ 绝不猜。老库里的事实不知道是哪说的，猜成 private 或 group
+            #      都会让"能不能外传"这个判定建立在一个编出来的前提上。
+            #      留空的结果是：永远不会被说给外人听 —— 这是安全的方向。
+            conn.execute(
+                "UPDATE facts SET origin = '' "
+                "WHERE origin IS NULL")
+            conn.execute(
+                "UPDATE facts SET topic = '' "
+                "WHERE topic IS NULL")
             ver = conn.execute("PRAGMA user_version").fetchone()[0]
             if ver < SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -455,10 +528,13 @@ def ensure_schema(path: str) -> Tuple[bool, str]:
 
 
 def _add_missing_columns(conn: sqlite3.Connection) -> None:
-    """给已有表补上 v3/v4 新增的列。表不存在就跳过。"""
+    """给已有表补上 v3/v4/v5 新增的列。表不存在就跳过。"""
     existing = _columns(conn, "facts")
     if existing:
         for name, decl in FACT_COLUMNS_V3:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
+        for name, decl in FACT_COLUMNS_V5:
             if name not in existing:
                 conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
     existing_o = _columns(conn, "owners")
@@ -847,18 +923,76 @@ def visible_visibilities(tier: str) -> Tuple[str, ...]:
     ⚠ 这里说的是"别的 owner 的东西"。自己 owner 的东西永远全可见，
       由 scope_filter 的第一条保证，跟 tier 无关。
 
-    **任何等级（包括主人）在别人的内容里都只能看到 shared / public。**
+    **主人：全部可见**（v5 改）。理由：数据存在主人自己的电脑上，
+    他只是看自己硬盘里的东西，不是"越过安全边界" —— 拦着不让看没有意义，
+    真正要拦的是"她会不会把这些说给外人听"，那由 guard 插件和
+    topic 白名单管，不在这里管。
 
-    为什么主人也不放开 private：
-        private 的定义就是"只有属于它的那个 owner 能看"。
-        主人权限管的是"我的东西给不给别人看"，**不是"我能不能翻别人的"**。
-        让主人可以翻遍所有人的私密，等于给了一个巨大的后门：
-        以后接群聊、接抖音，只要套上主人身份就全泄了。
+    **非主人：只能 shared / public。** private 永远不给。
 
-    tier 目前不影响结果 —— 保留参数是为了以后可能加"熟人可见的第三级"。
+    ⚠ 这条改动的边界很窄，必须说清楚：
+      「主人能看见」≠「她能说出去」。
+      看见只影响 UI 展示与提示词注入；说出去由 open_facts_for() 判定，
+      两件事分属两个函数，不能混。
     """
-    _ = tier
+    if tier == TIER_OWNER:
+        return (VIS_PRIVATE, VIS_SHARED, VIS_PUBLIC)
     return (VIS_SHARED, VIS_PUBLIC)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 开放信息 —— 「她能说给外人听什么」
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 和 visible_visibilities 是**两件事**，必须分开：
+#
+#   visible_visibilities   谁在 UI / 提示词里"看得见"
+#   open_facts_for         她"说得出口"，而且是对着非主人说
+#
+# 一条事实可以同时是"主人看得见"和"她不能对外说" —— 这就是绝大多数事实。
+# 反过来不成立：说不出口的东西，本身就得先看得见。
+
+
+def topic_allowed(topic: str) -> bool:
+    """这个话题能不能说给外人听。**白名单以外一律不行。**
+
+    空 topic（没打标签）也返回 False —— 没打标签就是没审过，
+    没审过的东西不能外传。这是"宁可不答"的方向。
+    """
+    t = (topic or "").strip()
+    return bool(t) and t in TOPIC_WHITELIST
+
+
+def open_facts_for(path: str, bank: str, owner: str, *,
+                   limit: int = 20) -> List[Dict[str, Any]]:
+    """列出某个 owner 名下**允许说给外人听**的事实。
+
+    两个条件同时成立才算：
+        ① visibility 是 shared 或 public（主人已经标过"这条可以给外人看"）
+        ② topic 在白名单里（这确实是"爱吃什么"这类基础信息）
+
+    这就是「B 问主人爱吃什么 → 她能答 / B 问主人住哪 → 她拒绝」的实现。
+    只标了 shared 但话题是"住址"的，照样不出现 —— 因为 ② 挡住了。
+    """
+    if not (path and os.path.isfile(path) and owner):
+        return []
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return []
+    try:
+        marks = ",".join("?" * len(TOPIC_WHITELIST))
+        rows = conn.execute(
+            "SELECT * FROM facts WHERE bank=? AND owner=? AND status='active' "
+            f"AND visibility IN (?,?) AND topic IN ({marks}) "
+            "ORDER BY pinned DESC, confidence DESC, id DESC LIMIT ?",
+            (bank, owner, VIS_SHARED, VIS_PUBLIC, *TOPIC_WHITELIST,
+             max(1, int(limit)))).fetchall()
+        return [_row_to_item(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        conn.close()
 
 
 def scope_filter(owner: str, tier: str,
@@ -898,6 +1032,8 @@ class Fact:
     visibility: str = VIS_PRIVATE
     platform: str = "wechat"
     pinned: bool = False
+    origin: str = ""
+    topic: str = ""
 
     def __post_init__(self) -> None:
         self.predicate = (self.predicate or "").strip()[:120]
@@ -915,6 +1051,15 @@ class Fact:
         self.platform = (self.platform or "wechat").strip().lower()[:32]
         self.owner = (self.owner or "").strip()[:200]
         self.pinned = bool(self.pinned)
+        # 非法 origin 一律留空 = "不知道在哪说的"。
+        # ⚠ 不退回 "private"：那会让"在群里说过"变成"私聊说的"，
+        #   是凭空捏造一个更安全的前提，比留空更糟。
+        o = (self.origin or "").strip()[:200]
+        self.origin = o if (o in ("", "private", "unknown")
+                            or o.startswith("group:")) else ""
+        # 话题不在已知集合里就留空（= 没打标签 = 不许外传）
+        t = (self.topic or "").strip()[:40]
+        self.topic = t if t in TOPICS else ""
 
     @property
     def ok(self) -> bool:
@@ -957,8 +1102,69 @@ def _find_same(conn: sqlite3.Connection, bank: str, fact: Fact) -> Optional[sqli
 _INSERT_FACT = (
     "INSERT INTO facts(bank,anchor,predicate,object,confidence,status,"
     "source_chunks,evidence,created_at,updated_at,note,"
-    "owner,visibility,platform,pinned,person,person_at_write) "
-    "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?)")
+    "owner,visibility,platform,pinned,person,person_at_write,"
+    "origin,topic) "
+    "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
+
+def _row_to_item(r: sqlite3.Row) -> Dict[str, Any]:
+    """sqlite3.Row → 界面/注入用 dict。
+
+    以前 list_facts 里内联了 20 行这种转换，v5 又要多两个字段；
+    收成一个函数，三处调用（list_facts / open_facts_for / 印象页）就不会漂。
+    """
+    try:
+        chunks = json.loads(r["source_chunks"] or "[]")
+    except Exception:
+        chunks = []
+    keys = set(r.keys())
+    return {
+        "id": int(r["id"]), "anchor": r["anchor"] or "",
+        "predicate": r["predicate"], "object": r["object"],
+        "confidence": round(float(r["confidence"] or 0), 2),
+        "status": r["status"], "supersededBy": r["superseded_by"],
+        "createdAt": int(r["created_at"] or 0),
+        "updatedAt": int(r["updated_at"] or 0),
+        "chunks": chunks, "evidence": r["evidence"] or "",
+        "owner": (r["owner"] if "owner" in keys else "") or "",
+        "visibility": (r["visibility"] if "visibility" in keys else VIS_PRIVATE),
+        "platform": (r["platform"] if "platform" in keys else "wechat"),
+        "pinned": bool(r["pinned"]) if "pinned" in keys else False,
+        "origin": (r["origin"] if "origin" in keys else "") or "",
+        "topic": (r["topic"] if "topic" in keys else "") or "",
+    }
+
+
+def _verify_sources(conn: sqlite3.Connection, bank: str,
+                    chunk_ids: Sequence[int],
+                    allowed_sessions: Optional[Sequence[str]] = None
+                    ) -> Tuple[bool, str]:
+    """校验事实引用的原始片段**真的存在**，并且属于这个库 / 这个会话。
+
+    这是「任何记忆都要有来源」的执行点。在它之前，"来源"只是一列数字：
+    模型写什么就存什么，指一个不存在的 chunk、或者指到别人的会话里，
+    都能照单全收 —— 于是它可以凭空造一条事实再给它配一个假来源。
+
+    返回 (ok, error)。chunk 列表为空时返回失败 —— 没有来源的事实不受理。
+    """
+    ids = [int(c) for c in chunk_ids if str(c).strip()]
+    if not ids:
+        return False, "没有来源片段"
+    marks = ",".join("?" * len(ids))
+    params: List[Any] = [bank, *ids]
+    sql = (f"SELECT c.id, m.session FROM chunks c "
+           f"JOIN messages m ON m.id=c.message "
+           f"WHERE m.bank=? AND c.id IN ({marks})")
+    if allowed_sessions:
+        smarks = ",".join("?" * len(allowed_sessions))
+        sql += f" AND m.session IN ({smarks})"
+        params += [str(s) for s in allowed_sessions]
+    found = {int(r["id"]) for r in conn.execute(sql, params).fetchall()}
+    missing = [c for c in ids if c not in found]
+    if missing:
+        return False, f"来源片段不存在或不属于本次反思：{missing[:4]}"
+    return True, ""
+
 
 
 def _person_of(conn: sqlite3.Connection, owner: str) -> str:
@@ -979,11 +1185,14 @@ def _insert_fact(conn: sqlite3.Connection, bank: str, fact: Fact, now: int) -> i
         bank, fact.anchor, fact.predicate, fact.object, fact.confidence,
         json.dumps(fact.source_chunks), fact.evidence, now, now, fact.note,
         fact.owner, fact.visibility, fact.platform, 1 if fact.pinned else 0,
-        person, person))
+        person, person, fact.origin, fact.topic))
     return int(cur.lastrowid)
 
 
-def remember(path: str, bank: str, fact: Fact) -> Tuple[bool, Optional[int], str]:
+def remember(path: str, bank: str, fact: Fact, *,
+             verify_sources: bool = True,
+             allowed_sessions: Optional[Sequence[str]] = None
+             ) -> Tuple[bool, Optional[int], str]:
     """写入一条事实。返回 (ok, fact_id, error)。
 
     三种结果：
@@ -997,6 +1206,13 @@ def remember(path: str, bank: str, fact: Fact) -> Tuple[bool, Optional[int], str
     ⚠ owner 为空的写入会被拒绝。这不是形式主义 —— 一条不知道属于谁的事实，
       在注入时只能二选一：要么谁都看不到（白记），要么谁都看得到（泄露）。
       所以宁可不收，也不留一条身份不明的事实。
+
+    ⚠ `verify_sources=True`（默认）时，`source_chunks` 必须指向**真实存在、
+      且属于本库**的片段，否则整条拒收。这是「任何记忆都要有来源」的执行点：
+      在它之前模型可以造一条事实再配一个假来源，而库里无从分辨。
+
+      只有**迁移/修复**这类"事实是从原文倒推来的、源片段另有出处"的场景
+      才该传 False，正常写入一律走校验。
     """
     if not fact.ok:
         return False, None, "predicate / object 为空"
@@ -1008,17 +1224,25 @@ def remember(path: str, bank: str, fact: Fact) -> Tuple[bool, Optional[int], str
         return False, None, str(exc)
     try:
         now = _now_ms()
+        if verify_sources:
+            ok_src, err_src = _verify_sources(conn, bank, fact.source_chunks,
+                                              allowed_sessions)
+            if not ok_src:
+                return False, None, err_src
         prev = _find_same(conn, bank, fact)
         with conn:  # 事务
             if prev is not None:
                 if (prev["object"] or "") == fact.object:
                     conf = min(0.95, float(prev["confidence"] or 0) + 0.05)
+                    # 重复提及时，把新看到的 origin 记进事件 ——
+                    # 「这句话他在群里也说过」是有用的事实，不该丢。
                     conn.execute(
                         "UPDATE facts SET confidence=?, updated_at=?, pinned=MAX(pinned,?) "
                         "WHERE id=?",
                         (conf, now, 1 if fact.pinned else 0, prev["id"]))
                     _event(conn, bank, int(prev["id"]), "reinforce",
-                           f"重复提及：{fact.predicate}", {"confidence": conf})
+                           f"重复提及：{fact.predicate}",
+                           {"confidence": conf, "origin": fact.origin})
                     return True, int(prev["id"]), ""
 
                 new_id = _insert_fact(conn, bank, fact, now)
@@ -1033,12 +1257,79 @@ def remember(path: str, bank: str, fact: Fact) -> Tuple[bool, Optional[int], str
             new_id = _insert_fact(conn, bank, fact, now)
             _event(conn, bank, new_id, "add", fact.predicate,
                    {"object": fact.object, "owner": fact.owner,
-                    "visibility": fact.visibility})
+                    "visibility": fact.visibility,
+                    "origin": fact.origin, "topic": fact.topic})
             return True, new_id, ""
     except Exception as exc:
         return False, None, str(exc)
     finally:
         conn.close()
+
+
+def remember_both(path: str, bank: str, fact: Fact, *,
+                  group_owner: str,
+                  group_visibility: str = VIS_SHARED,
+                  allowed_sessions: Optional[Sequence[str]] = None
+                  ) -> Dict[str, Any]:
+    """群聊双写：同一条事实，同时落进「说话人的池」和「群的池」。
+
+    为什么是双份而不是二选一（这是用户定的规则）：
+        群里说的话，既是"这个人说过的话"（属于他），
+        也是"这个群发生过的事"（属于群）。
+        只存一份，必然要丢掉其中一个视角 —— 而两个视角以后都要用：
+
+            A 私聊问「我们上次在群里说的那事」 → 要能从 A 池翻到，
+              并且看得出"那是在群里说的"（origin = group:xxx）
+            C 群里别人问「这个群之前聊过啥」  → 要能从群池翻到
+
+    ⚠ **群池那份只收"不算私密"的内容。**
+      用户原话：「群池只纳入在群里说过、并且不算私密的内容」。
+      判定用 visibility 与 topic 两个条件，理由：
+
+        · A 在群里说「我明天去医院」—— 这句话虽然是当着群里说的，
+          但它是 A 的私事。写进群池意味着**群池里躺着 A 的健康信息**，
+          以后任何人翻群记忆都可能撞见它。
+        · 所以：**私密的照常进 A 池（只有 A 和主人看得见），群池不收。**
+
+      具体规则：
+        ① A 池那份一定写（visibility 原样）
+        ② 群池那份要额外满足 visibility in (shared, public)
+           或者 topic 落白名单 —— 两个"公开"信号有一个就够，
+           因为主人标 shared 已经是显式授权，不需再打标签。
+    ⚠ 两次写入共用一个 `source_chunks` 校验，只校验一次，省一次查询。
+    """
+    out: Dict[str, Any] = {"ok": False, "personal": None, "group": None,
+                           "errors": []}
+    # ① 说话人自己的池 —— 永远写
+    ok1, fid1, err1 = remember(path, bank, fact,
+                               verify_sources=True,
+                               allowed_sessions=allowed_sessions)
+    out["ok"] = bool(ok1)
+    out["personal"] = fid1
+    if not ok1:
+        out["errors"].append(f"个人池：{err1}")
+        return out          # 个人池都没写进去，群池不必写
+    # ② 群池 —— 只收"不算私密"的
+    publicish = (fact.visibility in (VIS_SHARED, VIS_PUBLIC)
+                 or topic_allowed(fact.topic))
+    if not publicish:
+        out["skipped_group"] = "私密内容不写入群池"
+        return out
+    g = Fact(
+        predicate=fact.predicate, object=fact.object, anchor=fact.anchor,
+        confidence=fact.confidence, source_chunks=list(fact.source_chunks),
+        evidence=fact.evidence, note=fact.note, owner=group_owner,
+        visibility=group_visibility, platform=fact.platform,
+        pinned=False,               # 置顶是"我的池里别被挤掉"，群池不继承
+        origin=fact.origin, topic=fact.topic,
+    )
+    ok2, fid2, err2 = remember(path, bank, g,
+                               verify_sources=True,
+                               allowed_sessions=allowed_sessions)
+    out["group"] = fid2
+    if not ok2:
+        out["errors"].append(f"群池：{err2}")
+    return out
 
 
 def forget_fact(path: str, bank: str, fact_id: int, reason: str = "") -> Tuple[bool, str]:
@@ -1070,7 +1361,8 @@ def forget_fact(path: str, bank: str, fact_id: int, reason: str = "") -> Tuple[b
 def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
                query: str = "", limit: int = 100, offset: int = 0,
                owner: str = "", tier: str = "",
-               also_owners: Sequence[str] = ()) -> Dict[str, Any]:
+               also_owners: Sequence[str] = (),
+               origin: str = "", topic: str = "") -> Dict[str, Any]:
     """列/搜事实。
 
     两种调用方式：
@@ -1078,6 +1370,9 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
       · **说话视角**（传了 owner 和 tier）：只返回这个人有权看到的事实，
         走 scope_filter() 那条唯一的隔离判断。
         `also_owners` 传同一个人的其它平台账号，实现跨平台记忆汇总。
+
+    `origin` / `topic`（v5）：精确过滤。"group:xxx" 取某个群里说过的话；
+    话题给一个值就只出那一类。两个都空 = 不按这两项过滤。
 
     ⚠ 管理视角只能给 UI 用。任何注入到提示词的路径**必须**传 owner+tier，
       否则等于把所有人的私密内容摆到台面上。
@@ -1095,6 +1390,12 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
     if anchor:
         where.append("anchor = ?")
         params.append(anchor)
+    if origin:
+        where.append("origin = ?")
+        params.append(origin)
+    if topic:
+        where.append("topic = ?")
+        params.append(topic)
     if (query or "").strip():
         where.append("(predicate LIKE ? OR object LIKE ? OR evidence LIKE ?)")
         q = f"%{query.strip()}%"
@@ -1114,26 +1415,7 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
             "pinned DESC, CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC "
             "LIMIT ? OFFSET ?",
             params + [max(1, int(limit)), max(0, int(offset))]).fetchall()
-        items = []
-        for r in rows:
-            try:
-                chunks = json.loads(r["source_chunks"] or "[]")
-            except Exception:
-                chunks = []
-            keys = set(r.keys())
-            items.append({
-                "id": int(r["id"]), "anchor": r["anchor"] or "",
-                "predicate": r["predicate"], "object": r["object"],
-                "confidence": round(float(r["confidence"] or 0), 2),
-                "status": r["status"], "supersededBy": r["superseded_by"],
-                "createdAt": int(r["created_at"] or 0),
-                "updatedAt": int(r["updated_at"] or 0),
-                "chunks": chunks, "evidence": r["evidence"] or "",
-                "owner": (r["owner"] if "owner" in keys else "") or "",
-                "visibility": (r["visibility"] if "visibility" in keys else VIS_PRIVATE),
-                "platform": (r["platform"] if "platform" in keys else "wechat"),
-                "pinned": bool(r["pinned"]) if "pinned" in keys else False,
-            })
+        items = [_row_to_item(r) for r in rows]
         return {"items": items, "total": int(total)}
     except Exception as exc:
         return {"items": [], "total": 0, "error": str(exc)}
@@ -1299,7 +1581,8 @@ def recall_text(path: str, bank: str, query: str, *, max_chars: int = 2400) -> s
 
 
 def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
-                     limit: int = 8, pinned_limit: int = 4) -> str:
+                     limit: int = 8, pinned_limit: int = 4,
+                     question: str = "") -> str:
     """把「她认为什么」渲染成注入段。这是原文检索之外的第二条腿。
 
     原文给她"你说过什么"，事实给她"我知道你是谁、你偏好什么"。
@@ -1310,11 +1593,18 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
          直接返回空串 —— 宁可这次不注入，也不能瞎注入。
       2. 置顶单独走一遍，**独立预算**。置顶的事实不该被普通检索挤掉：
          "你叫她爸爸"和"今天下雨"不该抢同一个名额。
-      3. 非主人会看到 owner 是别人、但 visibility=shared 的条目 ——
+      3. **非主人只拿得到"开放信息"** —— 走 open_facts_for()，
+         两个条件同时成立才算（visibility 已标 shared/public 且话题在白名单）。
          这就是"她知道你喜欢吃辣，但不知道你昨天住院了"的实现方式。
+         v5 之前这里给的是"所有 shared"，于是只要你标过一次 shared，
+         连"住址"都会被端出去 —— 白名单补的就是这个洞。
       4. **跨平台**：她自己在这里查出这个人的所有平台账号
          （owner_persons），一起交给 scope_filter。调用方不需要知道
          person 表的存在 —— 少一个参数就少一处漏。
+      5. `question`（v5）：本轮对方说了什么。目前只用于**注入侧不提无关的开放信息**
+         —— 对方没问到主人时，不主动把主人的爱好塞进去（那反而会让她
+         在闲聊里突然提一嘴"我主人爱吃烧烤"，很不自然）。
+         传空串 = 不过滤（旧行为）。
     """
     if not owner or not tier:
         return ""
@@ -1331,6 +1621,17 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
                         limit=max(1, limit)).get("items") or []
 
     mine = {owner, *siblings}
+
+    # ③ 非主人：只留"开放信息"。open_facts_for 是唯一判定，
+    #    这里不复制它的条件 —— 两处各写一份就会漂。
+    if tier != TIER_OWNER:
+        allowed_ids: set = set()
+        for o in mine:
+            for it in open_facts_for(path, bank, o, limit=200):
+                allowed_ids.add(it["id"])
+        pinned = [i for i in pinned if i["id"] in allowed_ids]
+        normal = [i for i in normal if i["id"] in allowed_ids]
+
     seen, lines = set(), []
     for item in [i for i in pinned if i.get("pinned")] + normal:
         fid = item.get("id")
@@ -1344,8 +1645,264 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
         conf = item["confidence"]
         mark = "" if conf >= 0.7 else "（不确定）"
         star = "★" if item.get("pinned") else ""
-        lines.append(f"- {star}{who}｜{item['predicate']}：{item['object']}{mark}")
+        # 群里说过的事标出来 —— 她得知道"这话是在场合里说的"，
+        # 否则会把群聊里的公开讨论当成私聊秘密讲出去。
+        where = ""
+        o = item.get("origin") or ""
+        if o.startswith("group:"):
+            where = "（群里说的）"
+        lines.append(f"- {star}{who}｜{item['predicate']}：{item['object']}{mark}{where}")
     return "\n".join(lines)
+
+
+def owner_said_about(path: str, bank: str, answerer_owner: str,
+                     about_owner: str, question: str,
+                     limit: int = 6) -> str:
+    """「对方在问第三个人」时，把**那个第三人**的开放信息渲染出来。
+
+    典型场景：B 问「你主人喜欢吃什么呀」。
+    此时 B 面前是 `answerer_owner`（B 自己的池），但要回答的是关于
+    `about_owner`（主人 A）的事。
+
+    ⚠ 只给开放信息，而且**只给白名单话题**。
+      不问「住哪」时她拿不到「住址」，问了也拿不到 —— 判定在 open_facts_for，
+      不靠提示词自觉。
+    """
+    if not (about_owner and about_owner != answerer_owner):
+        return ""
+    items = open_facts_for(path, bank, about_owner, limit=max(1, int(limit)))
+    if not items:
+        return ""
+    lines = []
+    for it in items:
+        lines.append(f"- {it['predicate']}：{it['object']}")
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 记忆池总览 + 角色印象
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def pool_summary(path: str, bank: str, *, main_owner: str = "") -> Dict[str, Any]:
+    """各个记忆池的**数量**，不含任何内容。
+
+    UI 的「其他记忆池」副页只拿这个 —— 列出池名和条数，
+    一条内容都不返回。理由：别人的池本来就不该在主人没主动点进去时
+    被铺开在屏幕上；而且这个页面现在只是占位。
+
+    返回：
+        {"pools": [{"owner","name","kind","facts","messages","isMain"}], ...}
+    """
+    out: Dict[str, Any] = {"pools": [], "mainOwner": main_owner, "total": 0}
+    if not (path and os.path.isfile(path)):
+        return out
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return out
+    try:
+        rows = conn.execute(
+            "SELECT o.owner, o.kind, o.platform, o.display_name, o.tier, "
+            "(SELECT COUNT(*) FROM facts f WHERE f.bank=? AND f.owner=o.owner "
+            " AND f.status='active') AS facts, "
+            "(SELECT COUNT(*) FROM messages m WHERE m.bank=? AND m.session=o.external_id) AS msgs "
+            "FROM owners o ORDER BY facts DESC", (bank, bank)).fetchall()
+        pools = []
+        for r in rows:
+            pools.append({
+                "owner": r["owner"],
+                "kind": r["kind"],
+                "platform": r["platform"],
+                "name": r["display_name"] or r["external_id"] or r["owner"],
+                "tier": r["tier"],
+                "facts": int(r["facts"] or 0),
+                "messages": int(r["msgs"] or 0),
+                "isMain": r["owner"] == main_owner,
+            })
+        out["pools"] = pools
+        out["total"] = len(pools)
+        return out
+    except Exception:
+        return out
+    finally:
+        conn.close()
+
+
+def impression_board(path: str, bank: str) -> Dict[str, Any]:
+    """「角色印象」页的数据：每个人一格，格子里是她的评语 + 开放信息清单。
+
+    结构：
+        {"people": [{owner, name, kind, tier, note, open: [...], facts, private}],
+         "mainOwner": ""}
+
+    `open` 只装**开放信息**（shared + 白名单话题）—— 这一页的用途是让主人
+    逐条审阅"她准备对外说哪些关于我的事"，所以只列会外传的那些。
+    私密的数量给一个数字，但不铺开 —— 主人要看全文去记忆页。
+
+    note：印象评语。存在 owners 表旁边的一张表里（见印象表 DDL），
+    没有就返回空串，UI 显示输入框。
+    """
+    out: Dict[str, Any] = {"people": []}
+    if not (path and os.path.isfile(path)):
+        return out
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return out
+    try:
+        rows = conn.execute(
+            "SELECT * FROM owners ORDER BY last_seen DESC").fetchall()
+        people = []
+        for r in rows:
+            owner = r["owner"]
+            note = ""
+            try:
+                nr = conn.execute(
+                    "SELECT note FROM impressions WHERE owner=? AND bank=?",
+                    (owner, bank)).fetchone()
+                note = (nr["note"] if nr else "") or ""
+            except Exception:
+                note = ""
+            opens = open_facts_for(path, bank, owner, limit=60)
+            total = 0
+            priv = 0
+            try:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM facts WHERE bank=? AND owner=? "
+                    "AND status='active'", (bank, owner)).fetchone()[0]
+                priv = conn.execute(
+                    "SELECT COUNT(*) FROM facts WHERE bank=? AND owner=? "
+                    "AND status='active' AND NOT (visibility IN ('shared','public'))",
+                    (bank, owner)).fetchone()[0]
+            except Exception:
+                pass
+            people.append({
+                "owner": owner,
+                "name": r["display_name"] or r["external_id"] or owner,
+                "kind": r["kind"], "tier": r["tier"] or TIER_GUEST,
+                "note": note,
+                "open": [{"id": it["id"], "topic": it["topic"],
+                          "predicate": it["predicate"], "object": it["object"],
+                          "visibility": it["visibility"]} for it in opens],
+                "facts": int(total), "private": int(priv),
+            })
+        out["people"] = people
+        return out
+    except Exception:
+        return out
+    finally:
+        conn.close()
+
+
+def set_impression(path: str, bank: str, owner: str, note: str) -> Tuple[bool, str]:
+    """写「我对这个人的印象」。这是主人手写的一段话，模型不参与。"""
+    if not owner:
+        return False, "owner 为空"
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        now = _now_ms()
+        with conn:
+            conn.execute(
+                "INSERT INTO impressions(bank,owner,note,created_at,updated_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(bank,owner) DO UPDATE SET "
+                "note=excluded.note, updated_at=excluded.updated_at",
+                (bank, owner, (note or "")[:2000], now, now))
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def revoke_open(path: str, bank: str, fact_id: int) -> Tuple[bool, str]:
+    """把一条开放信息**撤回**成私密。
+
+    ⚠ 这是"角色印象页点删除"做的事：不是忘掉，只是不再外传。
+      和 forget_fact 完全不同 —— 忘掉是"她不再拿它当结论"，
+      撤回是"这条结论还在，但不许说给外人"。
+
+    同时清空 topic —— 话题标签本来就是为"能不能外传"服务的，
+    撤回了留着它没有意义，反而会让下次误判。
+    """
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        now = _now_ms()
+        with conn:
+            row = conn.execute("SELECT * FROM facts WHERE id=? AND bank=?",
+                               (fact_id, bank)).fetchone()
+            if row is None:
+                return False, "没有这条事实"
+            conn.execute(
+                "UPDATE facts SET visibility=?, topic='', updated_at=? WHERE id=?",
+                (VIS_PRIVATE, now, fact_id))
+            _event(conn, bank, fact_id, "revoke_open",
+                   f"撤回开放：{row['predicate']}",
+                   {"was": row["visibility"], "topic": row["topic"]})
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def delete_fact_pair(path: str, bank: str, fact_id: int) -> Dict[str, Any]:
+    """删一条事实，并且**连带删掉它的双写副本**（用户选的 B 方案）。
+
+    群聊双写之后，同一条话在「人池」和「群池」各有一条，但它们
+    **不是靠 id 关联的** —— 两条是独立插入的行。所以要靠
+    (origin, predicate, object, 时间相近) 找副本。
+
+    ⚠ 只在"确实来自群聊"时才找副本。私聊事实没有副本，
+      这一步是空操作，不会误删别人的东西。
+    """
+    out: Dict[str, Any] = {"ok": False, "deleted": [], "error": ""}
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+    try:
+        row = conn.execute("SELECT * FROM facts WHERE id=? AND bank=?",
+                           (fact_id, bank)).fetchone()
+        if row is None:
+            out["error"] = "没有这条事实"
+            return out
+        ids = [int(row["id"])]
+        origin = (row["origin"] if "origin" in row.keys() else "") or ""
+        if origin.startswith("group:"):
+            # 同一次反思写出的两条：owner 不同、origin 相同、谓词对象相同。
+            twins = conn.execute(
+                "SELECT id FROM facts WHERE bank=? AND origin=? AND predicate=? "
+                "AND object=? AND owner<>? AND status='active'",
+                (bank, origin, row["predicate"], row["object"],
+                 row["owner"])).fetchall()
+            ids += [int(t["id"]) for t in twins]
+        now = _now_ms()
+        with conn:
+            marks = ",".join("?" * len(ids))
+            conn.execute(
+                f"UPDATE facts SET status=?, updated_at=? WHERE id IN ({marks})",
+                (FORGOTTEN, now, *ids))
+            for fid in ids:
+                _event(conn, bank, fid, "forget", "用户删除",
+                       {"pair": len(ids) > 1})
+        out.update({"ok": True, "deleted": ids})
+        return out
+    except Exception as exc:
+        out["error"] = str(exc)
+        return out
+    finally:
+        conn.close()
+
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1408,9 +1965,41 @@ def set_visibility(path: str, bank: str, fact_id: int, visibility: str,
         conn.close()
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 反思：从原文提炼事实
-# ══════════════════════════════════════════════════════════════════════════
+def set_topic(path: str, bank: str, fact_id: int, topic: str,
+              *, by: str = "") -> Tuple[bool, str]:
+    """给一条事实打话题标签。话题决定「这条能不能说给外人听」。
+
+    和 set_visibility 的关系：**两个都要满足才能外传**（见 open_facts_for）。
+    所以这里传一个不在集合里的值，等于"撤销开放"，不是报错 ——
+    更好用的是 revoke_open()，那个一次把两项都清干净。
+
+    ⚠ 只该由主人在界面上点，或者由反思时**自动打一个保守的标签**。
+      模型打的标签错了只会导致"这条不给外人看"，不会反向泄露 ——
+      因为它和 visibility 是**与**的关系，不是或。
+    """
+    t = (topic or "").strip()
+    if t and t not in TOPICS:
+        return False, f"话题只能是 {TOPICS} 之一，或留空"
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            row = conn.execute("SELECT topic FROM facts WHERE id=? AND bank=?",
+                               (fact_id, bank)).fetchone()
+            if row is None:
+                return False, "没有这条事实"
+            conn.execute("UPDATE facts SET topic=?, updated_at=? WHERE id=?",
+                         (t[:40], _now_ms(), fact_id))
+            _event(conn, bank, fact_id, "topic",
+                   f"{row['topic'] or '-'} → {t or '-'}",
+                   {"by": by, "from": row["topic"], "to": t})
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
 
 REFLECT_SYSTEM = """你在帮一个角色把她记得的事整理成「事实」，而不是复述原文。
 

@@ -300,17 +300,25 @@ class UiaSender:
         return None
 
     def _gui(self):
-        """chatbox.send_file 需要的 GUI 门面。
+        """WeChatGUI 门面（懒加载并缓存）。
 
-        vendor 的 ``chatbox.send_file`` 走 ``SetClipboardFiles`` + ``SendKeys``，
-        要一个 ChatBox 对象；``guia``（WeChatGUI）已经具备
-        ``copy_files_to_clipboard`` / ``_uia_has_draft`` 等全套，而且已经在
-        本机验证过 4.1.x/4.2.0 两条分支。优先用它，失败再退回 chatbox。
+        ⚠ 必须缓存。WeChatGUI.__init__ 会做布局校准（OCR + 截图），
+          实测首次要 20 秒以上。每次发图都新建一个 = 每张图卡 20 秒。
+          而且这个对象持有截图坐标/渲染尺寸，草稿的像素检测全靠它。
+
+        为什么用 guia 而不是 chatbox：
+          chatbox.send_file 只有一条路（剪贴板 + SendKeys + 点发送按钮），
+          guia 有 UIA/坐标双路径 + 两套草稿判据 + 「自动最小化遮挡窗口」。
+          发附件比发文字脆弱得多，多出来的判据就是多出来的活路。
         """
+        g = getattr(self, "_gui_obj", None)
+        if g is not None:
+            return g
         try:
             from wechatauto.guia import WeChatGUI
 
             g = WeChatGUI()
+            self._gui_obj = g
             return g
         except Exception as exc:
             raise SendError(f"初始化 GUI 门面失败: {exc}", kind="init") from exc
@@ -371,7 +379,15 @@ class UiaSender:
         except Exception as exc:
             err = f"UIA 路线异常: {exc}"
 
-        # ② 退回坐标 + 真键盘路线（旧版微信仍然有效）
+        # ② 草稿检测不可信，合并走 vendor 的混合路线。
+        #
+        #    guia.send_file 内部有两条判据：
+        #      UIA 可用 → UIA 草稿（Value 里的 U+FFFC）
+        #      否则     → 像素检测（输入框上方有没有彩色缩略图）
+        #    实测（2026-11-02，4.1.15.53）UIA 那条会连试 3 次都判"没有草稿"，
+        #    但**粘贴可能已经成功了** —— 判据不看，不能据此断定失败。
+        #    所以这里不再自己实现一遍，直接把整件交给 guia：
+        #    它的 PasteFile 路径更全（真键盘 Ctrl+V、剪贴板文件列表）。
         try:
             gui = self._gui()
             res = gui.send_file(path, who=None)
@@ -380,20 +396,34 @@ class UiaSender:
             if ok:
                 return SendResult(ok=True, who=who, path=path, kind=kind,
                                   text=f"[{kind}]")
-            err = err or f"send_file 返回失败: {res!r}"
+            err = err or f"guia.send_file 返回失败: {res!r}"
         except Exception as exc:
             err = err or f"坐标路线异常: {exc}"
 
         raise SendError(f"媒体发送失败：{err}", kind="send")
 
     def _paste_media_uia(self, edit, path: str, attempts: int = 3) -> bool:
-        """UIA 路线：CF_HDROP 写剪贴板 → 控件级 Ctrl+V → 等草稿 → 回车。
+        """UIA 路线：CF_HDROP 写剪贴板 → 控件级 Ctrl+V → 判草稿 → 回车。
 
-        草稿判据是输入框 Value 里出现 U+FFFC（对象替换符）：
-        微信把粘贴进来的图片/表情当成一个内嵌对象塞进编辑框，
-        文本层就只剩这个字符。空框读回 ''。
-        控件不暴露 Value 时按"不知道"处理，**仍然发送** —— 条款没变，
-        读不到不等于内容错了（和 send_text 的同一条道理）。
+        ═══════════════════════════════════════════════════════════════
+        判据为什么不能用 Value 里的 U+FFFC
+        ═══════════════════════════════════════════════════════════════
+
+        2026-11-02 在本机 4.1.15.53 上实测（tools/diagnose_paste.py）：
+
+            文本粘贴后 Value : '诊断文本ABC'   ← 文本会进 Value
+            文件粘贴后 Value : ''              ← 文件**不进** Value，5 秒 9 次都是空
+            像素检测         : True            ← 但缩略图真的渲染出来了
+
+        也就是说：微信把文件当成内嵌对象塞进编辑框，却不把它算进 Value。
+        vendor 的 ``_uia_has_draft`` 等 U+FFFC，在这个版本上永远等不到 ——
+        它报"没有草稿"时，草稿其实已经在框里了。
+
+        所以这里改成两段式：
+            ① 粘贴后判据 = 像素（输入框上方有没有彩色缩略图）
+            ② 发没发出去 = 数据库（由 verify_media_sent 验，不在这里定）
+
+        像素判据失败时**仍然回车**，理由见下方注释。
         """
         try:
             from wechatauto.guia import WeChatGUI
@@ -405,41 +435,96 @@ class UiaSender:
         time.sleep(0.3)
 
         edit.SetFocus()
+
+        # 拿坐标路线那套像素检测 —— 它需要输入框的**渲染坐标**，
+        # 只有 WeChatGUI 知道（要做 rel→screen 换算）。
+        gui = None
+        box = None
+        try:
+            gui = self._gui()
+            box = gui.get_input_box()
+        except Exception as exc:
+            self._warn(f"拿不到输入框坐标，像素判据不可用：{exc}")
+
         landed = False
-        for _ in range(max(1, attempts)):
+        for n in range(max(1, attempts)):
             edit.SendKeys("{Ctrl}a{Delete}", waitTime=0.1)
             edit.SendKeys("{Ctrl}v", waitTime=0.1)
-            if self._wait_draft(edit, wait=4.0):
+            if self._draft_visible(edit, gui, box, wait=3.0):
                 landed = True
                 break
+            if n < attempts - 1:
+                # 焦点可能没落进输入框：点一下再试
+                try:
+                    if box:
+                        gui.focus_input(box)
+                except Exception:
+                    pass
+                time.sleep(0.4)
+
         if not landed:
-            # 读不到草稿标记：可能是控件不暴露 Value，也可能是粘贴真失败。
-            # 这里选择"再试一次纯键盘 Ctrl+V"，失败才放弃，避免静默发空。
-            try:
-                edit.SendKeys("{Ctrl}v", waitTime=0.1)
-                landed = self._wait_draft(edit, wait=2.0)
-            except Exception:
-                pass
-        if not landed:
-            return False
+            # 两条判据都说没有草稿。两种可能分不开：
+            #   a) 粘贴真失败（剪贴板被清、焦点丢了）
+            #   b) 像素判据也不适用（窗口被别的窗口挡住、缩略图还没画出来）
+            #
+            # 仍然回车。取舍：真失败时发出去的是一条空消息 —— 对方会问
+            # 「你发了啥」，看得见；而静默不发她永远不知道有张表情没出去，
+            # 看不见。宁可错在明处。
+            self._warn(
+                f"草稿判据未见缩略图（像素+Value 都空），仍尝试回车："
+                f"{os.path.basename(path)}")
 
         edit.SendKeys("{Enter}", waitTime=0.05)
         time.sleep(1.2)
         return True
 
     @staticmethod
-    def _wait_draft(edit, wait: float = 4.0) -> bool:
-        """轮询输入框 Value 是否出现 U+FFFC。控件不暴露 Value 时返回 True。"""
+    def _warn(msg: str) -> None:
+        """把警告同时写到 wechatauto 的日志和标准错误。
+
+        两边都写是因为：调试时人在看 stderr，而程序跑起来以后
+        只有 wxlog 落盘。只写一边总会有一边看不到。
+        """
+        try:
+            from wechatauto.logger import wxlog
+
+            wxlog.warning(msg)
+        except Exception:
+            pass
+        try:
+            print(f"[wechat_sender] {msg}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
+    def _draft_visible(self, edit, gui, box, wait: float = 3.0) -> bool:
+        """判"粘贴的草稿在不在输入框里"。
+
+        两条判据，**任一成立就算有**：
+          ① 输入框 Value 里出现 U+FFFC —— 4.2.0 上的行为
+          ② 输入框上方出现彩色缩略图   —— 4.1.x 上的行为（本机实测只有这条灵）
+
+        都没有才返回 False。任何一条成立就立刻 True，不浪费时间等另一条。
+        """
         deadline = time.time() + wait
         while time.time() < deadline:
+            # ① Value
             try:
-                val = edit.GetValuePattern().Value
+                v = edit.GetValuePattern().Value
+                if v and "\ufffc" in v:
+                    return True
             except Exception:
-                # 读不到 → 没有探测能力 ≠ 内容错了
-                return True
-            if val and "\ufffc" in val:
-                return True
-            time.sleep(0.25)
+                # 读不到 Value：没有探测能力，交给像素判据
+                pass
+
+            # ② 像素
+            if gui is not None and box is not None:
+                try:
+                    if gui._input_box_has_color_draft(box, wait=0.6):
+                        return True
+                except Exception:
+                    pass
+
+            time.sleep(0.3)
         return False
 
     # ------------------------------------------------------------------
