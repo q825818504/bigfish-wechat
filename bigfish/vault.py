@@ -1362,6 +1362,30 @@ def inspect_wipe(root: Optional[str] = None, keep_soul: bool = True) -> WipePlan
         plan.items.append({"name": "scope.json", "kind": "scope",
                            "bytes": os.path.getsize(sp), "action": "删除"})
         plan.total_bytes += os.path.getsize(sp)
+
+    # 表情库：清空时**不删**，鲸落时删。
+    #
+    # 为什么清空要留：清空是"她忘了"，可她的表情包是**用户攒的**，
+    # 不是她的记忆。把用户几十张表情一起删掉，那是删用户的文件。
+    # 鲸落是"她不存在了"，那时候表情库也该走。
+    sd = sticker_dir(root)
+    if os.path.isdir(sd):
+        size = 0
+        count = 0
+        for dirpath, _dn, filenames in os.walk(sd):
+            for fn in filenames:
+                try:
+                    size += os.path.getsize(os.path.join(dirpath, fn))
+                    count += 1
+                except Exception:
+                    pass
+        if count:
+            keep = keep_soul    # 清空(True) 保留；鲸落(False) 删除
+            plan.items.append({
+                "name": STICKER_DIR + "/", "kind": "stickers", "bytes": size,
+                "files": count, "action": "保留" if keep else "删除"})
+            if not keep:
+                plan.total_bytes += size
     return plan
 
 
@@ -1421,7 +1445,7 @@ def apply_wipe(root: Optional[str] = None, keep_soul: bool = True,
         name = item["name"]
         target = os.path.join(root, name.rstrip("/"))
         try:
-            if item["kind"] == "legacy":
+            if item["kind"] in ("legacy", "stickers"):
                 shutil.rmtree(target, ignore_errors=False)
             elif os.path.isfile(target):
                 os.remove(target)
@@ -1761,6 +1785,232 @@ def record_exchange(
         n += 1 if ok else 0
 
     return n
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 表情包
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 三样东西，各管一件事：
+#
+#   <数据目录>/stickers/            她的表情库。这里有什么，她就能发什么。
+#   <数据目录>/stickers/index.json  每个文件的一行描述（插件据此挑）
+#   <数据目录>/sticker-config.json  开关、频率、冷却
+#
+# 为什么总开关默认**关**：
+#   这是新能力，而且会改变聊天节奏。默认打开等于替用户做了决定，
+#   而用户第一次看到"她突然发图"时不会觉得惊喜，会觉得失控。
+#   要开，用户自己开。
+#
+# 为什么 rate 默认 0.15 而不是 0.5：
+#   表情包的价值来自稀缺。每三句发一张，两周后用户就会关掉这个功能。
+
+STICKER_DIR = "stickers"
+STICKER_INDEX = "index.json"
+STICKER_CONFIG_NAME = "sticker-config.json"
+
+STICKER_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "rate": 0.15,
+    "cooldown": 180,
+    "mode": "ai",          # ai = 让模型按心情挑；random = 随机
+    "maxPerChat": 20,
+}
+
+
+def sticker_dir(root: Optional[str] = None) -> str:
+    return os.path.join(root or resolve_data_root(), STICKER_DIR)
+
+
+def sticker_config_path(root: Optional[str] = None) -> str:
+    return os.path.join(root or resolve_data_root(), STICKER_CONFIG_NAME)
+
+
+def read_sticker_config(root: Optional[str] = None) -> Dict[str, Any]:
+    """读表情包配置。缺失/损坏都返回默认值，不抛 —— 引擎每轮都要调它。"""
+    cfg = dict(STICKER_DEFAULTS)
+    path = sticker_config_path(root)
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k in cfg:
+                        cfg[k] = v
+        except Exception:
+            pass
+    # 类型兜底：用户手改坏了的 JSON 能让引擎整轮崩掉，不值
+    try:
+        cfg["enabled"] = bool(cfg.get("enabled"))
+        cfg["rate"] = max(0.0, min(1.0, float(cfg.get("rate", 0.15))))
+        cfg["cooldown"] = max(0, int(cfg.get("cooldown", 180)))
+        cfg["maxPerChat"] = max(1, int(cfg.get("maxPerChat", 20)))
+        if cfg.get("mode") not in ("ai", "random"):
+            cfg["mode"] = "ai"
+    except (TypeError, ValueError):
+        cfg = dict(STICKER_DEFAULTS)
+    return cfg
+
+
+def write_sticker_config(patch: Dict[str, Any],
+                         root: Optional[str] = None) -> Tuple[bool, str]:
+    cfg = read_sticker_config(root)
+    for k, v in (patch or {}).items():
+        if k in STICKER_DEFAULTS:
+            cfg[k] = v
+    # 重新归一化一次（写进去的值也要夹住）
+    tmp = dict(STICKER_DEFAULTS)
+    tmp.update(cfg)
+    try:
+        tmp["enabled"] = bool(tmp.get("enabled"))
+        tmp["rate"] = max(0.0, min(1.0, float(tmp.get("rate"))))
+        tmp["cooldown"] = max(0, int(tmp.get("cooldown")))
+        tmp["maxPerChat"] = max(1, int(tmp.get("maxPerChat")))
+        if tmp.get("mode") not in ("ai", "random"):
+            tmp["mode"] = "ai"
+    except (TypeError, ValueError) as exc:
+        return False, f"参数不合法：{exc}"
+    try:
+        _atomic_write_json(sticker_config_path(root), tmp)
+    except WriteDenied as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def list_stickers(root: Optional[str] = None) -> List[Dict[str, Any]]:
+    """列出表情库。返回 [{name, path, size, kind, tags, desc}]，按名字排序。"""
+    d = sticker_dir(root)
+    out: List[Dict[str, Any]] = []
+    if not os.path.isdir(d):
+        return out
+    meta = _read_sticker_index(root)
+    for fn in sorted(os.listdir(d)):
+        if fn.lower() == STICKER_INDEX:
+            continue
+        p = os.path.join(d, fn)
+        if not os.path.isfile(p):
+            continue
+        ext = os.path.splitext(fn)[1].lower()
+        if ext not in (".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+            continue
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        m = meta.get(fn) or {}
+        out.append({
+            "name": fn,
+            "path": p,
+            "size": size,
+            "kind": "sticker" if ext == ".gif" else "image",
+            "desc": str(m.get("desc") or ""),
+        })
+    return out
+
+
+def _read_sticker_index(root: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    p = os.path.join(sticker_dir(root), STICKER_INDEX)
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_sticker_desc(name: str, desc: str,
+                       root: Optional[str] = None) -> Tuple[bool, str]:
+    """写一张表情的一句话说明。插件靠这个挑，而不是靠文件名。"""
+    idx = _read_sticker_index(root)
+    if desc.strip():
+        idx[name] = {"desc": desc.strip()[:60]}
+    else:
+        idx.pop(name, None)
+    try:
+        _atomic_write_json(os.path.join(sticker_dir(root), STICKER_INDEX), idx)
+    except WriteDenied as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def import_sticker(src: str, root: Optional[str] = None) -> Tuple[bool, str]:
+    """把外部图片拷进表情库。返回 (ok, 说明或新路径)。
+
+    会重名改名，不覆盖已有的 —— 覆盖表情库是不可撤销的破坏。
+    """
+    if not os.path.isfile(src):
+        return False, f"文件不存在：{src}"
+    ext = os.path.splitext(src)[1].lower()
+    if ext not in (".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+        return False, f"不支持的格式：{ext}"
+    d = sticker_dir(root)
+    try:
+        os.makedirs(d, exist_ok=True)
+        stem = os.path.splitext(os.path.basename(src))[0]
+        dst = os.path.join(d, stem + ext)
+        n = 1
+        while os.path.exists(dst):
+            dst = os.path.join(d, f"{stem}({n}){ext}")
+            n += 1
+        shutil.copy2(src, dst)
+        return True, dst
+    except Exception as exc:
+        return False, f"导入失败：{exc}"
+
+
+def delete_sticker(name: str, root: Optional[str] = None) -> Tuple[bool, str]:
+    p = os.path.join(sticker_dir(root), name)
+    if not os.path.isfile(p):
+        return False, "文件不存在"
+    try:
+        os.remove(p)
+    except Exception as exc:
+        return False, str(exc)
+    idx = _read_sticker_index(root)
+    if name in idx:
+        idx.pop(name, None)
+        try:
+            _atomic_write_json(os.path.join(sticker_dir(root), STICKER_INDEX), idx)
+        except Exception:
+            pass
+    return True, ""
+
+
+def record_sticker_sent(chat_id: str, name: str) -> None:
+    """记一笔"她在哪个会话发过哪张表情"。
+
+    存在 sticker-usage.json 里，只做统计和"别连着发同一张"，不进记忆库 ——
+    表情不是她说的话，塞进记忆会污染检索。
+    """
+    p = os.path.join(resolve_data_root(), "sticker-usage.json")
+    try:
+        data = {}
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+        rec = data.setdefault(chat_id, {})
+        rec[name] = int(rec.get(name, 0)) + 1
+        data["_last"] = {"chat": chat_id, "name": name, "at": int(time.time())}
+        _atomic_write_json(p, data)
+    except Exception:
+        pass
+
+
+def sticker_usage(chat_id: str = "") -> Dict[str, Any]:
+    p = os.path.join(resolve_data_root(), "sticker-usage.json")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        return data.get(chat_id, {}) if chat_id else data
+    except Exception:
+        return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════

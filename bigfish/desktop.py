@@ -264,6 +264,8 @@ class EngineWorker(QThread):
         self.soul = None
         self.mcfg = None
         self.owner_id = ""          # 主人在记忆库里的 owner 键
+        #: chat_id -> [时间戳]，表情包冷却用
+        self._sticker_sent: dict = {}
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
@@ -277,6 +279,117 @@ class EngineWorker(QThread):
     # ------------------------------------------------------------------
     def _log(self, text: str, kind: str = "") -> None:
         self.log.emit(text, kind)
+
+    # ==================================================================
+    # 表情包
+    # ==================================================================
+    def _pick_sticker(self, msg, body: str, reply: str) -> str:
+        """决定这一轮要不要跟一张表情包，返回文件路径（空串 = 不发）。
+
+        三层判断，任何一层否决就安静地不发：
+
+          ① 总开关关着 / 冷却中 / 本轮概率没中
+          ② 插件（scope=sticker）给出的选择
+          ③ 文件真能发（存在、格式对、尺寸没超）
+
+        为什么冷却放在这么前面：表情包的杀伤力在于稀缺。
+        每句都发就成了噪音，用户会把它关掉，然后这个功能等于没有。
+        """
+        from bigfish import vault
+
+        cfg = vault.read_sticker_config()
+        if not cfg.get("enabled"):
+            return ""
+
+        # ---- 冷却 ----
+        now = time.time()
+        span = self._sticker_sent.setdefault(msg.chat_id, [])
+        span[:] = [t for t in span if now - t < float(cfg.get("cooldown", 180))]
+        if span:
+            return ""
+
+        # ---- 概率 ----
+        try:
+            rate = float(cfg.get("rate", 0.15))
+        except (TypeError, ValueError):
+            rate = 0.15
+        rate = max(0.0, min(1.0, rate))
+        if rate <= 0:
+            return ""
+        import random
+
+        if random.random() > rate:
+            return ""
+
+        # ---- 插件选择 ----
+        path = ""
+        try:
+            from bigfish.plugins import collect_sticker
+
+            path = collect_sticker({
+                "chat_name": getattr(msg, "chat_name", ""),
+                "chat_id": getattr(msg, "chat_id", ""),
+                "user_text": body or "",
+                "reply_text": reply or "",
+                "is_group": str(getattr(msg, "chat_id", "")).endswith("@chatroom"),
+                "generated_by": "engine",
+            }) or ""
+        except Exception as exc:
+            self._log(f"[表情] 插件异常：{exc}", "err")
+            return ""
+
+        if not path:
+            return ""
+
+        # ---- 文件检查 ----
+        from bigfish.wechat_sender import check_media
+
+        ok, why = check_media(path)
+        if not ok:
+            self._log(f"[表情] 跳过：{why}", "err")
+            return ""
+        return path
+
+    def _send_sticker(self, msg, path: str, remember_sent) -> None:
+        """发出去，并把结果记进日志/统计。失败不抛，只记。"""
+        from bigfish.wechat_sender import SendError, classify_media
+
+        if self.sender is None:
+            return
+        import os as _os
+
+        name = _os.path.basename(path)
+        kind = classify_media(path)
+        label = "表情包" if kind == "sticker" else "图片"
+        try:
+            r = self.sender.send_media(msg.chat_name, path)
+        except SendError as exc:
+            self._log(f"[表情] 发送失败：{exc}", "err")
+            return
+        except Exception as exc:
+            self._log(f"[表情] 发送异常：{exc}", "err")
+            return
+
+        if not r.ok:
+            self._log(f"[表情] 未成功：{r.detail}", "err")
+            return
+
+        self._sticker_sent.setdefault(msg.chat_id, []).append(time.time())
+        self._log(f"[表情] 已发 {label}：{name}", "out")
+        self.chat_event.emit(msg.chat_name, f"[{label}]", "out")
+        # 表情消息在库里没有文本，回环判定靠 is_self 就够；
+        # 这里不登记内容，避免把"[表情]"这种占位符当成文本去匹配。
+        try:
+            remember_sent("")
+        except Exception:
+            pass
+        # 顺手记一笔：她发过表情。以后能拿来做"表达习惯"。
+        try:
+            from bigfish import vault as _v
+
+            _v.record_sticker_sent(msg.chat_id, name)
+        except Exception:
+            pass
 
     def _judge_mood_async(self, user_text: str, reply: str, msg) -> None:
         """后台判断心情，不阻塞下一轮对话。
@@ -776,6 +889,15 @@ class EngineWorker(QThread):
                           "think")
                 return
 
+            # ⭐ 表情包：文本发完之后，问一次贴纸插件要不要跟一张。
+            #   放这里是刻意的 —— 顺序必须是「先说话，再发表情」，
+            #   反过来的话对方先看到一个没头没尾的表情。
+            sticker_path = ""
+            try:
+                sticker_path = self._pick_sticker(msg, body, reply)
+            except Exception as exc:
+                self._log(f"[表情] 挑选失败：{exc}", "err")
+
             try:
                 r = self.sender.send(msg.chat_name, send_text)
                 if r.ok:
@@ -787,6 +909,12 @@ class EngineWorker(QThread):
                     self.stats.emit(self.recv_count, self.reply_count)
                     self._log(f"[发] {reply[:60]}", "out")
                     self.chat_event.emit(msg.chat_name, reply[:60], "out")
+
+                    # ⭐ 发完文字，再发表情包。
+                    #   失败只记日志，不影响这一轮 —— 对方已经从文字里
+                    #   读到内容了，表情是附加品，丢了不算聊崩。
+                    if sticker_path:
+                        self._send_sticker(msg, sticker_path, remember_sent)
 
                     # ⭐ 把这一问一答写进记忆库。
                     #   以前完全没有这一步 —— 聊一晚上记忆里一条都没有，
@@ -2401,6 +2529,132 @@ class Backend(QObject):
                               ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    # ── 表情包 ──
+    #
+    # 这是「她手里有什么」的唯一入口。三个动作：看、调、增删。
+    # 刻意不提供「去网上抓表情」—— 表情包的版权和来源都不可控，
+    # 用户自己放什么进来，她就发什么。
+    @Slot(result=str)
+    def sticker_list(self) -> str:
+        """表情库 + 当前配置。一次拿全，界面不用点两次。"""
+        try:
+            from bigfish import vault
+
+            root = vault.resolve_data_root()
+            cfg = vault.read_sticker_config(root)
+            items = vault.list_stickers(root)
+            usage = vault.sticker_usage("")
+            return json.dumps({
+                "ok": True,
+                "config": cfg,
+                "items": items,
+                "dir": vault.sticker_dir(root),
+                "last": (usage.get("_last") if isinstance(usage, dict) else None),
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def sticker_save_config(self, patch_json: str) -> str:
+        try:
+            from bigfish import vault
+
+            patch = json.loads(patch_json or "{}")
+            ok, err = vault.write_sticker_config(
+                patch if isinstance(patch, dict) else {})
+            return json.dumps({"ok": ok, "error": err},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def sticker_import(self, start: str) -> str:
+        """选图片 → 拷进表情库。多选，一次能放一堆。"""
+        try:
+            from PySide6.QtWidgets import QFileDialog
+
+            from bigfish import vault
+
+            files, _ = QFileDialog.getOpenFileNames(
+                self.window, "选择表情（.gif 才会被微信认成原生表情）",
+                start or "",
+                "表情图片 (*.gif *.png *.jpg *.jpeg *.webp *.bmp);;"
+                "GIF 表情 (*.gif);;所有文件 (*.*)")
+            if not files:
+                return json.dumps({"ok": True, "added": []}, ensure_ascii=False)
+            added, failed = [], []
+            for f in files:
+                ok, res = vault.import_sticker(f)
+                if ok:
+                    added.append(res)
+                else:
+                    failed.append({"file": os.path.basename(f), "why": res})
+            return json.dumps({"ok": True, "added": added, "failed": failed},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, result=str)
+    def sticker_set_desc(self, name: str, desc: str) -> str:
+        try:
+            from bigfish import vault
+
+            ok, err = vault.write_sticker_desc(name, desc)
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def sticker_delete(self, name: str) -> str:
+        try:
+            from bigfish import vault
+
+            ok, err = vault.delete_sticker(name)
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def sticker_open_dir(self) -> str:
+        try:
+            from bigfish import vault
+
+            d = vault.sticker_dir()
+            os.makedirs(d, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(d)  # noqa: S606
+            return json.dumps({"ok": True, "path": d}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def sticker_test_send(self, name: str) -> str:
+        """把一张表情发到「文件传输助手」，验证通道通不通。
+
+        ⚠ 会真的写微信、真的抢焦点。这是唯一能让用户自己验证
+          「这台机器上她到底能不能发表情」的办法，所以保留。
+        """
+        try:
+            from bigfish import vault
+            from bigfish.wechat_sender import SendError, UiaSender
+
+            path = os.path.join(vault.sticker_dir(), name)
+            if not os.path.isfile(path):
+                return json.dumps({"ok": False, "error": f"找不到：{name}"},
+                                  ensure_ascii=False)
+            s = UiaSender()
+            s.wake()
+            r = s.send_media("文件传输助手", path)
+            return json.dumps({"ok": bool(r.ok),
+                               "error": "" if r.ok else r.detail},
+                              ensure_ascii=False)
+        except SendError as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     @Slot(str, result=str)
     def pick_directory(self, start: str) -> str:

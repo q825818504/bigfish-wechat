@@ -161,6 +161,27 @@ for _gone in ("scopeWorkspace", "scopeSessions", "scopeMode"):
     expect("data", f"没有 #{_gone}", f"!!document.querySelector('#{_gone}')",
            lambda v: v is False, "不该存在（越界读 DSH 会话库）")
 
+# ── 表情包 ──
+expect("stickers", "有开关", "!!document.querySelector('#stickerEnabled')",
+       lambda v: v is True, "总开关必须存在")
+expect("stickers", "默认关", "document.querySelector('#stickerEnabled').checked",
+       lambda v: v is False, "新装默认不发表情")
+expect("stickers", "有频率滑块", "!!document.querySelector('#stickerRate')",
+       lambda v: v is True, "频率可调")
+expect("stickers", "有冷却输入", "!!document.querySelector('#stickerCooldown')",
+       lambda v: v is True, "冷却可调")
+expect("stickers", "有两种挑选模式", """(() =>
+  document.querySelectorAll('#stickerMode option').length)()""",
+       lambda v: int(v) == 2, "ai / random")
+expect("stickers", "有导入按钮", "!!document.querySelector('#btnStickerImport')",
+       lambda v: v is True, "表情库要能加东西")
+expect("stickers", "有保存按钮", "!!document.querySelector('#btnStickerSave')",
+       lambda v: v is True, "配置要能落盘")
+expect("stickers", "路径已填", "document.querySelector('#stickerDirPath').textContent",
+       lambda v: v.strip() not in ("", "—"), "要显示盘上位置")
+expect("stickers", "空库有提示", "document.querySelector('#stickerList').textContent",
+       lambda v: len(v.strip()) > 0, "空的时候也要说话")
+
 # ── 设置 ──
 expect("settings", "接口地址", "document.querySelector('#cfgEndpoint').value",
        lambda v: v.strip() != "", "要回填")
@@ -248,7 +269,13 @@ def main() -> int:
             app.quit()
 
     win.view.loadFinished.connect(on_load)
-    QTimer.singleShot(60000, app.quit)
+    # ⚠ 这个超时是**兜底**，不是时间预算。
+    #   原来是 60s，而每项检查要 900ms：
+    #   59 项 = 53 秒，加 2.5s 启动等待就顶到 56 秒 —— 最后几项被
+    #   静默截断，输出停在半路，看起来像"检查项没写"。实际是超时退出。
+    #   按 len(checks) 算，留足余量，检查项增加也不会再撞线。
+    budget_ms = (len(checks) + 8) * 1200 + 10000
+    QTimer.singleShot(min(budget_ms, 300000), app.quit)
     app.exec()
     return 1 if failures else 0
 

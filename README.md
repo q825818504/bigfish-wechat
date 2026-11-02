@@ -497,7 +497,7 @@ tools\test_persona_parity.py    18 项 两侧人格逐字节一致
 tools\test_no_leak.py           30 项 越界访问（不碰 DSH 会话库）
 tools\selftest_engine_fixes.py 60 项 回环判定 / 记忆写入 / 心情写入 / 鲸落
 tools\selftest_memory.py          71 项 事实 / 纠正 / 遗忘 / 检索 / 级联 / 迁移
-tools\selftest_plugins.py         62 项 插件座位 / 开关 / 注入排序 / 配置清洗 / 接线
+tools\selftest_plugins.py         88 项 插件座位 / 开关 / 注入排序 / 配置清洗 / 预览 / 接线
 ```
 
 后面这批分层的原因是：

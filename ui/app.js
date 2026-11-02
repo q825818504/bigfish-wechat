@@ -15,7 +15,7 @@ const S = {
 
 const PAGE_TITLES = {
   overview: '概览', chats: '会话', soul: '灵魂',
-  mood: '心情', memory: '记忆', data: '数据目录',
+  mood: '心情', memory: '记忆', stickers: '表情包', data: '数据目录',
   plugins: '插件', settings: '设置', logs: '日志',
 };
 
@@ -61,6 +61,7 @@ function go(page) {
   if (page === 'soul' && !S.soul) loadSoul();
   if (page === 'mood') loadMood();
   if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); loadPersons(); }
+  if (page === 'stickers') loadStickers();
   if (page === 'data') loadDataRoot();
   if (page === 'plugins') { closePlugin(); loadPlugins(); }
 }
@@ -2106,13 +2107,6 @@ function renderPluginList() {
   const list = (PLUG.data && PLUG.data.plugins) || [];
   const on = list.filter((p) => p.enabled).length;
   setText('#plugCount', list.length ? `已启用 ${on} / ${list.length}` : '');
-
-  const path = (PLUG.data && PLUG.data.statePath) || '';
-  const hint = $('#plugStoreHint');
-  if (hint) {
-    hint.textContent = '开关存在数据目录里';
-    hint.title = path ? `跟着数据目录走：${path}` : '';
-  }
 
   if (!list.length) {
     rows.innerHTML = '<div class="empty" style="padding:28px 0"><p>还没有登记任何插件。</p></div>';

@@ -46,6 +46,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v16M4 8h16M6.5 17.5l11-11"/><circle cx="12" cy="12" r="2.4" fill="currentColor" stroke="none"/></svg>
         <span>记忆</span>
       </button>
+      <button class="nav-item" data-page="stickers">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="5"/><path d="M8.5 10h.01M15.5 10h.01" stroke-linecap="round"/><path d="M8.5 14.5c1 1.2 2.1 1.8 3.5 1.8s2.5-.6 3.5-1.8" stroke-linecap="round"/></svg>
+        <span>表情包</span>
+      </button>
       <button class="nav-item" data-page="data">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
         <span>数据目录</span>
@@ -719,6 +723,85 @@
         </div>
       </section>
 
+      <!-- ═══════ 表情包 ═══════ -->
+      <section class="page" data-page="stickers">
+        <div class="page-heading">
+          <div>
+            <h1>表情包</h1>
+            <p>她手里有什么，就能发什么。没有的，她不会凭空变出来。</p>
+          </div>
+          <div class="heading-side" id="stickerCount">—</div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>发不发</h2>
+            <span class="tag" id="stickerStateTag">—</span>
+          </div>
+          <div class="card-desc" style="margin-bottom:14px">
+            默认是关的。打开之后，她会在情绪到位的时候，说完话再跟一张。<br>
+            <b>只发 .gif</b> 才能被微信认成原生表情（对方可以长按添加、会动）；
+            其他格式会发成普通图片。
+          </div>
+          <div class="form">
+            <div class="field full">
+              <label class="switch-row">
+                <input type="checkbox" id="stickerEnabled">
+                <span>让她能发表情包</span>
+              </label>
+              <small>关着的时候，这个功能完全不参与，连日志都不会有。</small>
+            </div>
+            <div class="form-grid">
+              <div class="field">
+                <label>多频繁</label>
+                <div class="range-row">
+                  <input type="range" id="stickerRate" min="0" max="100" step="5">
+                  <span class="range-val" id="stickerRateVal">—</span>
+                </div>
+                <small>每一轮回复有多大概率考虑配一张。15% 大约十句一张。</small>
+              </div>
+              <div class="field">
+                <label>同一个会话隔多久</label>
+                <div class="input-suffix">
+                  <input type="number" id="stickerCooldown" min="0" max="3600" step="30">
+                  <span>秒</span>
+                </div>
+                <small>刚发过就不会再发。密度太高会被当成刷屏。</small>
+              </div>
+              <div class="field full">
+                <label>怎么挑</label>
+                <select id="stickerMode">
+                  <option value="ai">看这句话的意思挑（慢一点，但搭）</option>
+                  <option value="random">随便挑一张（快，常不搭）</option>
+                </select>
+                <small>「看意思」会额外调一次模型判断该不该发、发哪张。</small>
+              </div>
+            </div>
+          </div>
+          <div class="memory-toolbar" style="margin-top:14px">
+            <button class="btn btn-primary" id="btnStickerSave">保存</button>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-head">
+            <h2>她的表情库</h2>
+            <div class="card-actions">
+              <button class="btn btn-sm" id="btnStickerImport">导入…</button>
+              <button class="btn btn-sm" id="btnStickerRefresh">刷新</button>
+            </div>
+          </div>
+          <div class="card-desc" style="margin-bottom:12px">
+            放在 <code id="stickerDirPath">stickers\</code> 里。
+            每个文件可以写一句话说明 —— <b>她靠这句话判断该不该用</b>，
+            没写的话只能靠文件名猜。
+          </div>
+          <div id="stickerList" class="sticker-grid">
+            <div class="empty-hint">还没有表情。</div>
+          </div>
+        </div>
+      </section>
+
       <!-- ═══════ 数据目录 ═══════ -->
       <section class="page" data-page="data">
         <div class="page-heading">
@@ -1088,5 +1171,6 @@
 
 <script src="qwebchannel.js"></script>
 <script src="app.js"></script>
+<script src="stickers.js"></script>
 </body>
 </html>

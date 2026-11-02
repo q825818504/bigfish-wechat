@@ -93,6 +93,11 @@ SCOPES = {
     "prompt": {"label": "注入提示词", "needs_order": True},
     "gate": {"label": "判定", "needs_order": False},
     "hook": {"label": "动作", "needs_order": False},
+    # sticker 是**第四个** scope，2026-11 为表情包加的。
+    # 它不往提示词里加字，也不决定回不回，只回答一件事：
+    # 「这一轮说完话之后，要不要再跟一张表情？」
+    # 返回值是一个本地文件路径（.gif = 微信原生表情，其他 = 图片）。
+    "sticker": {"label": "表情包", "needs_order": False},
 }
 
 STATE_NAME = "plugins.json"
@@ -123,6 +128,8 @@ class Plugin:
     gate: Optional[Callable[[Dict[str, Any]], Tuple[bool, str]]] = None
     #: hook 类：ctx -> None
     tick: Optional[Callable[[Dict[str, Any]], None]] = None
+    #: sticker 类：ctx -> 本地文件路径（空串 = 这轮不发）
+    sticker: Optional[Callable[[Dict[str, Any]], str]] = None
     #: 详情页「它做什么」：为什么需要它（没有它会怎样）
     why: str = ""
     #: 详情页「会影响什么」
@@ -143,6 +150,7 @@ def register(
     render: Optional[Callable[[Dict[str, Any]], str]] = None,
     gate: Optional[Callable[[Dict[str, Any]], Tuple[bool, str]]] = None,
     tick: Optional[Callable[[Dict[str, Any]], None]] = None,
+    sticker: Optional[Callable[[Dict[str, Any]], str]] = None,
     why: str = "",
     affects: Optional[List[str]] = None,
     limits: Optional[List[str]] = None,
@@ -175,11 +183,13 @@ def register(
         raise ValueError(f"插件 {pid} 是 prompt 类，必须提供 render(ctx)")
     if scope == "gate" and gate is None:
         raise ValueError(f"插件 {pid} 是 gate 类，必须提供 gate(ctx)")
+    if scope == "sticker" and sticker is None:
+        raise ValueError(f"插件 {pid} 是表情包类，必须提供 sticker(ctx)")
 
     plugin = Plugin(
         id=pid, title=title, desc=desc, scope=scope, order=order,
         default=bool(default), config=dict(config or {}),
-        render=render, gate=gate, tick=tick,
+        render=render, gate=gate, tick=tick, sticker=sticker,
         why=str(why or ""),
         affects=[str(x) for x in (affects or [])],
         limits=[str(x) for x in (limits or [])],
@@ -427,6 +437,45 @@ def run_hooks(ctx: Dict[str, Any], root: Optional[str] = None) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 表情包：问插件「这一轮要不要跟一张」
+# ══════════════════════════════════════════════════════════════════════
+
+def collect_sticker(ctx: Dict[str, Any], root: Optional[str] = None) -> str:
+    """所有已启用的 sticker 类插件依次询问，**第一个给出路径的胜出**。
+
+    为什么是「第一个」而不是投票/随机：
+        表情包是整体行为，两张同义词的表情同时发出去就是噪音。
+        先注册的先用，用户想换顺序就关掉不要的那个。
+
+    返回本地文件路径；没有插件愿意给就返回空串。
+    任何插件抛错都不影响其他，也不影响这一轮回复。
+    """
+    state = read_state(root)
+    for pid, defn in _REGISTRY.items():
+        if defn.get("scope") != "sticker":
+            continue
+        recorded = state["enabled"].get(pid)
+        on = recorded if isinstance(recorded, bool) else bool(defn.get("default"))
+        if not on:
+            continue
+        fn = defn.get("sticker")
+        if fn is None:
+            continue
+        merged = _default_config(defn)
+        saved = state["config"].get(pid)
+        if isinstance(saved, dict):
+            merged.update(saved)
+        try:
+            got = fn({**ctx, "config": merged})
+        except Exception as exc:
+            print(f"[插件] {pid} 挑表情失败：{exc}", flush=True)
+            continue
+        if got and isinstance(got, str):
+            return got
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 预览：改了参数之后，她实际会收到什么
 # ══════════════════════════════════════════════════════════════════════
 
@@ -541,6 +590,7 @@ def _load_builtins() -> None:
     """
     from . import clock  # noqa: F401
     from . import guard  # noqa: F401
+    from . import sticker  # noqa: F401
 
 
 _LOADED = False

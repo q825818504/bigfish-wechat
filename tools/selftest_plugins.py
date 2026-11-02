@@ -322,7 +322,7 @@ def main() -> int:
         check(f"desktop.py 暴露 Slot {slot}", ok, why)
 
     # ══════════════════════════════════════════════════════════════
-    section("10. 界面接线（nav、页面、详情四块都加上了）")
+    section("10. 界面接线（nav、页面、详情四块）")
 
     html = open(os.path.join(_ROOT, "ui", "index.html"), encoding="utf-8").read()
     check("侧栏有插件入口", 'data-page="plugins"' in html)
