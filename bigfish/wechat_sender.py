@@ -1186,21 +1186,42 @@ class UiaSender:
 
         deadline = time.time() + timeout
         fname = os.path.basename(path)
+        seen = []          # 记录实际读到了什么，失败时打出来
         while time.time() < deadline:
             try:
                 rows = db.get_new_messages(chat, since_seq=before_seq, limit=8)
-            except Exception:
+            except Exception as exc:
+                UiaSender._warn(f"读新消息失败：{exc}")
                 rows = []
             for r in rows:
-                if int(r.get("sender_id") or 0) != 2:
-                    continue
                 t = str(r.get("type") or "")
+                sid = r.get("sender_id")
+                seen.append(f"type={t!r} sender_id={sid!r} "
+                            f"seq={r.get('sort_seq')}")
+                # ⚠ 不再过滤 sender_id。
+                #
+                #   原来这里有一句 `if sender_id != 2: continue`（照抄
+                #   vendor 的 _verify_attachment_sent）。实测（2026-11-03）
+                #   消息明明发出去、对方也收到了，这里却一直返回 False ——
+                #   因为这台机器上自己发的消息 sender_id 不是 2。
+                #
+                #   去掉这条过滤不会误判：调用方刚按完回车，
+                #   10 秒窗口内新增的、类型对得上的，几乎不可能是别人发的。
+                #   真撞上了也只是把一次失败记成成功，比反过来（成功记成
+                #   失败、还让用户以为没发出去）危害小。
                 if t == want:
                     return True
                 # 类型对不上但 content 里带了文件名，也算（文件/图片兜底）
                 if kind != "sticker" and fname in str(r.get("content") or ""):
                     return True
             time.sleep(0.5)
+
+        if seen:
+            UiaSender._warn(f"10 秒内读到 {len(seen)} 条新消息，但类型都不对："
+                            f"{seen[:5]}")
+        else:
+            UiaSender._warn(f"10 秒内没读到任何新消息"
+                            f"（chat={chat!r} before_seq={before_seq}）")
         return False
 
 
