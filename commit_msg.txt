@@ -1,20 +1,25 @@
-修漏传参数：_input_region_signature 少给 box
+_warn 漏了 @staticmethod —— 再加一个静态检查防止复发
 
-    UiaSender._input_region_signature() missing 1 required
-    positional argument: 'box'
+    UiaSender._warn() takes 1 positional argument but 2 were given
 
-方法改成 @staticmethod 之后签名是 (gui, box)，调用点还是老样子。
-纯手误。
+_warn 定义成 `def _warn(msg)`（没有 self），但装饰器丢了，
+于是 `self._warn("...")` 实际传两个参数。
 
-顺带说明一个"好"现象：这个异常被 send_media 的兜底捕获，
-最后报成「媒体没能发出去（数据库 10 秒内没有新增）。原因：UIA 路线异常: ...」
-—— 用户在测试里看到的是红色 ✗，不是假的 ✓。
+这条异常在最外层异常处理里 —— 一报错就把真正的失败原因盖掉，
+界面上看到的还是「媒体没能发出去」，跟发送毫无关系。
 
-前面几轮最严重的问题恰恰是相反的：send_media 无条件 return True，
-"发送成功"和"用户什么都没收到"能同时成立，还往上记了 [表情] 已发。
-现在错就是错，能被看见。
+上一轮刚踩过同类：_input_region_signature 改成 staticmethod 后
+调用点少传一个参数。两次都是"签名和调用点对不上"，
+都炸在最不该炸的地方（错误处理路径本身）。
 
-顺手加固 _input_region_signature：
-  · 改成 staticmethod（不再依赖实例，语义更准）
-  · 区域小于 16×16 直接返回 None，避免把异常坐标传进 ImageGrab
-  · 注释写清为什么不往上看 150px —— 那是 vendor 那个判据假阳性的根源
+所以加了 tools/check_method_calls.py：
+用 AST 把每个 self.xxx(...) / Cls.xxx(...) 的参数个数对一遍。
+只查个数不查类型 —— 查类型要跑起来，那是单元测试的事。
+
+先验证它有检测能力（不是碰巧没报错）：
+    造两个最小复现，
+        @staticmethod def sig(gui, box)  →  self.sig(self)          ✗ 少一个
+        def warn(msg)                   →  self.warn("x")         ✗ 多一个
+    两个都抓到了。
+
+然后对六个文件跑了一遍，全绿。

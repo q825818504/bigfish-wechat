@@ -710,11 +710,20 @@ class UiaSender:
             return False
         return bool(v and "\ufffc" in v)
 
+    @staticmethod
     def _warn(msg: str) -> None:
         """把警告同时写到 wechatauto 的日志和标准错误。
 
         两边都写是因为：调试时人在看 stderr，而程序跑起来以后
         只有 wxlog 落盘。只写一边总会有一边看不到。
+
+        ⚠ 必须是 staticmethod，而且**只能用 UiaSender._warn(msg) 或
+          self._warn(msg) 调**，不能 `_warn(self, msg)`。
+          它曾经漏了 @staticmethod 装饰器（只有一个 msg 参数），
+          于是 self._warn("...") 变成传两个参数：
+              _warn() takes 1 positional argument but 2 were given
+          而这条异常又处在最外层异常处理里 —— 一报错就把真正的
+          失败原因盖掉了。
         """
         try:
             from wechatauto.logger import wxlog
