@@ -385,17 +385,26 @@ class UiaSender:
         before_seq = self._target_seq(who)
 
         # ① 先试 UIA 控件路线（不吃前台焦点，最稳）
+        #
+        # ⚠ 这里有个必须记住的教训：早先写成
+        #       ok = self._paste_media_uia(...)
+        #       if ok: pass                      # 什么都不做
+        #       if not err or ...:               # err 还是空的 → 条件成立
+        #           gui.send_file(...)           # 又发一次
+        #   结果 UIA 成功之后又走了一遍兜底，**一次调用发了两条表情**。
+        #   真机日志里看得很清楚：发送后新增 2 条，耗时 12.6s（正常约 6s）。
+        #
+        #   所以用 uia_ok 显式记录，兜底只在它为 False 时才跑。
+        uia_ok = False
         err = ""
         try:
             edit = self._chat_input_ctrl()
             if edit is not None:
-                ok = self._paste_media_uia(edit, real_path)
-                if ok:
-                    # ⚠ 不在这里返回成功。回车是按下去了，
-                    #   发没发出去只有数据库知道。下面统一验。
-                    pass
-                else:
+                uia_ok = self._paste_media_uia(edit, real_path)
+                if not uia_ok:
                     err = "UIA 粘贴没让输入框发生变化"
+            else:
+                err = "拿不到输入框控件"
         except Exception as exc:
             err = f"UIA 路线异常: {exc}"
 
@@ -404,7 +413,9 @@ class UiaSender:
         #    guia.send_file 有自己一套判据和会话复用逻辑，比我在外面
         #    猜"谁成功了"靠谱。但它返回 True 也只代表"动作做完了"，
         #    同样不代表对方收到了 —— 所以仍然走下面统一验证。
-        if not err or err.startswith("UIA 粘贴没"):
+        #
+        #    **只有 uia_ok 为 False 才走这里**，否则会重复发送。
+        if not uia_ok:
             try:
                 gui = self._gui()
                 res = gui.send_file(real_path, who=None)
