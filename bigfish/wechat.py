@@ -44,6 +44,55 @@ class ChatMessage:
         return c
 
 
+def _classify(uid: str) -> str:
+    """给会话分类。只看 username 的格式，不查库 —— 快且稳。
+
+        @chatroom        群聊
+        gh_              公众号 / 服务号
+        @openim          企微 / 外部
+        brandsession     品牌会话
+        filehelper 等    系统
+        其余             联系人
+    """
+    u = uid or ""
+    if u.endswith("@chatroom"):
+        return "group"
+    if u.startswith("gh_"):
+        return "official"
+    if u.startswith("brandsessionholder") or u in (
+            "filehelper", "fmessage", "medianote", "newsapp",
+            "notifymessage", "qqmail", "floatbottle", "weixin"):
+        return "system"
+    if u.endswith("@openim"):
+        return "official"
+    # holder 类：微信内部的占位账号（"未知联系人(holder)"），
+    # 不是真人，混在联系人里会让人以为名单是脏的。
+    if "holder" in u:
+        return "system"
+    return "contact"
+
+
+def _clean_name(value: str) -> str:
+    """洗掉昵称里的控制字符。
+
+    微信昵称里混控制字符是常态：\\x7f 做占位、\\\\u200b 零宽空格、
+    还有一堆不可见的分隔符。不做清洗的话，界面上会出现
+    「看起来非空、实际一片空白」的名字，比空字符串更难排查。
+    """
+    if not value:
+        return ""
+    out = []
+    for ch in str(value):
+        code = ord(ch)
+        # C0/C1 控制符、DEL、零宽与格式字符、BOM 一律丢弃
+        if code < 0x20 or code == 0x7f or 0x80 <= code <= 0x9f:
+            continue
+        if code in (0x200b, 0x200c, 0x200d, 0x200e, 0x200f, 0xfeff):
+            continue
+        out.append(ch)
+    return "".join(out).strip()
+
+
 class WeChatReader:
     """微信数据库只读封装。
 
@@ -72,6 +121,31 @@ class WeChatReader:
     def ready(self) -> bool:
         return self._db is not None and bool(getattr(self._db, "_keys", None))
 
+    def close(self) -> None:
+        """释放当前数据库连接。
+
+        ⚠ 切换账号时必须先 close 再 open 新的 —— 否则旧的 WeChatDB
+          还握着上一账号的密钥与文件句柄，很可能出现
+          "明明选了 B，读出来的还是 A 的内容"。
+        """
+        db = self._db
+        self._db = None
+        if db is None:
+            return
+        # WeChatDB 没暴露公开的 close，逐项尽力释放；失败不影响重新打开
+        for attr in ("_conns", "conns", "_cache"):
+            try:
+                v = getattr(db, attr, None)
+                if isinstance(v, dict):
+                    for c in v.values():
+                        try:
+                            c.close()
+                        except Exception:
+                            pass
+                    v.clear()
+            except Exception:
+                pass
+
     @property
     def account(self) -> str:
         return self._db.account if self._db else ""
@@ -81,24 +155,58 @@ class WeChatReader:
         return self._db.wxid if self._db else ""
 
     def self_info(self) -> Dict:
+        """自己的账号信息。昵称要**兜底**，不能直接用数据库里的。
+
+        ⚠ 微信在 contact 表里对"自己"那条记录不存真名，实测值是
+          '\x7f\x7f\x7f\x7f'（四个 DEL 控制字符）。直接用它，
+          界面上就是一块空白 —— 用户不知道现在连着哪个号。
+
+        兜底顺序：
+          1. contact.nick_name（真名时可用）
+          2. contact.remark（备注名，有时比昵称更像人话）
+          3. wxid（至少能区分账号）
+        """
         self._require()
-        return self._db.get_self_info()
+        info = self._db.get_self_info() or {}
+        nick = _clean_name(info.get("nick_name") or "")
+        if not nick:
+            nick = _clean_name(info.get("remark") or "")
+        if not nick:
+            nick = info.get("username") or self.wxid or ""
+        return {**info, "nick_name": nick, "raw_nick": info.get("nick_name") or ""}
 
     # ------------------------------------------------------------------
-    def sessions(self, limit: int = 20) -> List[Dict]:
-        """会话列表，附带解析好的显示名。"""
+    def sessions(self, limit: int = 200) -> List[Dict]:
+        """会话列表，附带解析好的显示名与分类。
+
+        limit 默认从 20 提到 200：以前界面只显示最近 20 个，
+        用户会觉得"我的会话不全"。
+
+        ⚠ 但 200 条里实测公众号占 71% —— 真正的人只有 42 个。
+          所以这里**按分类分桶取**：联系人和群聊给足，公众号只留最近 20 个。
+          用户要的是"能回复的会话"，不是"完整的会话历史"。
+        """
         self._require()
+        quota = {"contact": 300, "group": 300, "official": 20, "system": 5}
+        used = {"contact": 0, "group": 0, "official": 0, "system": 0}
         out = []
-        for s in self._db.get_sessions(limit=limit):
-            uid = s["username"]
+        for s in self._db.get_sessions(limit=max(limit, 400)):
+            uid = s["username"] or ""
+            kind = _classify(uid)
+            if used[kind] >= quota[kind]:
+                continue
+            used[kind] += 1
             out.append({
                 "username": uid,
                 "name": self._display_name(uid),
                 "unread": s.get("unread", 0),
                 "summary": (s.get("summary") or "")[:40],
                 "last_time": s.get("last_time"),
-                "is_group": uid.endswith("@chatroom"),
+                "is_group": kind == "group",
+                "kind": kind,
             })
+            if len(out) >= limit:
+                break
         return out
 
     def _display_name(self, uid: str) -> str:

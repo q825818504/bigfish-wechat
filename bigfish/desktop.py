@@ -867,10 +867,136 @@ class Backend(QObject):
         self._log_sent = 0
 
     # ------------------------------------------------------------------
-    def _reader_or_open(self):
-        if self._reader is None:
+    # 账号选择
+    #
+    # ⚠ 必须让用户明确选，原因有两个，都是真实踩过的：
+    #
+    #   ① WeChatDB._pick_account() 按 **db 文件最后修改时间** 排序取第一个。
+    #      多开微信时这等于随机 —— 谁的库最近被写过就选谁。
+    #      实测这台机器上它选中的是 wxid_74pumkyi8vs422，而不是主人正在用的
+    #      wxid_51f85n6xp73o22。
+    #
+    #   ② 选错账号之后，即使把那个微信退出，**目录和文件还在磁盘上**，
+    #      下次启动照样能读到旧内容 —— 看起来像"退出了还认那个号"。
+    #
+    # 所以这里不再自动挑，只负责列出候选与按用户选择打开。
+
+    @Slot(result=str)
+    def list_accounts(self) -> str:
+        """列出本机所有微信账号（多开时会有多个）。
+
+        只在**打开数据库之前**能安全调用 —— 它只扫目录和文件名，
+        不做密钥提取，所以很快，也解不锁任何东西。
+        """
+        try:
+            import sys as _sys
+
+            from bigfish.wechat import _VENDOR
+
+            if _VENDOR not in _sys.path:
+                _sys.path.insert(0, _VENDOR)
+            from wechatauto.db import auto_detect_db_dir, list_accounts
+
+            root = auto_detect_db_dir()
+            rows = list_accounts(root) if root else []
+            cfg = load_json_config()
+            saved = str((cfg.get("auto_reply") or {}).get("account") or "")
+
+            out = []
+            for a in rows:
+                out.append({
+                    "account": a["account"],
+                    "wxid": a["wxid"],
+                    "lastActivity": ts_to_local(
+                        int((a.get("last_activity") or 0) * 1000)),
+                    "isSaved": a["account"] == saved,
+                })
+            return json.dumps({
+                "root": root or "",
+                "accounts": out,
+                "saved": saved,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"root": "", "accounts": [],
+                               "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def open_account(self, account: str) -> str:
+        """按用户选的账号打开数据库（真正解密钥在这里发生）。
+
+        传空串 = 未选择，直接报错，**不回退到"自动挑一个"** ——
+        自动挑正是问题根源。宁可让用户看见"没选账号"，也不要他
+        以为在跟自己聊天，实际是另一个号。
+        """
+        acc = (account or "").strip()
+        if not acc:
+            return json.dumps({"ok": False,
+                               "error": "没有选择微信账号"},
+                              ensure_ascii=False)
+        try:
             from bigfish.wechat import WeChatReader
-            self._reader = WeChatReader().open()
+
+            # 关掉旧的（可能连的是别的号）
+            try:
+                if self._reader is not None:
+                    self._reader.close()
+            except Exception:
+                pass
+            self._reader = None
+
+            r = WeChatReader(account=acc).open()
+            info = r.self_info()
+            self.account = info.get("nick_name") or acc
+            self._reader = r
+
+            # 记住选择（下次启动作为默认高亮项）
+            c = load_json_config()
+            ar = c.setdefault("auto_reply", {})
+            ar["account"] = acc
+            try:
+                save_json_config(c)
+            except Exception:
+                pass
+
+            return json.dumps({
+                "ok": True,
+                "account": acc,
+                "nick": self.account,
+                "wxid": getattr(r._db, "wxid", ""),
+            }, ensure_ascii=False)
+        except Exception as exc:
+            self._reader = None
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(result=str)
+    def current_account(self) -> str:
+        """现在到底连着哪个号。界面上必须一直显示它。"""
+        acc = ""
+        wxid = ""
+        nick = ""
+        try:
+            if self._reader is not None:
+                acc = getattr(self._reader._db, "account", "") or ""
+                wxid = getattr(self._reader._db, "wxid", "") or ""
+                info = self._reader.self_info()
+                nick = info.get("nick_name") or ""
+        except Exception:
+            pass
+        return json.dumps({"account": acc, "wxid": wxid, "nick": nick,
+                           "open": bool(acc)}, ensure_ascii=False)
+
+    # ------------------------------------------------------------------
+    def _reader_or_open(self):
+        """拿当前 reader。**没有已选账号就报错，不自动挑。**
+
+        旧实现是 WeChatReader().open() —— 不带 account，等于交给
+        _pick_account() 按 mtime 随机选。那正是问题 1 的根源。
+        """
+        if self._reader is None:
+            raise RuntimeError(
+                "还没有选择微信账号。请在「会话」页点「选择账号」，"
+                "先明确要用哪个微信。")
         return self._reader
 
     # ── 状态 ──

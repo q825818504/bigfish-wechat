@@ -163,7 +163,10 @@ async function refreshStatus() {
     $('#ovRecv').innerHTML = `${s.recv ?? 0}<small>条</small>`;
     $('#ovReply').innerHTML = `${s.reply ?? 0}<small>条</small>`;
     setText('#ovUptime', s.running ? (s.uptime || '0秒') : '—');
-    setText('#accountLabel', s.account || '—');
+    // 账号标签统一由 refreshAccountLabel 管：它调 current_account，
+    // 能拿到"未选择"、wxid、昵称三种状态。这里不再直接用 s.account ——
+    // 那个字段在没打开数据库时是空的，会把标签刷成「—」。
+    refreshAccountLabel();
     setText('#ovUpdated', '更新于 ' + hhmmss());
 
     if (s.diagnose) renderChecks(s.diagnose);
@@ -238,32 +241,59 @@ function renderChats() {
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
         <path d="M4 6h16v10H8l-4 4V6z"/></svg>
       <h3>还没有加载会话</h3>
-      <p>点右上角「加载会话」，从你的微信里读取列表</p></div>`;
+      <p>点右上角「刷新会话」，从你的微信里读取列表</p></div>`;
     return;
   }
 
-  box.innerHTML = '';
-  for (const c of S.chats) {
-    const on = S.watching.has(c.username);
-    const initial = (c.name || '?').trim().charAt(0).toUpperCase();
-    const row = document.createElement('div');
-    row.className = 'chat-row' + (on ? ' is-on' : '');
-    row.innerHTML =
-      `<span class="chat-avatar">${esc(initial)}</span>` +
-      `<div style="min-width:0">
-         <div class="chat-name">${esc(c.name)}</div>
-         <div class="chat-sub">${c.is_group ? '群聊' : '联系人'}${c.unread ? ' · ' + c.unread + ' 条未读' : ''}</div>
-       </div>` +
-      `<span class="tag">${c.is_group ? '群' : '人'}</span>` +
-      `<span class="chat-toggle"></span>`;
+  /* 分组。
+   *
+   * 以前只有一个平铺列表，公众号（实测 147 个）和联系人（21 个）混在一起，
+   * 想找个人得往下翻半天。现在按 kind 分四组，各自带数量。
+   */
+  const GROUPS = [
+    { key: 'contact', label: '联系人', note: '' },
+    { key: 'group', label: '群聊', note: '打开开关的群才会被回复' },
+    { key: 'official', label: '公众号', note: '不建议打开' },
+    { key: 'system', label: '系统', note: '' },
+  ];
+
+  let html = '';
+  for (const g of GROUPS) {
+    const rows = S.chats.filter((c) => (c.kind || 'contact') === g.key);
+    if (!rows.length) continue;
+    html += `<div class="chat-group">
+      <div class="chat-group-head">
+        <span>${esc(g.label)}</span>
+        <span class="tag">${rows.length}</span>
+        ${g.note ? `<span class="chat-group-note">${esc(g.note)}</span>` : ''}
+      </div>`;
+    html += rows.map((c) => {
+      const on = S.watching.has(c.username);
+      const initial = (c.name || '?').trim().charAt(0).toUpperCase();
+      const unread = c.unread ? ` · ${c.unread > 99 ? '99+' : c.unread} 条未读` : '';
+      return `<div class="chat-row${on ? ' is-on' : ''}" data-chat="${esc(c.username)}">
+        <span class="chat-avatar">${esc(initial)}</span>
+        <div style="min-width:0">
+          <div class="chat-name">${esc(c.name)}</div>
+          <div class="chat-sub">${unread || '—'}</div>
+        </div>
+        <span class="chat-toggle"></span>
+      </div>`;
+    }).join('');
+    html += '</div>';
+  }
+  box.innerHTML = html;
+
+  $$('#chatList [data-chat]').forEach((row) => {
     row.addEventListener('click', () => {
-      if (S.watching.has(c.username)) S.watching.delete(c.username);
-      else S.watching.add(c.username);
+      const uid = row.dataset.chat;
+      if (S.watching.has(uid)) S.watching.delete(uid);
+      else S.watching.add(uid);
       renderChats();
       syncWatching();
     });
-    box.appendChild(row);
-  }
+  });
+  setText('#watchCount', S.watching.size + ' 个会话');
 }
 
 async function syncWatching() {
@@ -273,12 +303,81 @@ async function syncWatching() {
   } catch (e) { toast('同步失败'); }
 }
 
-$('#btnLoadChats').addEventListener('click', async () => {
+/* 当前账号：左下角必须一直显示"我是谁"。
+ *
+ * 修复前那里读的是 contact 表里自己的 nick_name，实际值是
+ * '\x7f\x7f\x7f\x7f'（四个 DEL 控制字符）—— 界面上就是一块空白，
+ * 用户根本不知道现在连着哪个微信。
+ */
+async function refreshAccountLabel() {
+  if (!S.bridge || !S.bridge.current_account) return;
+  try {
+    const d = JSON.parse(await S.bridge.current_account());
+    const el = $('#accountLabel');
+    if (!el) return;
+    if (d.open) {
+      const show = d.nick || d.wxid || d.account;
+      el.textContent = show + (d.nick && d.nick !== d.wxid ? '' : '');
+      el.title = 'wxid: ' + (d.wxid || d.account);
+    } else {
+      el.textContent = '未选择账号';
+      el.title = '点「选择账号」挑一个微信';
+    }
+  } catch (e) { /* 静默 */ }
+}
+
+/* 账号选择弹窗 —— 多开微信时不让系统替你选 */
+async function pickAccount() {
+  if (!S.bridge) return toast('后端未就绪');
+  let d;
+  try {
+    d = JSON.parse(await S.bridge.list_accounts());
+  } catch (e) { return toast('读取账号失败'); }
+  if (d.error) return toast(d.error);
+  const list = d.accounts || [];
+  const modal = $('#accountModal');
+  const box = $('#accountList');
+  if (!modal || !box) return toast('界面缺少账号弹窗');
+  if (!list.length) {
+    box.innerHTML = '<div class="empty"><p>本机没有找到已登录的微信</p></div>';
+  } else {
+    box.innerHTML = list.map((a) => `
+      <div class="session-item" data-acc="${esc(a.account)}" style="cursor:pointer">
+        <span class="chat-avatar">${esc((a.wxid || '?').slice(-2))}</span>
+        <div class="session-main">
+          <div class="session-name">${esc(a.wxid)}
+            ${a.isSaved ? '<span class="tag" style="margin-left:8px">上次用的</span>' : ''}
+          </div>
+          <div class="session-sub">最后活跃 ${esc(a.lastActivity)}</div>
+        </div>
+      </div>`).join('');
+  }
+  modal.classList.add('is-open');
+}
+
+async function chooseAccount(acc) {
+  const modal = $('#accountModal');
+  if (modal) modal.classList.remove('is-open');
+  try {
+    const r = JSON.parse(await S.bridge.open_account(acc));
+    if (!r.ok) return toast(r.error || '打开失败');
+    toast('已连接：' + (r.nick || r.wxid || acc));
+    await refreshAccountLabel();
+    await doLoadChats();
+  } catch (e) { toast('打开失败'); }
+}
+
+async function doLoadChats() {
   if (!S.bridge) return toast('后端未就绪');
   const btn = $('#btnLoadChats');
-  btn.textContent = '加载中…';
+  if (btn) { btn.disabled = true; btn.textContent = '读取中…'; }
   try {
-    const d = JSON.parse(await S.bridge.list_chats(40));
+    const cur = JSON.parse(await S.bridge.current_account());
+    if (!cur.open) {
+      toast('先选一个微信账号');
+      return pickAccount();
+    }
+    const d = JSON.parse(await S.bridge.list_chats(300));
     if (d.error) return toast(d.error);
     S.chats = d.chats || [];
     for (const c of S.chats) if (c.watching) S.watching.add(c.username);
@@ -287,7 +386,18 @@ $('#btnLoadChats').addEventListener('click', async () => {
   } catch (e) {
     toast('加载失败');
   } finally {
-    btn.textContent = '加载会话';
+    if (btn) { btn.disabled = false; btn.textContent = '刷新会话'; }
+  }
+}
+
+$('#btnPickAccount').addEventListener('click', pickAccount);
+$('#btnLoadChats').addEventListener('click', doLoadChats);
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('[data-acc]');
+  if (a) { chooseAccount(a.dataset.acc); return; }
+  if (e.target.closest('#accountModalClose') || e.target.id === 'accountModal') {
+    const m = $('#accountModal');
+    if (m) m.classList.remove('is-open');
   }
 });
 
@@ -2288,6 +2398,7 @@ async function onBridgeReady(b) {
   }
 
   await loadSettings();
+  await refreshAccountLabel();
   await refreshStatus();
   setInterval(refreshStatus, 2000);
 

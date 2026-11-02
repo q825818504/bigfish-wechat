@@ -774,6 +774,65 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   overflow-wrap: anywhere;
 }
 
+/* ══ 会话分组 ══
+   公众号（实测 147 个）跟联系人（21 个）混在一起时，
+   想找个人要翻半天。分组标题用弱化色，不抢会话本身。 */
+.chat-group { margin-bottom: 18px; }
+.chat-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 4px 2px 8px;
+  border-bottom: 1px solid var(--border-soft);
+  margin-bottom: 6px;
+}
+.chat-group-note {
+  font-weight: 400;
+  font-size: 11px;
+  opacity: .7;
+}
+
+/* ══ 账号选择弹窗 ══ */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 20, 22, .38);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+}
+.modal.is-open { display: flex; }
+.modal-box {
+  width: min(520px, 92vw);
+  max-height: 80vh;
+  overflow: auto;
+  background: var(--surface);
+  border-radius: 14px;
+  border: 1px solid var(--border-soft);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .18);
+  padding: 20px;
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.modal-head h2 { margin: 0; font-size: 15px; }
+.modal-desc {
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--muted);
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  background: var(--surface-3);
+  border-radius: 8px;
+}
+
 /* ══ 事实层（她认定的事） ══
    和原文列表刻意长得不一样：原文是"事件"，认识是"结论"。
    被取代/已忘掉的条目压暗但保留 —— 她能改主意，旧的那条不该消失。 */

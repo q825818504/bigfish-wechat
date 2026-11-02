@@ -210,7 +210,8 @@
             <p>打开右侧开关，只有打开的会话才会自动回复。</p>
           </div>
           <div class="heading-side">
-            <button class="btn btn-sm" id="btnLoadChats">加载会话</button>
+            <button class="btn btn-sm" id="btnPickAccount">选择账号</button>
+            <button class="btn btn-sm" id="btnLoadChats">刷新会话</button>
           </div>
         </div>
 
@@ -1050,6 +1051,23 @@
           <div class="log-view" id="logView"></div>
         </div>
       </section>
+
+
+    <!-- 账号选择弹窗：多开微信时不让系统替你选 -->
+    <div class="modal" id="accountModal">
+      <div class="modal-box">
+        <div class="modal-head">
+          <h2>选择要连接的微信</h2>
+          <button class="btn btn-sm" id="accountModalClose">关闭</button>
+        </div>
+        <div class="modal-desc">
+          你电脑上登录了多个微信。大肥鱼<b>不会替你挑</b> ——
+          以前它按「数据库最后修改时间」选，等于随机，
+          而且选错之后即使那个微信退出，磁盘上的旧数据照样会被读到。
+        </div>
+        <div id="accountList"></div>
+      </div>
+    </div>
 
     </main>
   </div>
