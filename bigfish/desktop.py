@@ -902,14 +902,21 @@ class Backend(QObject):
             cfg = load_json_config()
             saved = str((cfg.get("auto_reply") or {}).get("account") or "")
 
+            # 昵称缓存：accounts 段里按 account 存 "显示名"。
+            # 只有在真正打开过某个账号之后才知道它叫什么（要解密 contact.db），
+            # 所以这里只能读缓存；没打开过的显示 wxid。
+            names = dict((cfg.get("accounts") or {}))
             out = []
             for a in rows:
                 out.append({
                     "account": a["account"],
                     "wxid": a["wxid"],
+                    "nick": names.get(a["account"], ""),
                     "lastActivity": ts_to_local(
                         int((a.get("last_activity") or 0) * 1000)),
                     "isSaved": a["account"] == saved,
+                    "chats": len(((cfg.get("per_account") or {})
+                                  .get(a["account"], {}) or {}).get("chats") or []),
                 })
             return json.dumps({
                 "root": root or "",
@@ -949,10 +956,20 @@ class Backend(QObject):
             self.account = info.get("nick_name") or acc
             self._reader = r
 
-            # 记住选择（下次启动作为默认高亮项）
+            # 记住选择 + 缓存昵称 + **恢复这个号上次的监听配置**
             c = load_json_config()
             ar = c.setdefault("auto_reply", {})
             ar["account"] = acc
+            c.setdefault("accounts", {})[acc] = self.account
+
+            # 每个微信号各存一份监听列表。
+            # 理由：不同号关注的会话完全不同（工作号 vs 私人号），
+            # 共用一份等于每次切换都要重勾一遍。
+            per = c.setdefault("per_account", {})
+            saved = per.get(acc) or {}
+            restored = [str(x) for x in (saved.get("chats") or [])]
+            if restored:
+                ar["chats"] = restored
             try:
                 save_json_config(c)
             except Exception:
@@ -963,6 +980,8 @@ class Backend(QObject):
                 "account": acc,
                 "nick": self.account,
                 "wxid": getattr(r._db, "wxid", ""),
+                "chats": restored,
+                "restored": bool(restored),
             }, ensure_ascii=False)
         except Exception as exc:
             self._reader = None
@@ -1161,6 +1180,10 @@ class Backend(QObject):
                     "username": s["username"],
                     "name": s["name"],
                     "is_group": s["is_group"],
+                    # ⚠ kind 必须带上。前端就是靠它分组的 ——
+                    #   漏了这一个字段，所有会话都会落到"联系人"组里，
+                    #   看起来像"分组功能没做"。实测踩过。
+                    "kind": s.get("kind") or ("group" if s["is_group"] else "contact"),
                     "unread": s["unread"],
                     "watching": s["username"] in self.watching,
                 })
@@ -1170,12 +1193,46 @@ class Backend(QObject):
 
     @Slot(str, result=str)
     def set_watching(self, usernames_json: str) -> str:
+        """保存监听列表。**按当前账号分开存**。
+
+        存两份：
+          · auto_reply.chats       当前生效的（启动逻辑读它）
+          · per_account[账号].chats 这个号专属的（下次选它时自动恢复）
+        """
         try:
-            lst = json.loads(usernames_json)
-            self.watching = [str(x) for x in lst]
-            return json.dumps({"ok": True, "count": len(self.watching)})
+            lst = [str(x) for x in json.loads(usernames_json)]
+            self.watching = lst
+            c = load_json_config()
+            ar = c.setdefault("auto_reply", {})
+            ar["chats"] = lst
+            acc = str(ar.get("account") or "")
+            if acc:
+                c.setdefault("per_account", {}).setdefault(acc, {})["chats"] = lst
+            save_json_config(c)
+            return json.dumps({"ok": True, "count": len(self.watching),
+                               "account": acc}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, str, result=str)
+    def rename_account(self, account: str, display: str) -> str:
+        """给某个微信号起个显示名。
+
+        数据库里"自己"那条记录不存真名（实测是 \x7f\x7f\x7f\x7f），
+        alias 有时也叫人看不懂，所以允许手动覆盖。只影响界面显示。
+        """
+        acc = (account or "").strip()
+        name = (display or "").strip()[:40]
+        if not acc:
+            return json.dumps({"ok": False, "error": "缺少账号"}, ensure_ascii=False)
+        try:
+            c = load_json_config()
+            c.setdefault("accounts", {})[acc] = name
+            save_json_config(c)
+            return json.dumps({"ok": True, "account": acc, "nick": name},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
     # ── 灵魂（可读写） ──
     @Slot(result=str)

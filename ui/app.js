@@ -34,7 +34,20 @@ function toast(text) {
   const el = document.createElement('div');
   el.className = 'toast';
   el.textContent = text;
-  $('#toastWrap').appendChild(el);
+  async function renameAccount(acc) {
+  const cur = ((S.accountList || []).find((a) => a.account === acc) || {});
+  const name = prompt('给这个微信号起个名字（只影响界面显示）：',
+    cur.nick || '');
+  if (name === null) return;
+  try {
+    const r = JSON.parse(await S.bridge.rename_account(acc, name));
+    if (!r.ok) return toast(r.error || '改名失败');
+    toast('已改名');
+    await pickAccount();   // 重画弹窗（会重新拉列表）
+  } catch (e) { toast('改名失败'); }
+}
+
+$('#toastWrap').appendChild(el);
   setTimeout(() => {
     el.classList.add('out');
     setTimeout(() => el.remove(), 240);
@@ -335,22 +348,30 @@ async function pickAccount() {
   } catch (e) { return toast('读取账号失败'); }
   if (d.error) return toast(d.error);
   const list = d.accounts || [];
+  S.accountList = list;
   const modal = $('#accountModal');
   const box = $('#accountList');
   if (!modal || !box) return toast('界面缺少账号弹窗');
   if (!list.length) {
     box.innerHTML = '<div class="empty"><p>本机没有找到已登录的微信</p></div>';
   } else {
-    box.innerHTML = list.map((a) => `
-      <div class="session-item" data-acc="${esc(a.account)}" style="cursor:pointer">
-        <span class="chat-avatar">${esc((a.wxid || '?').slice(-2))}</span>
-        <div class="session-main">
-          <div class="session-name">${esc(a.wxid)}
+    box.innerHTML = list.map((a) => {
+      // 显示名优先：手填的备注 > 已知昵称/alias > wxid
+      const title = a.nick || a.wxid;
+      const sub = a.nick ? a.wxid + ' · ' : '';
+      return `<div class="session-item">
+        <span class="chat-avatar">${esc((title || '?').slice(0, 2))}</span>
+        <div class="session-main" data-acc="${esc(a.account)}" style="cursor:pointer">
+          <div class="session-name">${esc(title)}
             ${a.isSaved ? '<span class="tag" style="margin-left:8px">上次用的</span>' : ''}
+            ${a.chats ? `<span class="tag" style="margin-left:6px">${a.chats} 个会话</span>` : ''}
           </div>
-          <div class="session-sub">最后活跃 ${esc(a.lastActivity)}</div>
+          <div class="session-sub">${esc(sub)}最后活跃 ${esc(a.lastActivity)}</div>
         </div>
-      </div>`).join('');
+        <button class="btn btn-sm" data-rename="${esc(a.account)}"
+                title="给这个号起个好认的名字">改名</button>
+      </div>`;
+    }).join('');
   }
   modal.classList.add('is-open');
 }
@@ -362,6 +383,13 @@ async function chooseAccount(acc) {
     const r = JSON.parse(await S.bridge.open_account(acc));
     if (!r.ok) return toast(r.error || '打开失败');
     toast('已连接：' + (r.nick || r.wxid || acc));
+    if (r.restored) {
+      // 这个号上次勾过会话 —— 自动恢复，不用重勾
+      S.watching = new Set(r.chats || []);
+      toast('已恢复上次的 ' + S.watching.size + ' 个会话');
+    } else {
+      S.watching = new Set();
+    }
     await refreshAccountLabel();
     await doLoadChats();
   } catch (e) { toast('打开失败'); }
@@ -393,6 +421,8 @@ async function doLoadChats() {
 $('#btnPickAccount').addEventListener('click', pickAccount);
 $('#btnLoadChats').addEventListener('click', doLoadChats);
 document.addEventListener('click', (e) => {
+  const rn = e.target.closest('[data-rename]');
+  if (rn) { renameAccount(rn.dataset.rename); return; }
   const a = e.target.closest('[data-acc]');
   if (a) { chooseAccount(a.dataset.acc); return; }
   if (e.target.closest('#accountModalClose') || e.target.id === 'accountModal') {

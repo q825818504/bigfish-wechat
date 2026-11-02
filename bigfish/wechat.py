@@ -161,19 +161,50 @@ class WeChatReader:
           '\x7f\x7f\x7f\x7f'（四个 DEL 控制字符）。直接用它，
           界面上就是一块空白 —— 用户不知道现在连着哪个号。
 
-        兜底顺序：
-          1. contact.nick_name（真名时可用）
-          2. contact.remark（备注名，有时比昵称更像人话）
-          3. wxid（至少能区分账号）
+        兜底顺序（按"像人话"的程度递减）：
+          1. contact.nick_name     真名（大多数人的自己记录是空的）
+          2. contact.remark        备注名
+          3. contact.alias         **微信号**（如 daimeng2001，可读性最好）
+          4. wxid                  最后手段，至少能区分账号
+
+        实测：自己那条 nick_name='\x7f\x7f\x7f\x7f'、remark=''、alias='daimeng2001'。
+        所以 alias 这一级**必须有** —— 没有它，界面上只能显示 wxid。
         """
         self._require()
         info = self._db.get_self_info() or {}
         nick = _clean_name(info.get("nick_name") or "")
+        source = "nick" if nick else ""
         if not nick:
             nick = _clean_name(info.get("remark") or "")
+            source = "remark" if nick else ""
+        if not nick:
+            nick = _clean_name(self._self_alias())
+            source = "alias" if nick else ""
         if not nick:
             nick = info.get("username") or self.wxid or ""
-        return {**info, "nick_name": nick, "raw_nick": info.get("nick_name") or ""}
+            source = "wxid"
+        return {**info, "nick_name": nick, "nick_source": source,
+                "raw_nick": info.get("nick_name") or "",
+                "alias": self._self_alias()}
+
+    def _self_alias(self) -> str:
+        """自己那条 contact 记录的 alias（微信号）。取不到返回空串。"""
+        try:
+            wxid = self.wxid
+            for rel, path, _ in self._db._db_files:
+                if not path.endswith("contact.db"):
+                    continue
+                conn = self._db._open(rel)
+                try:
+                    row = conn.execute(
+                        "SELECT alias FROM contact WHERE username=? LIMIT 1",
+                        (wxid,)).fetchone()
+                    return (row[0] if row else "") or ""
+                finally:
+                    conn.close()
+        except Exception:
+            return ""
+        return ""
 
     # ------------------------------------------------------------------
     def sessions(self, limit: int = 200) -> List[Dict]:
