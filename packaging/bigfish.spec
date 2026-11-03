@@ -64,6 +64,7 @@ hiddenimports = [
     "bigfish.soul",
     "bigfish.vault",
     "bigfish.mood_judge",
+    "bigfish.paths",
     "bigfish.stickers",
     "bigfish.sticker_desc",
     "bigfish.plugins.sticker",

@@ -39,9 +39,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-_VENDOR = os.path.join(_ROOT, "vendor", "wechatauto-replica")
+from bigfish.paths import res_root  # noqa: E402
+
+_HERE = os.path.join(res_root(), "bigfish")
+_ROOT = res_root()
+_VENDOR = os.path.join(res_root(), "vendor", "wechatauto-replica")
 if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 

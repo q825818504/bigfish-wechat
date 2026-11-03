@@ -1,81 +1,44 @@
-表情包：从「能发」变成一套完整的库
+修打包后找不到界面：__file__ 是相对路径
 
-用户提的完整需求：
-  1. 侧边表情包 = 纯库
-  2. 添加表情：弹框、拖拽、单个/批量、任意格式自动转 GIF
-  3. 每张一个唯一代码 + 两级备注（双击才看详情）
-  4. 导入时让大肥鱼自动写备注
-  5. 勾选启用插件后，侧边栏才出现这一项
+用户打开新 exe 报：
+    无法访问您的文件
+    ERR_FILE_NOT_FOUND
 
-── 架构：表情包是插件，不是内建页面 ──
+根因不是文件丢了，是路径算错了。
 
-侧边栏那一项跟着插件开关走。关掉插件入口就消失 ——
-否则用户点进去只会看到"请先启用插件"，那是设计上的自相矛盾。
+PyInstaller 打进去的模块，__file__ 可能是**相对路径**
+（形如 "bigfish/desktop.py"）。于是
 
-页面职责也分开了：
-    表情包页 → 她手里有什么（浏览、添加、改备注、删除）
-    插件页   → 她要不要发、多久发一次、怎么挑
-开关和频率搬进插件配置。两个开关控制同一件事迟早互相打脸。
+    os.path.dirname(os.path.abspath(__file__))
 
-── 新模块 ──
+会按**当前工作目录**解析 —— 算出来的位置取决于用户从哪儿启动 exe，
+和 exe 在哪儿没关系。
 
-bigfish/stickers.py     表情库本体
-bigfish/sticker_desc.py 视觉备注
+实测：从 dist/BigFish 启动时恰好算对（所以之前的打包版能用），
+换个目录启动就指向 <安装目录>/ui，而界面在 <安装目录>/_internal/ui。
 
-schema v2：
-    {version, seq, items: {stk_0007: {code, file, brief, detail,
-                                      tags, source, auto, frames, w, h}}}
-旧格式 {文件名: {desc}} 第一次读时自动迁移，desc 进 brief。
+同一个隐患还藏在五个地方，其中两个更严重：
+    vault.install_root()   数据目录会跟着启动位置跑
+    watcher.WATERMARK_FILE 水位文件同理
+    wechat_sender/wechat/bridge_client  的 vendor 路径
+    replier 的 config.json 路径
 
-代码用 stk_NNNN 递增，不用语义前缀 —— 语义靠 brief 表达，
-而 brief 随时能改；代码要一辈子不变。
+新建 bigfish/paths.py 统一算：
+    app_root()  程序所在目录（data/、config.json 这些用户可见的）
+    res_root()  资源根（ui/、bridge/、vendor/，打包后是 sys._MEIPASS）
+它不 import 任何 bigfish 子模块，不会被循环拖累。
 
-── 格式统一转 GIF ──
+六个文件全部改用 paths，不再自己拼 __file__。
 
-微信只把 .gif 认成原生表情，所以导入时一律转。
-有损，但做了三件事缓解：
-  ① >1024 等比缩小（微信上限，超过当文件发）
-  ② 调色板 ADAPTIVE（按实际颜色分布，不是固定 216 色）
-  ③ 多帧保留（GIF / 动 WebP 逐帧转，动图不会变静图）
-透明只能二值化 —— GIF 1 位透明的格式限制，不是实现问题。
+另外给 --selftest 加了「界面资源」一项：
+检查 index.html 真的在 UI_DIR 里、大小正常、bridge.mjs 在。
+这项错了以前只表现成 Chromium 的 ERR_FILE_NOT_FOUND，
+一个字都不提路径 —— 加进自检就不用再靠猜。
 
-── 自动备注 ──
+验证（从 D:\大脑\_launchtest 启动，故意换个工作目录）：
+    [OK] 界面资源
+         UI_DIR=...\dist\BigFish\_internal\ui（59518 字节）
+    [OK] 数据根
+    通过 14 / 失败 1（UIA 需要管理员，正常）
 
-本地网关支持视觉（实测：发红色圆形返回"红色圆形"）。
-图缩到 512 再 base64（base64 会让请求体涨 33%）。
-任何失败都不拒绝导入，退化成空备注 —— 没备注的表情仍然能发。
-
-── 学习 ──
-
-主人纠正时改那张表情的备注。两道门：关键词粗筛（省 99% 调用）
-+ 模型判断（挡住"这个表情真好看"这类误伤）。
-
-同步做不放后台：放后台她这一轮已经用旧理解回复了，下一轮才改，
-用户会觉得"我说了你怎么还不改"。而粗筛之后绝大多数消息走不到这里。
-
-只改最近那张（5 分钟内）。翻旧账不处理 —— 分不清指的是哪张。
-
-── 删除的墓碑 ──
-
-Windows 上文件被占用删不掉（QtWebEngine 预览持句柄）。
-整个删除失败会让用户以为程序坏了。改成标记 deleted：
-列表跳过、发送读不到，条目留着，下次 list 再试真删。
-
-── 踩到的坑 ──
-
-· sticker_dir() 无条件 makedirs，把鲸落删掉的目录又建回来了 ——
-  "鲸落之后她不存在"就不成立了。改成纯返回路径。
-· 循环 import：stickers→vault（要 resolve_data_root），
-  vault→stickers（转发层）。只能一个方向在模块级写，vault 改延迟 import。
-
-── 测试 ──
-  selftest_sticker       40/40（重写）
-  selftest_ui            全通过（新增导航跟随、弹窗、双击详情）
-  selftest_vault         148/148
-  selftest_plugins       89/89
-  selftest_engine_fixes  60/60
-  test_no_leak           30/30
-  test_persona_parity    18/18
-  check_method_calls     无问题
-
-未验：真机导入+发送（库是空的）、拖拽能否拿到 file.path、学习功能。
+数据目录也确认建在 dist/BigFish/data，没跑到启动目录旁边。

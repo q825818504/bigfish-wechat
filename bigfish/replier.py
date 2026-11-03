@@ -59,7 +59,7 @@ class ModelConfig:
 
         # 1) config.json
         p = path or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            __import__("bigfish.paths", fromlist=["app_root"]).app_root(),
             "config.json")
         if os.path.isfile(p):
             try:

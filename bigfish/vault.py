@@ -76,11 +76,12 @@ def app_dir() -> str:
     ⚠ 必须是**exe 所在目录**而不是 _MEIPASS —— onedir 模式下后者是 _internal/，
       用户升级时可能被整个替换掉，配置放那里等于每次升级丢失。
     """
-    import sys
+    # 走 paths.app_root()，不要自己拼 __file__ ——
+    # 打包后 __file__ 可能是相对路径，abspath 会按**当前工作目录**
+    # 解析，于是数据目录跟着"从哪儿启动"跑，而不是跟着安装位置。
+    from bigfish.paths import app_root
 
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(os.path.abspath(sys.executable))
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return app_root()
 
 
 def default_data_root() -> str:

@@ -18,8 +18,10 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
+from bigfish.paths import app_root, res_root  # noqa: E402
+
+_HERE = os.path.join(res_root(), "bigfish")
+_ROOT = res_root()
 
 # 打包后 bridge/ 在 exe 同级目录，不在包内。
 # 依次尝试：安装目录 / 仓库根 / 包目录。

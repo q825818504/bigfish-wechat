@@ -41,20 +41,35 @@ def _safe_reconfigure_stdout() -> None:
 
 _safe_reconfigure_stdout()
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-
 # 打包后（PyInstaller onedir）：
-#   <安装目录>/大肥鱼.exe
-#   <安装目录>/_internal/...        ← 依赖
-#   <安装目录>/ui/                  ← 界面（外部，可改）
-#   <安装目录>/bridge/              ← Node 桥接（外部）
+#   <安装目录>/BigFish.exe
+#   <安装目录>/_internal/...        ← 依赖 + ui/ + bridge/
+#   <安装目录>/data/                ← 数据
 # 开发态时 _ROOT 就是仓库根，结构一致。
 FROZEN = getattr(sys, "frozen", False)
+
 if FROZEN:
     _APP_DIR = os.path.dirname(sys.executable)
-    _RES_DIR = os.path.dirname(_HERE)   # _internal 的上一级也可能有 ui/
+    # ⚠ 不能用 __file__ 反推资源目录。
+    #
+    #   PyInstaller 打进去的模块，__file__ 可能是**相对路径**
+    #   （形如 "bigfish/desktop.py"），于是 os.path.abspath 会按
+    #   当前工作目录去解析 —— 解析出来的目录取决于用户从哪儿启动 exe，
+    #   和 exe 在哪儿没关系。
+    #
+    #   实测（2026-11-03）：这样算出来的 UI_DIR 是 <安装目录>/ui，
+    #   而界面实际在 <安装目录>/_internal/ui，于是界面加载失败，
+    #   用户看到的是 Chromium 的「无法访问您的文件 / ERR_FILE_NOT_FOUND」。
+    #   那个错误页一个字都没提路径，看起来像文件丢了。
+    #
+    #   sys._MEIPASS 是 PyInstaller 提供的**绝对路径**，onedir 模式下
+    #   就是 _internal 目录。这才是唯一可靠的锚点。
+    _RES_DIR = getattr(sys, "_MEIPASS", "") or os.path.join(_APP_DIR, "_internal")
+    _HERE = os.path.join(_RES_DIR, "bigfish")
+    _ROOT = _RES_DIR
 else:
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    _ROOT = os.path.dirname(_HERE)
     _APP_DIR = _ROOT
     _RES_DIR = _ROOT
 
@@ -3837,6 +3852,22 @@ def _run_selftest_inner() -> int:
         finally:
             _sh.rmtree(tmpd, ignore_errors=True)
     item("可写层", t_vault)
+
+    # 界面资源路径 —— 打包后最容易错的一项，而且错了只表现成
+    # 「无法访问您的文件 / ERR_FILE_NOT_FOUND」，看不出是路径问题。
+    def t_ui():
+        idx = os.path.join(UI_DIR, "index.html")
+        if not os.path.isfile(idx):
+            raise FileNotFoundError(f"index.html 不在 UI_DIR 里：{idx}")
+        size = os.path.getsize(idx)
+        if size < 1000:
+            raise ValueError(f"index.html 只有 {size} 字节，八成是空文件")
+        parts = [f"UI_DIR={UI_DIR}（{size} 字节）"]
+        if not os.path.isfile(os.path.join(BRIDGE_DIR, "bridge.mjs")):
+            parts.append(f"⚠ bridge.mjs 不在 {BRIDGE_DIR}")
+        return "；".join(parts)
+
+    item("界面资源", t_ui)
 
     # 10. 记忆写入链路 —— 打包后这条最容易"缺一块"
     #     读路径一直在，写路径是后补的；exe 里漏了 import 就会静默不写。

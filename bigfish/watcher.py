@@ -22,15 +22,18 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
-_VENDOR = os.path.join(_ROOT, "vendor", "wechatauto-replica")
+# 走 paths，不自己拼 __file__ —— 打包后 __file__ 可能是相对路径，
+# abspath 会按当前工作目录解析，水位文件就会写到"启动目录"旁边去。
+from bigfish.paths import app_root, res_root  # noqa: E402
+
+_ROOT = res_root()
+_VENDOR = os.path.join(res_root(), "vendor", "wechatauto-replica")
 if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 
 from bigfish.render import render as render_message  # noqa: E402
 
-WATERMARK_FILE = os.path.join(_ROOT, "state", "watermark.json")
+WATERMARK_FILE = os.path.join(app_root(), "state", "watermark.json")
 
 
 @dataclass
