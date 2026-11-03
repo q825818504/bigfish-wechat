@@ -18,8 +18,50 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST = os.path.join(ROOT, "dist")
 TOKEN_FILE = os.path.join(ROOT, ".secrets", "github_token.txt")
 REPO = "q825818504/bigfish-wechat"
-TAG = "v0.1.0"
-VERSION = "0.1.0"
+
+
+def _read_version() -> str:
+    """版本号从 bigfish/__init__.py 读，不在这里硬编码。
+
+    ⚠ 以前这文件里写死 TAG = "v0.1.0"，发 0.2/0.3 时忘了改，
+      跑一次就把附件传到 0.1.0 那条 Release 上，而且看起来"成功了"。
+    """
+    path = os.path.join(ROOT, "bigfish", "__init__.py")
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("__version__"):
+                return line.split("=")[1].strip().strip('"').strip("'")
+    raise RuntimeError(f"没能从 {path} 读到 __version__")
+
+
+def _changelog_body(version: str) -> str:
+    """从 CHANGELOG.md 里截出这个版本的正文，用作 Release 说明。
+
+    截法是：找到 `## <version>` 那一行，取到下一个 `## ` 之前。
+    截不到就退回一句最简说明 —— 宁可说明短，也不要发一条空 Release。
+    """
+    path = os.path.join(ROOT, "CHANGELOG.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return f"## 大肥鱼 × 微信 v{version}"
+    marker = f"## {version}"
+    i = text.find(marker)
+    if i < 0:
+        return f"## 大肥鱼 × 微信 v{version}"
+    j = text.find("\n## ", i + len(marker))
+    body = text[i:j] if j > 0 else text[i:]
+    # 去掉自己的 `## x.y.z` 标题行，Release 标题已经显示版本了
+    lines = body.splitlines()
+    if lines and lines[0].startswith("## "):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
+VERSION = _read_version()
+TAG = "v" + VERSION
+BODY = _changelog_body(VERSION)
 
 # 不走系统代理（本机代理未启动）
 for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
@@ -49,60 +91,16 @@ def api(path: str, method: str = "GET", data=None, raw=False):
         raise RuntimeError(f"HTTP {exc.code} on {path}\n{detail}") from exc
 
 
-BODY = """## 大肥鱼 × 微信 v0.1.0
 
-把 DSH 的大肥鱼灵魂接进微信。**用你自己的微信号，不是 Bot。**
-
-### 这一版能做什么
-
-| 环节 | 实现 |
-|---|---|
-| 读 | SQLCipher 数据库解密，20/20 密钥 |
-| 听 | 轮询监听，1.2 秒间隔 |
-| 想 | 人格 + 情绪 + 记忆（调 dsh-bigfish 原版模块）+ 模型 |
-| 发 | UIA 控件树驱动，数据库回读确认 |
-
-### 实测记录
-
-真实双号对话验证：手机大号发消息 → 电脑小号回复 → 回一句就停。
-
-```
-BigFish.exe --selftest     7/7 通过
-BigFish.exe --live-send    发送 + 落库确认
-```
-
-### 前置条件
-
-- 微信 **4.1.15.53**（4.1.10.27 的 UIA 无法热激活）
-- **管理员权限**（热激活要写 1 个 gate 字节）
-- **桌面解锁且微信可见**（UIA 是界面操作）
-
-### 防护
-
-- 四层回环防护（`allow_self` / 内容比对 / 归一化 / 频率熔断）
-- 群聊只在被 @ 或叫名字时回
-- 发送前校验输入框归属，防止发错人
-
-### 已知限制
-
-- 微信重启后程序失联，需手动重启程序
-- 群聊未做真实 @ 场景验证
-- 语音/表情包发送未实现
-- 记忆只读，微信对话还没写回 DSH 记忆库
-
-### 安装
-
-下载 `BigFish-0.1.0-setup.zip`，解压后双击 `install.bat`。
-或下载 `BigFish-0.1.0-portable.zip`，解压即用。
-"""
-
+#: 发布附件。路径按当前版本号拼，**不从 dist/ 取** ——
+#: build_portable.py 已经把 zip 和 manifest 生成在 release/ 下，
+#: dist/ 目录只放解压后的可执行文件。
+RELEASE_DIR = os.path.join(ROOT, "release")
 ASSETS = [
-    ("BigFish-0.1.0-setup.zip",
-     os.path.join(DIST, "BigFish-0.1.0-setup.zip")),
-    ("BigFish-0.1.0-portable.zip",
-     os.path.join(DIST, "BigFish-0.1.0-portable.zip")),
-    ("BigFish-0.1.0-manifest.json",
-     os.path.join(DIST, "BigFish-0.1.0-manifest.json")),
+    (f"BigFish-{VERSION}-portable.zip",
+     os.path.join(RELEASE_DIR, f"BigFish-{VERSION}-portable.zip")),
+    (f"BigFish-{VERSION}-manifest.json",
+     os.path.join(RELEASE_DIR, f"BigFish-{VERSION}-manifest.json")),
 ]
 
 
