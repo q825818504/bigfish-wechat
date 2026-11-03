@@ -1257,6 +1257,32 @@
             <small>列表里显示这一句。也是她挑表情时唯一能看到的信息，所以要准。</small>
           </div>
 
+          <div class="form-grid">
+            <div class="field">
+              <label>情绪维度</label>
+              <select id="stickerDetailDim">
+                <option value="">不归类（任何心情都能用）</option>
+                <option value="happy">开心</option>
+                <option value="calm">踏实</option>
+                <option value="sweet">甜蜜</option>
+                <option value="heartache">心疼</option>
+                <option value="worry">担心</option>
+                <option value="sad">难过</option>
+                <option value="jealous">吃醋</option>
+              </select>
+              <small>和心情系统同一套。她开心时优先挑「开心」类的。</small>
+            </div>
+            <div class="field">
+              <label>强度</label>
+              <div class="range-row">
+                <input type="range" id="stickerDetailIntensity"
+                       min="1" max="5" step="1">
+                <span class="range-val" id="stickerDetailIntensityVal">3</span>
+              </div>
+              <small>1=很淡（微微一笑）　5=极强（笑到打滚）。心情好才发高强度的。</small>
+            </div>
+          </div>
+
           <div class="field full">
             <label>详细说明</label>
             <textarea id="stickerDetailDesc" rows="4" maxlength="200"

@@ -59,6 +59,10 @@ VISION_MAX = 512
 #: 单张备注的超时。模型看一眼很快，超过这个基本就是网关有问题
 TIMEOUT = 45.0
 
+#: 允许的情绪维度 key。和 stickers.MOOD_DIM_KEYS 一致（有测试断言）。
+_MOOD_KEYS = ("happy", "calm", "sweet", "heartache",
+              "worry", "sad", "jealous")
+
 SYSTEM_PROMPT = """你在帮一个聊天机器人整理她的表情包。
 
 看这张图，说出三件事：
@@ -75,8 +79,33 @@ SYSTEM_PROMPT = """你在帮一个聊天机器人整理她的表情包。
 
 3. tags：2~4 个关键词，用于检索。每个 2~4 字。
 
+4. intensity：这张表情的**强度**，1~5 的整数。
+   1 = 很淡（微微一笑、轻轻点头、面无表情）
+   2 = 轻（有点开心、有点无奈）
+   3 = 中等（明显的高兴/不满/惊讶）
+   4 = 强（大笑、皱眉瞪眼、瞪大眼）
+   5 = 极强（狂笑到打滚、暴怒、崩溃、尖叫）
+
+   ⚠ 强度是**这张图本身**有多强烈，不是"适合什么心情"。
+      同样是"高兴"：嘴角上扬是 2，咧嘴笑是 3，笑到流泪是 5。
+
+5. mood_dim：这张表情最贴近哪种**情绪维度**？只能从这七个里选一个，
+   或者给空字符串表示不属于任何一类：
+
+   happy      开心（笑、乐、得意、兴奋）
+   calm       踏实（安心、放心、平静、靠谱）
+   sweet      甜蜜（撒娇、害羞、被暖到）
+   heartache  心疼（怜惜、想抱抱、受伤了）
+   worry      担心（焦虑、紧张、不安）
+   sad        难过（哭、失落、委屈、沮丧）
+   jealous    吃醋（酸、不满、赌气）
+
+   ⚠ 像"无语""疑惑""震惊"这种不属于上面任何一类的，给空字符串，
+      不要硬塞进 happy 或 sad。
+
 只输出一行 JSON，不要解释，不要代码块：
-{"brief": "...", "detail": "...", "tags": ["...", "..."]}"""
+{"brief": "...", "detail": "...", "tags": ["...", "..."],
+ "intensity": 3, "mood_dim": "happy"}"""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -126,7 +155,8 @@ def _parse(raw: str) -> Dict[str, Any]:
     模型经常在 JSON 外面包一层 ```json ``` 或者先说一句话，
     所以先找第一个 { 到最后一个 }。
     """
-    out: Dict[str, Any] = {"brief": "", "detail": "", "tags": []}
+    out: Dict[str, Any] = {"brief": "", "detail": "", "tags": [],
+                           "intensity": 0, "mood_dim": ""}
     s = (raw or "").strip()
     if not s:
         return out
@@ -151,6 +181,14 @@ def _parse(raw: str) -> Dict[str, Any]:
     tags = obj.get("tags")
     if isinstance(tags, list):
         out["tags"] = [str(t).strip() for t in tags if str(t).strip()][:6]
+    try:
+        n = int(obj.get("intensity"))
+        out["intensity"] = max(1, min(5, n))
+    except (TypeError, ValueError):
+        out["intensity"] = 0        # 0 = 模型没给，调用方用默认值
+
+    dim = str(obj.get("mood_dim") or "").strip().lower()
+    out["mood_dim"] = dim if dim in _MOOD_KEYS else ""
     return out
 
 
@@ -165,6 +203,7 @@ def describe(path: str, endpoint: str = "", model: str = "",
     **任何失败都不抛异常** —— 备注是锦上添花，不该挡住导入。
     """
     out: Dict[str, Any] = {"brief": "", "detail": "", "tags": [],
+                           "intensity": 0, "mood_dim": "",
                            "ok": False, "error": ""}
 
     if not os.path.isfile(path):

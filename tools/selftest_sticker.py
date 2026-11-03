@@ -78,6 +78,7 @@ def main():
     root = _tmp_root()
     try:
         import bigfish.stickers as S
+        import bigfish.vault as vault
 
         section("代码生成：唯一、递增")
         data = S.read_index(root)
@@ -223,6 +224,49 @@ def main():
         chk("没发过表情时不学",
             st.should_learn({"user_text": "这个表情不是这么用的",
                              "chat_id": "nobody"}) is False)
+
+        section("情绪维度与强度")
+        chk("维度和 vault 一致",
+            tuple(S.MOOD_DIM_KEYS) == tuple(k for k, _ in vault.MOOD_DIMS))
+        chk("标签和 vault 一致",
+            S.MOOD_DIM_LABELS == dict(vault.MOOD_DIMS))
+
+        # 脏数据不能崩
+        chk("脏维度被清空", S._clean_dim("hAppy") == "happy")
+        chk("不认识的维度清空", S._clean_dim("angry") == "")
+        chk("None 维度清空", S._clean_dim(None) == "")
+
+        chk("强度夹到 1~5（低）", S._clamp_intensity(0) == 1)
+        chk("强度夹到 1~5（高）", S._clamp_intensity(99) == 5)
+        chk("强度默认 3", S._clamp_intensity(None) == 3)
+        chk("强度默认 3（脏）", S._clamp_intensity("abc") == 3)
+
+        # ⚠ 用当前还在库里的第一张 —— 前面的删除测试可能已经删掉了 code
+        alive = [x["code"] for x in S.list_stickers(root)]
+        chk("库里还有图可测", bool(alive), alive)
+        probe = alive[0] if alive else code
+        ok, err = S.update_sticker(probe, root, mood_dim="happy", intensity=5)
+        chk("写维度与强度", ok, err)
+        got = S.get_sticker(probe, root)
+        chk("维度读得回", got.get("moodDim") == "happy", got.get("moodDim"))
+        chk("维度标签", got.get("moodDimLabel") == "开心")
+        chk("强度读得回", got.get("intensity") == 5, got.get("intensity"))
+
+        ok, err = S.update_sticker(probe, root, mood_dim="")
+        chk("清空维度", ok and S.get_sticker(probe, root)["moodDim"] == "")
+
+        section("插件：心情怎么压成给模型看的话")
+        from bigfish.plugins.sticker import _mood_line
+
+        line = _mood_line({"mood": {"value": 72, "label": "心情不错",
+                                    "dims": {"happy": 45, "sweet": 12,
+                                             "sad": 0}}})
+        chk("带分数", "72" in line, line)
+        chk("带标签", "心情不错" in line, line)
+        chk("带活跃维度", "开心" in line and "甜蜜" in line, line)
+        chk("零值维度不出现", "难过" not in line, line)
+        chk("空心情返回空串", _mood_line({}) == "")
+        chk("脏心情不崩", isinstance(_mood_line({"mood": "abc"}), str))
 
         section("使用记录：冷却靠它")
         S.record_sent("filehelper", "stk_0001", root)

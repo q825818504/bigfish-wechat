@@ -121,7 +121,7 @@ function renderStickerGrid(items) {
       <div class="sticker-meta">
         <div class="sticker-brief${brief ? '' : ' is-empty'}">${esc(brief || '没写说明')}</div>
         <div class="sticker-foot">
-          <span class="sticker-kind${isGif ? ' is-gif' : ''}">${isGif ? 'gif' : '图片'}${frames > 1 ? ' · ' + frames + '帧' : ''}</span>
+          <span class="sticker-kind${isGif ? ' is-gif' : ''}">${esc(it.moodDimLabel || (isGif ? 'gif' : '图片'))} · ${Number(it.intensity || 3)}</span>
           <code style="font-size:10px;color:var(--muted)">${esc(it.code)}</code>
         </div>
       </div>
@@ -149,6 +149,10 @@ function openStickerDetail(code) {
 
   $('#stickerDetailBrief').value = it.brief || '';
   $('#stickerDetailDesc').value = it.detail || '';
+  $('#stickerDetailDim').value = it.moodDim || '';
+  const inten = Number(it.intensity || 3);
+  $('#stickerDetailIntensity').value = inten;
+  setText('#stickerDetailIntensityVal', String(inten));
 
   openModal('stickerDetailModal');
   setTimeout(() => $('#stickerDetailBrief').focus(), 80);
@@ -158,7 +162,10 @@ async function saveStickerDetail() {
   if (!S.detailCode) return;
   const brief = $('#stickerDetailBrief').value.trim();
   const detail = $('#stickerDetailDesc').value.trim();
-  const r = JSON.parse(await S.bridge.sticker_update(S.detailCode, brief, detail));
+  const dim = $('#stickerDetailDim').value || '';
+  const inten = Number($('#stickerDetailIntensity').value || 3);
+  const r = JSON.parse(await S.bridge.sticker_update(
+    S.detailCode, brief, detail, inten, dim));
   if (!r.ok) return toast(r.error || '保存失败');
   toast('已保存');
   closeModal('stickerDetailModal');
@@ -311,6 +318,11 @@ $('#btnStickerClearPending')?.addEventListener('click', () => {
   renderPending();
 });
 $('#btnStickerDoImport')?.addEventListener('click', doStickerImport);
+
+$('#stickerDetailIntensity')?.addEventListener('input', () => {
+  setText('#stickerDetailIntensityVal',
+    $('#stickerDetailIntensity').value);
+});
 
 $('#btnStickerDetailSave')?.addEventListener('click', saveStickerDetail);
 $('#btnStickerDetailDelete')?.addEventListener('click', deleteStickerDetail);

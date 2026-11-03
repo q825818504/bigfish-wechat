@@ -417,7 +417,41 @@ class EngineWorker(QThread):
     # ==================================================================
     # 表情包
     # ==================================================================
-    def _pick_sticker(self, msg, body: str, reply: str) -> str:
+    def _current_mood(self) -> dict:
+        """读当前落盘的心情，整理成插件要的形状。
+
+        形状：
+            {"value": 72, "label": "心情不错",
+             "dims": {"happy": 45, "sweet": 12, ...}}
+
+        读不到就返回空字典 —— 插件那边 _mood_line 会输出空串，
+        挑表情退化成"只看对话"，不影响主流程。
+        """
+        try:
+            from bigfish import vault as _v
+
+            st = _v.read_mood_state()
+            if not isinstance(st, dict):
+                return {}
+            out = {
+                "value": st.get("mood"),
+                "dims": st.get("dims") if isinstance(st.get("dims"), dict)
+                        else {},
+            }
+            # label 用 bridge_client 那套阈值，保证和界面上显示的一致
+            try:
+                from bigfish.bridge_client import Mood
+
+                out["label"] = Mood(value=out["value"]).label
+            except Exception:
+                out["label"] = ""
+            return out
+        except Exception as exc:
+            self._log(f"[表情] 读心情失败：{exc}", "err")
+            return {}
+
+    def _pick_sticker(self, msg, body: str, reply: str,
+                      mood=None) -> str:
         """决定这一轮要不要跟一张表情包，返回文件路径（空串 = 不发）。
 
         三层判断，任何一层否决就安静地不发：
@@ -473,6 +507,9 @@ class EngineWorker(QThread):
                 "reply_text": reply or "",
                 "is_group": str(getattr(msg, "chat_id", "")).endswith("@chatroom"),
                 "generated_by": "engine",
+                # 心情要传进去 —— 不传的话挑表情只看对话文本，
+                # 她可能刚被哄得很开心却挑一张「无语」。
+                "mood": mood or {},
             }) or ""
         except Exception as exc:
             self._log(f"[表情] 插件异常：{exc}", "err")
@@ -1119,8 +1156,14 @@ class EngineWorker(QThread):
             #   放这里是刻意的 —— 顺序必须是「先说话，再发表情」，
             #   反过来的话对方先看到一个没头没尾的表情。
             sticker_path = ""
+            # 挑表情要参考心情。这里用**当前落盘的那份**，而不是本轮
+            # 生成回复时用的上下文 —— 后者是这一轮开始时的快照，
+            # 而心情判断是上一轮结束后写的，两者差一轮。
+            # 用最新的更准：她刚才被哄开心了，这一轮就该挑开心的表情。
+            _sticker_mood = self._current_mood()
             try:
-                sticker_path = self._pick_sticker(msg, body, reply)
+                sticker_path = self._pick_sticker(
+                    msg, body, reply, mood=_sticker_mood)
             except Exception as exc:
                 self._log(f"[表情] 挑选失败：{exc}", "err")
 
@@ -2988,15 +3031,21 @@ class Backend(QObject):
                     continue
                 res = sticker_desc.describe(item["path"])
                 if res.get("ok"):
+                    # 强度 0 表示模型没给，不覆盖（保留默认 3）
+                    inten = int(res.get("intensity") or 0)
                     stickers.update_sticker(
                         str(code),
                         brief=res.get("brief") or "",
                         detail=res.get("detail") or "",
                         tags=res.get("tags") or [],
-                        auto=True)
+                        auto=True,
+                        intensity=inten if inten else None,
+                        mood_dim=res.get("mood_dim") or None)
                     out.append({"code": code, "ok": True,
                                 "brief": res.get("brief") or "",
-                                "detail": res.get("detail") or ""})
+                                "detail": res.get("detail") or "",
+                                "intensity": inten,
+                                "moodDim": res.get("mood_dim") or ""})
                 else:
                     out.append({"code": code, "ok": False,
                                 "error": res.get("error") or "模型没给内容"})
@@ -3006,14 +3055,17 @@ class Backend(QObject):
             return json.dumps({"ok": False, "error": str(exc)},
                               ensure_ascii=False)
 
-    @Slot(str, str, str, result=str)
-    def sticker_update(self, code: str, brief: str, detail: str) -> str:
-        """改一张表情的概览和详细。"""
+    @Slot(str, str, str, int, str, result=str)
+    def sticker_update(self, code: str, brief: str, detail: str,
+                       intensity: int, mood_dim: str) -> str:
+        """改一张表情的概览、详细、强度、情绪维度。"""
         try:
             from bigfish import stickers
 
             ok, err = stickers.update_sticker(
-                code, brief=brief, detail=detail, auto=False)
+                code, brief=brief, detail=detail, auto=False,
+                intensity=int(intensity) if intensity else None,
+                mood_dim=mood_dim)
             return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)},

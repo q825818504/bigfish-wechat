@@ -86,6 +86,57 @@ def _usable(entry: Dict[str, Any]) -> bool:
     return True
 
 
+def _mood_line(ctx: Dict[str, Any]) -> str:
+    """把当前心情压成两三行给模型看。
+
+    数据来自 vault 的心情系统：
+        value  0~100 的总分
+        label  "心情不错" 这种人话
+        dims   {happy: 45, sweet: 12, ...} 七根维度的激活量
+
+    ⚠ 只挑**激活量最高的两三根**。七根全列出来会让模型抓不住重点，
+      而且大部分时候只有一两根是活的。
+    """
+    m = ctx.get("mood")
+    if not isinstance(m, dict) or not m:
+        return ""
+
+    lines = []
+    val = m.get("value")
+    label = str(m.get("label") or "").strip()
+    if val is not None:
+        try:
+            v = float(val)
+            lines.append(f"她现在的心情：{label or '未知'}（{v:.0f}/100）")
+        except (TypeError, ValueError):
+            pass
+    elif label:
+        lines.append(f"她现在的心情：{label}")
+
+    dims = m.get("dims")
+    if isinstance(dims, dict) and dims:
+        try:
+            from bigfish.stickers import MOOD_DIM_LABELS
+
+            active = []
+            for k, v in dims.items():
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if fv > 0 and k in MOOD_DIM_LABELS:
+                    active.append((k, fv))
+            active.sort(key=lambda x: -x[1])
+            if active:
+                shown = "、".join(
+                    f"{MOOD_DIM_LABELS[k]} {v:.0f}" for k, v in active[:3])
+                lines.append(f"情绪偏向：{shown}")
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
+
 def _ask_model(candidates: List[Dict[str, Any]], ctx: Dict[str, Any]) -> str:
     """让模型从候选里挑一张，或决定不挑。返回代码（空 = 不挑）。
 
@@ -101,23 +152,58 @@ def _ask_model(candidates: List[Dict[str, Any]], ctx: Dict[str, Any]) -> str:
         # 没有 brief 的用代码兜底 —— 至少模型知道有这么一张
         label = brief or "（没写说明）"
         frames = "动图" if int(e.get("frames") or 1) > 1 else "静图"
-        lines.append(f"- {code} [{frames}] {label}")
+        # 强度：1=很淡 5=极强。缺失按 3 处理。
+        inten = int(e.get("intensity") or 3)
+        # 情绪维度：和心情系统那七根一一对应。空表示不归类。
+        dim = e.get("moodDimLabel") or ""
+        tag = "·".join(x for x in (frames, f"强度{inten}", dim) if x)
+        lines.append(f"- {code} [{tag}] {label}")
 
-    system = (
-        "你在帮一个正在微信上聊天的人决定：说完这句话之后，要不要再发一张表情包。\n"
-        "表情包不是必需品。大多数人发十句话才发一张表情。\n"
-        "只有当这句话带有明显情绪（高兴、无语、得意、委屈、摆烂、鼓励），"
-        "而且下面正好有一张真的贴合的时候，才发。\n"
-        "拿不准就不发 —— 发一张不搭的表情比不发更尴尬。\n\n"
-        "只输出一行 JSON，不要解释，不要代码块：\n"
-        '{"pick": "stk_0007"}\n'
-        '不发表情时 pick 用空字符串。'
-    )
-    user = (
-        f"她刚要说的话：{ctx.get('reply_text') or ''}\n"
-        f"对方说的话：{ctx.get('user_text') or ''}\n\n"
-        f"可用的表情（共 {len(candidates)} 张）：\n" + "\n".join(lines)
-    )
+    system = "\n".join([
+        "你在帮一个正在微信上聊天的人决定：说完这句话之后，要不要再发一张表情包。",
+        "表情包不是必需品。大多数人发十句话才发一张表情。",
+        "只有当这句话带有明显情绪（高兴、无语、得意、委屈、摆烂、鼓励），",
+        "而且下面正好有一张真的贴合的时候，才发。",
+        "拿不准就不发 —— 发一张不搭的表情比不发更尴尬。",
+        "",
+        "## 怎么挑：先对维度，再对强度",
+        "",
+        "每张表情标了两样东西：",
+        "  · 情绪维度（开心/踏实/甜蜜/心疼/担心/难过/吃醋）—— 和她的心情系统同一套",
+        "  · 强度 1~5（1=很淡，5=极强）",
+        "",
+        "**第一步：维度要对上。** 她现在的情绪偏向会在下面给她，",
+        "优先挑同一维度的表情。她正在开心，就挑「开心」类的，",
+        "别挑「难过」类的 —— 哪怕这句话本身有点丧。",
+        "",
+        "没有标维度的表情（像「无语」「疑惑」）任何心情下都能用，",
+        "它们不算错配。",
+        "",
+        "**第二步：强度要跟心情分数对上。**",
+        "",
+        "- 心情好（≥70）→ 优先强度 4~5，情绪放得出来",
+        "- 心情一般（40~70）→ 挑 2~3，别用力过猛",
+        "- 心情低（<40）→ 挑 1~2，或者干脆不发。",
+        "  心情差的时候发狂喜的表情，看着像装的。",
+        "",
+        "但**以这句话本身为准**：如果这句话明显在开玩笑，",
+        "哪怕心情低也可以发一张强度高的自嘲。",
+        "",
+        "只输出一行 JSON，不要解释，不要代码块：",
+        '{"pick": "stk_0007"}',
+        '不发表情时 pick 用空字符串。',
+    ])
+
+    parts = [
+        f"她刚要说的话：{ctx.get('reply_text') or ''}",
+        f"对方说的话：{ctx.get('user_text') or ''}",
+    ]
+    mood_line = _mood_line(ctx)
+    if mood_line:
+        parts.append(mood_line)
+    parts.append(f"可用的表情（共 {len(candidates)} 张）：")
+    parts.append("\n".join(lines))
+    user = "\n".join(parts)
 
     mc = ModelConfig.load()
     raw = call_model(mc, system, user)

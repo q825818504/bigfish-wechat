@@ -107,6 +107,36 @@ BRIEF_MAX = 12
 #: detail 长度上限
 DETAIL_MAX = 200
 
+#: 情绪维度 —— 和 vault.MOOD_DIMS 一一对应。
+#:
+#: 为什么要这个字段：brief 是自由文本（"高兴"、"无语"、"生气"），
+#: 而心情系统只有七个维度。两边对不上，挑表情时就没法按心情匹配 ——
+#: 模型只能凭 brief 猜，猜得准不准全看运气。
+#:
+#: 存 key 而不是中文标签：标签会改，key 不会。标签在显示时查表。
+MOOD_DIM_KEYS = ("happy", "calm", "sweet", "heartache",
+                 "worry", "sad", "jealous")
+
+#: key → 中文标签。和 vault.MOOD_DIMS 必须一致（有测试断言）。
+MOOD_DIM_LABELS = {
+    "happy": "开心",
+    "calm": "踏实",
+    "sweet": "甜蜜",
+    "heartache": "心疼",
+    "worry": "担心",
+    "sad": "难过",
+    "jealous": "吃醋",
+}
+
+#: 强度默认值。老数据没有这个字段，按"中等"处理。
+#:
+#: 为什么需要强度：库里可能十张都是「高兴」，但一张是微微一笑、
+#: 一张是笑到打滚。光看 brief 模型分不出来，只能随机挑 ——
+#: 结果就是心情 90 分的时候发了个"呵呵"，或者心情 30 分的时候发狂喜。
+#:
+#: 1=很淡  2=轻  3=中等  4=强  5=极强
+INTENSITY_DEFAULT = 3
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 路径
@@ -422,6 +452,21 @@ def list_stickers(root: Optional[str] = None,
     return out
 
 
+def _clean_dim(v: Any) -> str:
+    """把维度值规范化。不认识的 key 一律当"不归类"。"""
+    k = str(v or "").strip().lower()
+    return k if k in MOOD_DIM_KEYS else ""
+
+
+def _clamp_intensity(v: Any) -> int:
+    """把强度夹到 1~5。缺失/脏数据都给默认值。"""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return INTENSITY_DEFAULT
+    return max(1, min(5, n))
+
+
 def _shape(code: str, meta: Dict[str, Any], path: str,
            with_detail: bool) -> Dict[str, Any]:
     try:
@@ -439,6 +484,10 @@ def _shape(code: str, meta: Dict[str, Any], path: str,
         "source": str(meta.get("source") or ""),
         "auto": bool(meta.get("auto")),
         "frames": int(meta.get("frames") or 1),
+        "intensity": _clamp_intensity(meta.get("intensity")),
+        "moodDim": _clean_dim(meta.get("mood_dim")),
+        "moodDimLabel": MOOD_DIM_LABELS.get(
+            _clean_dim(meta.get("mood_dim")), ""),
         "kind": "sticker" if path.lower().endswith(".gif") else "image",
     }
     if with_detail:
@@ -463,7 +512,10 @@ def get_sticker(code: str, root: Optional[str] = None) -> Optional[Dict[str, Any
 
 def import_sticker(src: str, root: Optional[str] = None,
                    brief: str = "", detail: str = "",
-                   source: str = "import") -> Tuple[bool, str, Dict[str, Any]]:
+                   source: str = "import",
+                   intensity: Optional[int] = None,
+                   mood_dim: str = ""
+                   ) -> Tuple[bool, str, Dict[str, Any]]:
     """收一张表情进库。返回 (ok, 错误或代码, 条目)。
 
     流程：转 GIF → 分配代码 → 落盘 → 写 index。
@@ -510,6 +562,9 @@ def import_sticker(src: str, root: Optional[str] = None,
         "created": int(time.time()),
         "source": source,
         "auto": False,
+        "intensity": _clamp_intensity(
+            intensity if intensity is not None else INTENSITY_DEFAULT),
+        "mood_dim": _clean_dim(mood_dim),
         "frames": int(info.get("frames") or 1),
         "w": int(info.get("out_w") or info.get("w") or 0),
         "h": int(info.get("out_h") or info.get("h") or 0),
@@ -531,7 +586,9 @@ def update_sticker(code: str, root: Optional[str] = None,
                    brief: Optional[str] = None,
                    detail: Optional[str] = None,
                    tags: Optional[List[str]] = None,
-                   auto: Optional[bool] = None) -> Tuple[bool, str]:
+                   auto: Optional[bool] = None,
+                   intensity: Optional[int] = None,
+                   mood_dim: Optional[str] = None) -> Tuple[bool, str]:
     """改一张表情的描述。只改传进来的字段。"""
     data = read_index(root)
     items = data.get("items") or {}
@@ -547,6 +604,10 @@ def update_sticker(code: str, root: Optional[str] = None,
         meta["tags"] = [str(t).strip() for t in tags if str(t).strip()][:8]
     if auto is not None:
         meta["auto"] = bool(auto)
+    if intensity is not None:
+        meta["intensity"] = _clamp_intensity(intensity)
+    if mood_dim is not None:
+        meta["mood_dim"] = _clean_dim(mood_dim)
     meta["updated"] = int(time.time())
 
     items[code] = meta

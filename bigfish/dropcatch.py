@@ -116,8 +116,11 @@ class DropCatcher(QObject, QAbstractNativeEventFilter):
                 continue
             if not hwnd:
                 continue
+            # 先撤 OLE，否则系统不发 WM_DROPFILES
+            revoked = self._revoke_ole(hwnd)
             if self._accept_files(hwnd):
                 n += 1
+                self._log(f"  hwnd={hwnd} 撤OLE={revoked} 已设接受文件")
             # OLE 那条也顺手放行 —— 万一某些系统上 WM_DROPFILES 不走
             self._allow_uipi(hwnd)
 
@@ -153,6 +156,38 @@ class DropCatcher(QObject, QAbstractNativeEventFilter):
         return uniq
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _revoke_ole(hwnd: int) -> bool:
+        """撤销这个窗口的 OLE drop target 注册。
+
+        ═══════════════════════════════════════════════════════════════
+        为什么必须撤
+        ═══════════════════════════════════════════════════════════════
+
+        一个窗口只要注册了 OLE drop target（`RegisterDragDrop`），
+        系统就**只走 OLE 那条路，再也不发 WM_DROPFILES**。
+
+        Qt 的 `setAcceptDrops(True)` 会注册 OLE；QWebEngineView 内部
+        为了支持网页内拖放，肯定也注册了。所以 DragAcceptFiles 设了
+        也没用 —— 日志里只有 install、没有 WM_DROPFILES，就是这个原因。
+
+        而 OLE 这条路在管理员权限下被 UIPI 卡死（跨完整性 COM 调用被拒），
+        表现就是拖动源显示禁止图标。
+
+        两条路互相打架，只能选一条。这里选 WM_DROPFILES：
+        撤销 OLE 注册，让系统回到老式路径。
+
+        代价：网页内部的拖放（拖文字、拖图片进页面）会失效。
+        我们的界面不需要那个 —— 要的只是"从资源管理器拖文件进来"。
+        """
+        try:
+            r = ctypes.windll.ole32.RevokeDragDrop(
+                ctypes.c_void_p(int(hwnd)))
+            # S_OK=0；DRAGDROP_E_NOTREGISTERED=0x80040100（没注册过，正常）
+            return r == 0
+        except Exception:
+            return False
+
     @staticmethod
     def _accept_files(hwnd: int) -> bool:
         """DragAcceptFiles(hwnd, TRUE)"""

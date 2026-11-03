@@ -1,35 +1,55 @@
-拖放改走原生 WM_DROPFILES —— 前两条路都是错的
+表情接上心情：先对维度，再对强度
 
-用户试了三次都不行。把三条路都试过一遍之后才找对：
+用户提的：「大肥鱼在不同的心情下，如果有同类的表情包，就根据不同
+的心情展示不同的表情包，比如同样是高兴，一个一般高兴，一个非常高兴」
+并强调「一定要配合到我们的心情插件，里面就有情绪维度」
 
-① HTML5 dataTransfer.files
-   QtWebEngine 里能拿到 File 对象，但没有 path 属性 ——
-   那是 Electron 扩展，Chromium 标准没有。没路径就没法转 GIF。
+先纠正一个说法：**不需要新增"情绪值"** —— 心情系统已经有两层：
+    score  0~100
+    dims   七根维度（开心/踏实/甜蜜/心疼/担心/难过/吃醋）
 
-② QWidget eventFilter + OLE drag-drop
-   直接构造 QDropEvent 塞给控件时 eventFilter 是正常的（日志有、
-   accepted 为 True），但真实拖动时鼠标显示禁止图标、事件根本没产生。
-   后来查出来是 UIPI：程序要 UIA 所以是管理员权限（高完整性），
-   资源管理器是中完整性，Windows 拦住跨完整性的 OLE 拖放。
-   加了 ChangeWindowMessageFilterEx 放行三条消息（API 都返回 True），
-   事件还是没到。
+真正缺的是两个：
+    ① 挑表情时完全没读心情（插件只看对话文本）
+    ② 表情没有维度也没有强度（十张都叫"高兴"，不知道哪张是微笑）
 
-③ 现在：Windows 原生 WM_DROPFILES
-   DragAcceptFiles(hwnd, TRUE) 让系统知道这个窗口收文件，
-   之后系统直接发 WM_DROPFILES，不经过 OLE，绕开跨进程那套。
-   配合 QAbstractNativeEventFilter 全局拦消息 —— 比装 eventFilter
-   到某个子控件可靠，不管落在哪一层都会经过。
+── 改动 ──
 
-我自己构造了一个 WM_DROPFILES（GlobalAlloc + DROPFILES + PostMessage）
-验证整条链路：
-    WM_DROPFILES hdrop=... 文件数=2
-    已交给页面：2 个
-    页面 pending: {"n":2,"p":["动图_512.gif","动图_240.gif"]}
+表情加两个字段（schema 兼容，老数据用默认值）：
+    mood_dim   七根维度之一，或空表示"不归类"（无语/疑惑这类）
+    intensity  1~5
 
-批量拖拽本来就是支持的（DragQueryFileW 逐条读）。
+为什么存 key 不存中文：标签会改，key 不会。标签显示时查表。
+MOOD_DIM_KEYS / MOOD_DIM_LABELS 和 vault.MOOD_DIMS 对齐，
+有测试断言两边一致 —— 不一致的话挑表情就永远匹配不上。
 
-拖放出问题很难查（界面在管理员权限下跑，看不到控制台），
-所以加了 <程序目录>/data/_drop.log，记录 install / 收到消息 /
-解析出几个文件 / 有没有交给页面。下次再坏能一眼看出卡在哪。
+视觉备注的 prompt 加两个输出：
+    intensity  1=很淡 5=极强（是"这张图本身有多强烈"，不是适合什么心情）
+    mood_dim   只能从七个里选，或者空。像"无语""疑惑"不许硬塞进 happy
 
-DragFinish 必须调 —— 否则系统侧资源不释放，第二次拖放会失败。
+挑表情时：
+    引擎 _current_mood() 读**当前落盘的那份**心情（不是本轮开始时的
+    快照 —— 心情判断是上一轮结束后写的，用最新的更准）
+    → 传进插件 ctx["mood"]
+    → _mood_line() 压成两三行：分数 + 标签 + 活跃的前三根维度
+    → 候选列表带维度标签和强度
+    → prompt 说明"先对维度，再对强度"
+
+UI 详情弹窗加两个控件：情绪维度下拉 + 强度滑块。可手改。
+
+── 实测 ──
+
+造两张图让模型判断：
+    微笑（小弧线嘴、圆眼）  → calm  强度 2  brief=微笑
+    大笑（大弧嘴、弯眼）    → happy 强度 3  brief=开心
+
+── 测试 ──
+  selftest_sticker      61/61（新增 13 项：维度对齐、脏数据、强度夹取、
+                        _mood_line 的各种输入）
+  selftest_vault        148/148
+  selftest_engine_fixes 60/60
+  test_no_leak          30/30
+  test_persona_parity   18/18
+  selftest_ui           全通过
+  selftest_plugins      89/89
+  check_method_calls    无问题
+  check_slots           无问题
