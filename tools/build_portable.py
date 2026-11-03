@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST = os.path.join(ROOT, 'dist', 'BigFish')
 OUT = os.path.join(ROOT, 'release')
-VERSION = '0.2.1'
+VERSION = '0.3.1'
 
 if not os.path.isdir(DIST):
     sys.exit('dist/BigFish 不存在，先打包')

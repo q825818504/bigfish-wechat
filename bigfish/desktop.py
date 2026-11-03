@@ -193,6 +193,44 @@ def _source_ms(msg) -> "int | None":
     return v * 1000 if v < 10_000_000_000 else v
 
 
+def _profile_block(owner: str) -> str:
+    """取「她印象里的他」—— 从事实归纳出来的那段概述（v6）。
+
+    和 `## 你认定的事`（逐条事实）的分工：
+        这里是**整段**（900 字内），每轮必带，让她始终知道面前是谁；
+        那边是**逐条**，只挑这一轮相关的十几条。
+
+    为什么两个都要：
+        只有画像 → 细节全靠猜，说得出"他爱吃辣"但说不出"上周三他说胃疼"；
+        只有事实 → 几千条里只进得去十几条，她大部分时候对你一片模糊。
+
+    ⚠ 画像 `enabled=0` 时返回空串 —— 你否决过的那段，一个字都不注入。
+    """
+    try:
+        from bigfish import memory as M, vault as V
+
+        db = V.memory_db_path()
+        if not (db and os.path.isfile(db) and owner):
+            return ""
+        return M.profiles_for_prompt(db, "dafeiyu", owner=owner)
+    except Exception:
+        return ""
+
+
+def _recall_thin(text: str) -> bool:
+    """这次原文召回是不是"太少了，值得再查一次"。
+
+    判断标准就一条：有效行数 < 2。
+    用行数而不是字数 —— 一条长片段和五条短片段，前者信息更多，
+    按字数判会把"一条长回忆"误判成"料很足"。
+
+    ⚠ 空文本也算 thin，但调用方还要看 hist 有没有内容 ——
+      刚开聊时 hist 是空的，补查也没词可用。
+    """
+    lines = [ln for ln in (text or "").splitlines() if ln.strip().startswith("-")]
+    return len(lines) < 2
+
+
 def _facts_block(owner: str, tier: str, *, limit: int = 8, pinned_limit: int = 4,
                  question: str = "") -> str:
     """取「她认定的事」渲染成注入段。失败返回空串，绝不中断对话。
@@ -1009,9 +1047,6 @@ class EngineWorker(QThread):
             sys_parts = [text for _o, text in _sections]
 
             user_parts = []
-            mem = ctx.render_memory()
-            if mem:
-                user_parts.append("## 你记得的事\n\n" + mem)
 
             # ── 记忆隔离：先确定"面前这个人是谁" ──
             #
@@ -1065,6 +1100,45 @@ class EngineWorker(QThread):
                 # 主人 = 配置里 auto_reply.owner 指定的那个人；
                 # 没配就退回"监听名单里的私聊对象"，但等级仍是 known 不是 owner。
                 _tier = _M.TIER_OWNER if _owner == owner_id else _M.TIER_KNOWN
+
+            # ── 画像：她自己归纳的「这个人是什么样」（v6）──
+            #
+            # 为什么放在「你记得的事」之前：画像是**概述**，原文和事实是**细节**。
+            # 先让她知道"这是个什么样的人"，再去读具体说过什么 ——
+            # 顺序反了，她会拿一句三年前的话当这个人现在的样子。
+            #
+            # ⚠ 只注入**当前这个人**的画像。别人的画像里必然带着别人的私事，
+            #   那正是 v5 那道墙要拦的东西。
+            profile_text = _profile_block(_owner)
+            if profile_text:
+                user_parts.append("## 你印象里的他\n\n" + profile_text)
+
+            # ── 原文：不够就再查一次（v6）──
+            #
+            # 以前只查一次，命不中就是命不中。你问"我爸上次说啥来着"，
+            # 第一次检索没捞到就只能干瞪眼。
+            #
+            # 现在：第一次命中很少（< 2 条）时，换一个查询词再查一次 ——
+            # 用最近的对话当线索（她上一句说了什么、你上一条说了什么），
+            # 那两个词往往比整句更接近真正的主题。
+            #
+            # 这是"让模型主动查"的穷人版：不改架构，只在明显没料时补一枪。
+            try:
+                mem_now = ctx.render_memory()
+                if _recall_thin(mem_now) and hist:
+                    # 用上一轮她说的话 + 更早一轮你说的话当第二查询
+                    alt = " ".join(t for _w, t in hist[-3:])
+                    if alt.strip() and alt.strip() != (body or "").strip():
+                        extra_ctx = load_context(query=alt.strip()[:200])
+                        extra_mem = extra_ctx.render_memory()
+                        if extra_mem:
+                            mem_now = (mem_now + "\n" + extra_mem).strip()
+                            self._log("[记] 补搜一次，多捞到一些原话", "think")
+            except Exception as exc:
+                self._log(f"[记] 补搜失败（不影响这一轮）：{exc}", "")
+
+            if mem_now:
+                user_parts.append("## 你记得的事\n\n" + mem_now)
 
             # 事实层：她「知道什么」。和原文分开注入 ——
             #   原文是逐句的、带时间的；事实是稳定的、可被纠正的。
@@ -2294,6 +2368,62 @@ class Backend(QObject):
             db = V.memory_db_path()
             ok, err = M.set_impression(db or "", "dafeiyu", owner or "",
                                        note or "")
+            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def refresh_profile(self, owner: str) -> str:
+        """让她重新归纳一次「这个人是什么样」。
+
+        这是 v6 的画像层：把几百条事实压成一段话，每轮都能带进提示词。
+        要调一次模型，所以放后台跑，界面先返回"在做"。
+
+        ⚠ 不碰 enabled —— 你否决过的画像，刷新完还是否决状态。
+          否则否决一次、刷新一次就活过来，否决就成了摆设。
+        """
+        try:
+            import threading
+
+            from bigfish import memory as M, vault as V
+            from bigfish.replier import call_model
+
+            db = V.memory_db_path()
+            if not (db and os.path.isfile(db) and owner):
+                return json.dumps({"ok": False, "error": "缺少记忆库或 owner"},
+                                  ensure_ascii=False)
+
+            def work() -> None:
+                try:
+                    r = M.refresh_profile(
+                        db, "dafeiyu", owner,
+                        lambda system, user: call_model(self.mcfg, system, user))
+                    if r.get("ok"):
+                        self._log(f"[画像] 已更新（{r.get('chars', 0)} 字，"
+                                  f"来自 {r.get('fromFacts', 0)} 条事实）", "")
+                    else:
+                        self._log(f"[画像] 归纳失败：{r.get('error')}", "err")
+                except Exception as exc:
+                    self._log(f"[画像] 归纳异常：{exc}", "err")
+
+            threading.Thread(target=work, daemon=True, name="profile").start()
+            return json.dumps({"ok": True, "started": True}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+
+    @Slot(str, bool, result=str)
+    def set_profile_enabled(self, owner: str, enabled: bool) -> str:
+        """启 / 停用画像。
+
+        停用 = 她不再按这段画像理解这个人，但画像本身留着 ——
+        删了下次归纳又生成，你的否决等于没说过。
+        """
+        try:
+            from bigfish import memory as M, vault as V
+
+            db = V.memory_db_path()
+            ok, err = M.set_profile_enabled(db or "", "dafeiyu",
+                                            owner or "", bool(enabled))
             return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)

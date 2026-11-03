@@ -943,6 +943,162 @@ def t_impression(tmp: str) -> None:
           str(ps["pools"]))
 
 
+def t_retrieval_strategy(tmp: str) -> None:
+    section("v6 取用策略：记得 ≠ 想得起来")
+    db = os.path.join(tmp, "pick.sqlite3")
+    M.ensure_schema(db)
+    use_db(db)
+    me = M.owner_of_private("pick-user")
+    cid = seed_source("wechat:pick", "一些往事")
+
+    now = M._now_ms()
+    DAY = 86_400_000
+    # 一条三年前的旧事，一条昨天的琐事
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="医疗", object="拔过智齿", owner=me, confidence=0.9,
+        source_chunks=[cid]))
+    M.remember(db, "dafeiyu", M.Fact(
+        predicate="工作", object="昨天加班到十点", owner=me, confidence=0.9,
+        source_chunks=[cid]))
+    import sqlite3 as _sq
+
+    c = _sq.connect(db)
+    c.execute("UPDATE facts SET created_at=?, updated_at=? WHERE object='拔过智齿'",
+              (now - 3 * 365 * DAY, now - 3 * 365 * DAY))
+    # 让"加班"这条是昨天刚用过的（久远感只来自时间，不来自使用）
+    c.execute("UPDATE facts SET last_used_at=? WHERE object='昨天加班到十点'",
+              (now - 1 * DAY,))
+    c.commit()
+    c.close()
+
+    # ① 带了相关问题：旧事该被相关性顶上来，即使它更老
+    got = M.facts_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER,
+                             limit=1, pinned_limit=0, question="我最近牙疼")
+    check("问牙疼 → 捞到三年前拔智齿", "智齿" in got, got)
+    check("问牙疼 → 不塞无关的加班", "加班" not in got, got)
+
+    # ② 不带问题：按取用分数排，不按 id
+    got2 = M.facts_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER,
+                              limit=2, pinned_limit=0)
+    check("无问题 → 两条都进", "智齿" in got2 and "加班" in got2, got2)
+
+    # ③ 用过之后 use_count 涨了
+    row = {f["object"]: f for f in
+           M.list_facts(db, "dafeiyu", query="智齿")["items"]}["拔过智齿"]
+    check("被注入过的事实记了使用次数", row["useCount"] >= 1, str(row["useCount"]))
+    check("记了上次使用时间", row["lastUsedAt"] > 0, str(row["lastUsedAt"]))
+
+    # ④ 三年前那次使用 → 分数明显低于昨天用过的
+    old = dict(row, lastUsedAt=now - 3 * 365 * DAY)
+    new = dict(row, lastUsedAt=now - 1 * DAY)
+    check("久没用过的分数更低",
+          M._fact_score(old, now) < M._fact_score(new, now),
+          f"{M._fact_score(old, now):.3f} vs {M._fact_score(new, now):.3f}")
+    # 但不会归零 —— 降权不是删除
+    check("久没用过也不会归零", M._fact_score(old, now) > 0,
+          str(M._fact_score(old, now)))
+
+    # ⑤ 从没用过的按"全新鲜"算，不会一起沉底
+    fresh = dict(row, lastUsedAt=0, useCount=0, confidence=0.9)
+    check("从没用过 = 不折旧", abs(M._fact_score(fresh, now) - 0.9) < 1e-6,
+          str(M._fact_score(fresh, now)))
+
+    # ⑥ 相关性用同一套分词
+    #
+    # ⚠ 这里只能测**字面共词**。分词器不做同义词扩展 ——
+    #   「牙疼」和「拔过智齿」一个字都不共，相关性就是 0，
+    #   要它们关联起来得靠别的机制（同一条事实、或画像）。
+    #   一开始我按"牙疼应该命中智齿"写了断言，那是错的：
+    #   分词器没那么聪明，硬要它聪明就得接语义模型，那是另一个量级的成本。
+    check("相关性：牙疼 命中 拔牙",
+          M._relevance({"predicate": "医疗", "object": "去年拔过牙"}, "我最近牙疼") > 0)
+    check("相关性：牙疼 不命中 智齿（无共词）",
+          M._relevance({"predicate": "医疗", "object": "拔过智齿"}, "我最近牙疼") == 0)
+    check("相关性：无关问题给 0",
+          M._relevance({"predicate": "医疗", "object": "拔过牙"}, "今天天气不错") == 0)
+    check("相关性：空问题给 0",
+          M._relevance({"predicate": "医疗", "object": "拔过牙"}, "") == 0)
+
+    # ⑦ 置顶必进，即使不相关
+    fid = [f["id"] for f in M.list_facts(db, "dafeiyu", query="加班")["items"]][0]
+    M.pin_fact(db, "dafeiyu", fid, pinned=True)
+    got3 = M.facts_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER,
+                              limit=1, pinned_limit=1, question="我最近牙疼")
+    check("置顶的即使不相关也进", "加班" in got3, got3)
+
+    # ⑧ mark_used 空输入安全
+    check("mark_used 空输入返回 0", M.mark_used(db, "dafeiyu", []) == 0)
+
+
+def t_profile(tmp: str) -> None:
+    section("v6 画像：把几百条事实压成一段话")
+    db = os.path.join(tmp, "prof.sqlite3")
+    M.ensure_schema(db)
+    use_db(db)
+    me = M.owner_of_private("prof-user")
+    M.ensure_owner(db, "dafeiyu", me, display_name="老王", tier=M.TIER_OWNER)
+    cid = seed_source("wechat:prof", "一些事")
+
+    # 事实太少：不该归纳
+    M.remember(db, "dafeiyu", M.Fact(predicate="饮食", object="爱吃辣",
+                                     owner=me, source_chunks=[cid]))
+    check("只有 1 条事实时不归纳", M.should_refresh_profile(db, "dafeiyu", me) is False)
+
+    for p, o in [("爱好", "养了只猫"), ("职业", "做设计"), ("作息", "经常熬夜")]:
+        M.remember(db, "dafeiyu", M.Fact(predicate=p, object=o,
+                                         owner=me, source_chunks=[cid]))
+    check("事实够了就归纳", M.should_refresh_profile(db, "dafeiyu", me) is True)
+
+    calls = {"n": 0}
+
+    def fake(system: str, user: str) -> str:
+        calls["n"] += 1
+        # 提示词里必须带事实，且不许出现别人的
+        check("画像提示词带事实", "爱吃辣" in user, user[:80])
+        return "```\n老王是做设计的，爱吃辣，养了只猫，最近经常熬夜。\n```"
+
+    r = M.refresh_profile(db, "dafeiyu", me, fake, name="老王")
+    check("归纳成功", r.get("ok"), str(r))
+    check("剥掉了 markdown 围栏", "```" not in (M.get_profile(db, "dafeiyu", me)["text"]),
+          M.get_profile(db, "dafeiyu", me)["text"][:40])
+    check("记下了用了多少条事实", r.get("fromFacts") == 4, str(r.get("fromFacts")))
+
+    txt = M.profiles_for_prompt(db, "dafeiyu", owner=me)
+    check("画像能注入", "做设计" in txt, txt)
+    check("注入有长度上限", len(txt) <= M.PROFILE_MAX_CHARS, str(len(txt)))
+
+    # 归纳完不该马上又提示要归纳
+    check("刚归纳完不重复归纳", M.should_refresh_profile(db, "dafeiyu", me) is False)
+
+    # 否决：注入立刻为空，但画像还在
+    ok, err = M.set_profile_enabled(db, "dafeiyu", me, False)
+    check("能停用", ok, err)
+    check("停用后不注入", M.profiles_for_prompt(db, "dafeiyu", owner=me) == "")
+    check("停用后画像仍留着", bool(M.get_profile(db, "dafeiyu", me)["text"]))
+
+    # ⚠ 关键：重新归纳不能把"停用"改回"启用"
+    M.refresh_profile(db, "dafeiyu", me, fake, name="老王")
+    check("重新归纳不会偷偷恢复启用",
+          M.get_profile(db, "dafeiyu", me)["enabled"] is False,
+          str(M.get_profile(db, "dafeiyu", me)["enabled"]))
+    check("停用状态下仍然不注入", M.profiles_for_prompt(db, "dafeiyu", owner=me) == "")
+
+    ok, err = M.set_profile_enabled(db, "dafeiyu", me, True)
+    check("能恢复", ok, err)
+    check("恢复后又能注入", "做设计" in M.profiles_for_prompt(db, "dafeiyu", owner=me))
+
+    # 别人的画像不能串
+    other = M.owner_of_private("prof-other")
+    check("别人的画像为空", M.profiles_for_prompt(db, "dafeiyu", owner=other) == "")
+
+    # 印象页要同时给出 手写评语 与 画像
+    M.set_impression(db, "dafeiyu", me, "我眼里的他")
+    board = {p["owner"]: p for p in M.impression_board(db, "dafeiyu")["people"]}
+    check("印象页带画像", "做设计" in (board[me]["profile"] or ""), board[me]["profile"][:40])
+    check("印象页带手写评语", board[me]["note"] == "我眼里的他", board[me]["note"])
+    check("两者分开给", board[me]["note"] != board[me]["profile"])
+
+
 def main() -> int:
     print("=" * 66)
     print("记忆层自检")
@@ -968,6 +1124,8 @@ def main() -> int:
         t_dual_write(tmp)
         t_open_info(tmp)
         t_impression(tmp)
+        t_retrieval_strategy(tmp)
+        t_profile(tmp)
         t_health(tmp)
         t_cli(tmp)
     finally:

@@ -1224,11 +1224,16 @@ async function loadFacts(offset) {
       // 真的会外传时给个明显标记
       const openTag = (f.openable && !dead) ?
         '<span class="health-tag ok">会外传</span>' : '';
+      // 用过几次（v6）：说明这条是不是她真的在用。
+      // 0 次不显示 —— 大多数条目都是 0，全都标出来等于噪音。
+      const useTag = (!dead && (f.useCount || 0) > 0) ?
+        '<span class="memory-time" title="被带进提示词的次数">用过 ' +
+        f.useCount + ' 次</span>' : '';
       return '<div class="memory-item' + (dead ? ' is-dead' : '') + '">' +
         '<div class="memory-body"><div class="memory-meta">' +
         '<span class="memory-role">' + esc(f.anchor || '她') + '</span>' +
         '<span class="memory-time">' + esc(f.predicate) + '</span>' + conf + replaced +
-        visBadge + pinBadge + ownerTag + originTag + openTag + topicSel +
+        visBadge + pinBadge + ownerTag + originTag + openTag + useTag + topicSel +
         '<span class="memory-time">' + esc(f.createdText || '') + '</span>' + del +
         '</div><div class="memory-text">' + esc(f.object) + '</div></div></div>';
     }).join('');
@@ -1659,8 +1664,15 @@ function renderImprPanes() {
     '<div class="card-head"><h2>' + esc(p.name || p.owner) +
     (p.isOwner ? ' <span class="health-tag ok">主人</span>' : '') + '</h2>' +
     '<span class="tag">' + p.facts + ' 条认识 / ' + p.private + ' 条私密</span></div>' +
+
+    // ── 她的画像（v6）──
+    //
+    // 这是她**自己**从事实归纳的一段话，每轮都会带进提示词。
+    // 和下面「你手写的评语」区别：那段她看不见，这段她天天在用。
+    buildProfileBlock(p) +
+
     '<div class="field full" style="margin-bottom:16px">' +
-    '<label>你怎么看这段关系（手写，模型不参与）</label>' +
+    '<label>你怎么看这段关系（手写，模型不参与，她也不看）</label>' +
     '<textarea id="imprNote" rows="3" placeholder="比如：话不多，但每次说饿都是真的饿了">' +
     esc(p.note || '') + '</textarea>' +
     '<div class="path-row" style="margin-top:8px">' +
@@ -1675,6 +1687,49 @@ function renderImprPanes() {
     '</div>' +
     '<div class="open-list">' + openRows + '</div>' +
     '</div>';
+}
+
+function buildProfileBlock(p) {
+  const on = p.profileEnabled !== false;
+  const has = !!(p.profile || '').trim();
+  const head =
+    '<div class="card-head" style="margin-top:6px">' +
+    '<h2>她的画像</h2>' +
+    '<span class="tag' + (on ? ' ok' : ' warn') + '">' +
+    (has ? (on ? '在用' : '已停用') : '还没生成') + '</span></div>';
+
+  const desc =
+    '<div class="card-desc" style="margin-bottom:10px">' +
+    '这是她<b>自己</b>从上面那些认识里归纳的一段话，每一轮对话都会带上。' +
+    '刷新会重新归纳（要调一次模型）。觉得哪里不对就停用 —— ' +
+    '停用后她不再按这段理解你，但这段话还留着，将来还能重新生成。' +
+    '</div>';
+
+  const body = has
+    ? '<div class="profile-text' + (on ? '' : ' is-off') + '">' +
+      esc(p.profile).replace(/\n/g, '<br>') + '</div>'
+    : '<div class="empty" style="padding:14px 0"><p>' +
+      (p.facts >= 3
+        ? '认识够了，点「重新归纳」让她写一段'
+        : '认识太少，先多聊几句（至少 3 条认识）') + '</p></div>';
+
+  const meta = (has && p.profileUpdatedAt)
+    ? '<div class="memory-time" style="margin-top:8px">更新于 ' +
+      esc(new Date(p.profileUpdatedAt).toLocaleString('zh-CN')) +
+      '｜基于 ' + (p.profileFactsAt || 0) + ' 条认识</div>'
+    : '';
+
+  const btns =
+    '<div class="path-row" style="margin-top:10px">' +
+    '<button class="btn btn-primary btn-sm" data-profile-refresh="' +
+    esc(p.owner) + '">重新归纳</button>' +
+    (has ? '<button class="btn btn-sm" data-profile-toggle="' + esc(p.owner) +
+      '" data-to="' + (on ? '0' : '1') + '">' +
+      (on ? '停用这段画像' : '重新启用') + '</button>' : '') +
+    '<span class="memory-time" id="profileHint"></span>' +
+    '</div>';
+
+  return head + desc + body + meta + btns;
 }
 
 async function saveImprNote() {
@@ -1916,10 +1971,46 @@ bindPersonUI();
     }
     const rv = e.target.closest('[data-revoke]');
     if (rv) { revokeOpen(rv.dataset.revoke); return; }
+    const pr = e.target.closest('[data-profile-refresh]');
+    if (pr) { refreshProfile(pr.dataset.profileRefresh); return; }
+    const pt = e.target.closest('[data-profile-toggle]');
+    if (pt) { toggleProfile(pt.dataset.profileToggle, pt.dataset.to === '1'); return; }
     const save = e.target.closest('#btnSaveNote');
     if (save) saveImprNote();
   });
 })();
+
+/* ── 画像：重新归纳 / 停用 ──
+ *
+ * 归纳要调一次模型（2~10 秒），所以后端是后台线程，这里只等一个"已开始"。
+ * 过几秒自动重读一次 —— 比让用户手动点刷新友好，也不用做进度条。
+ */
+async function refreshProfile(owner) {
+  if (!S.bridge || !S.bridge.refresh_profile) return;
+  setText('#profileHint', '正在归纳…');
+  try {
+    const r = JSON.parse(await S.bridge.refresh_profile(owner));
+    if (!r.ok) { setText('#profileHint', r.error || '归纳失败'); return; }
+    // 模型调用要几秒，等一会儿再重读；读早了会看到旧内容
+    setTimeout(() => { loadImpression(); setText('#profileHint', ''); }, 9000);
+  } catch (e) { setText('#profileHint', '归纳失败'); }
+}
+
+async function toggleProfile(owner, enable) {
+  if (!S.bridge || !S.bridge.set_profile_enabled) return;
+  if (!enable) {
+    const NL = String.fromCharCode(10);
+    const ok = confirm('停用这段画像？' + NL + NL +
+      '她将不再按这段理解你 —— 但这段话还留着，随时能重新启用。');
+    if (!ok) return;
+  }
+  try {
+    const r = JSON.parse(await S.bridge.set_profile_enabled(owner, enable));
+    if (!r.ok) return toast(r.error || '操作失败');
+    toast(enable ? '已重新启用' : '已停用');
+    loadImpression();
+  } catch (e) { toast('操作失败'); }
+}
 
 /* ────────── 数据目录 ────────── */
 

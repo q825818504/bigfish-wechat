@@ -2091,3 +2091,30 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   font-weight: 400;
   font-style: italic;
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   v6：画像
+   ══════════════════════════════════════════════════════════════════ */
+
+/* 画像正文。
+   它和"你手写的评语"视觉上要区分开 —— 那段她看不见，这段她天天在用。
+   用左侧一道竖线表示"这是她说的"，而不是你写的。 */
+.profile-text {
+  font-size: 13px;
+  line-height: 1.85;
+  color: var(--text);
+  padding: 12px 14px;
+  border-left: 2px solid var(--accent);
+  background: var(--surface-2);
+  border-radius: 0 8px 8px 0;
+  overflow-wrap: anywhere;
+}
+/* 停用的画像：划一道灰线，表示"还在但不用了"。
+   不用 opacity 整体变淡 —— 那样看不清内容，用户就没法判断要不要重新启用。 */
+.profile-text.is-off {
+  border-left-color: var(--border);
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--border);
+  text-decoration-thickness: 1px;
+}

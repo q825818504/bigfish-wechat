@@ -60,8 +60,9 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 #   3  多 owner 隔离 + 行为习惯 + 置顶 + visibility
 #   4  person：跨平台同一个人
 #   5  origin（来源场景）+ topic（话题标签）+ 群聊双写 + 事实来源校验
+#   6  取用策略：last_used_at / use_count（事实）+ hit_count（原文）+ 画像层
 # 只在 migrate() 里推进，不靠文件名或 PRAGMA 之外的任何状态。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 老库（v1/v2/v3）没有这些列，migrate() 用 ALTER TABLE 补。
 # SQLite 的 ADD COLUMN 是常数时间，不影响已有行。
@@ -103,6 +104,33 @@ FACT_COLUMNS_V5: Tuple[Tuple[str, str], ...] = (
     ("origin", "TEXT NOT NULL DEFAULT ''"),
     ("topic", "TEXT NOT NULL DEFAULT ''"),
 )
+
+# v6：取用策略 —— 「记得」和「想得起来」是两件事。
+#
+# 背景（用户的原意）：硬盘多大记忆就多大，不压缩。这条一直成立。
+# 但存得住不等于用得上：提示词每轮只有那么大，几千条事实里能进去的就十几条。
+# 以前按 `id DESC` 取（= 最新的优先），于是**越老的事实越沉底，永远进不来**。
+# 三年后你说"我牙疼"，她想不起三年前你拔过智齿 —— 不是没存，是排序把它埋了。
+#
+#   last_used_at  这条事实上一次**被注入到提示词**的时间。注意不是"写入时间"、
+#                 也不是"被搜索到"，是**真的用上了**。用它算衰减：久未使用的降权。
+#   use_count     被用过多少次。高频使用的浮上来 —— 反复被验证有用。
+#
+# 为什么要记"用过"而不是"搜到"：搜到但没进提示词的，等于没起作用。
+# 记它会让分数虚高，而那些其实从没帮上忙的条目会一直霸着前排。
+FACT_COLUMNS_V6: Tuple[Tuple[str, str], ...] = (
+    ("last_used_at", "INTEGER NOT NULL DEFAULT 0"),
+    ("use_count", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+# 事实取用的衰减半衰期（天）。
+#
+# MaiBot 用的是 24 小时 —— 那是给闲聊机器人调的，一句话隔一天就该忘。
+# 我们要的是「三年后还认得你」，所以放到 90 天：
+#     三个月没用到 → 权重减半
+#     一年没用到   → 剩 1/16
+#     但它**不会消失**，只是排到后面去 —— 一旦被新的检索命中，立刻回升。
+FACT_HALF_LIFE_DAYS = 90.0
 
 # 话题白名单：**只有这些话题的 shared 事实才允许说给非主人听**。
 #
@@ -196,13 +224,17 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         person TEXT NOT NULL DEFAULT '',
         person_at_write TEXT NOT NULL DEFAULT '',
         origin TEXT NOT NULL DEFAULT '',
-        topic TEXT NOT NULL DEFAULT '')""",
+        topic TEXT NOT NULL DEFAULT '',
+        last_used_at INTEGER NOT NULL DEFAULT 0,
+        use_count INTEGER NOT NULL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS facts_bank_status ON facts(bank,status,id)",
     "CREATE INDEX IF NOT EXISTS facts_bank_anchor ON facts(bank,anchor,predicate)",
     "CREATE INDEX IF NOT EXISTS facts_owner ON facts(bank,owner,status,id)",
     "CREATE INDEX IF NOT EXISTS facts_vis ON facts(bank,visibility,status)",
     "CREATE INDEX IF NOT EXISTS facts_origin ON facts(bank,origin,status)",
     "CREATE INDEX IF NOT EXISTS facts_topic ON facts(bank,topic,visibility)",
+    # v6：按取用排序要走这个索引
+    "CREATE INDEX IF NOT EXISTS facts_used ON facts(bank,owner,status,last_used_at)",
     # 事实事件：记 → 改 → 忘，每一步都留痕。忘记不是删除。
     """CREATE TABLE IF NOT EXISTS fact_events (
         id INTEGER PRIMARY KEY, bank TEXT NOT NULL, fact INTEGER,
@@ -216,6 +248,18 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         bank TEXT NOT NULL, speaker TEXT NOT NULL DEFAULT '',
         token_count INTEGER NOT NULL DEFAULT 0,
         term_blob TEXT NOT NULL DEFAULT '')""",
+    # v6：原文片段被检索**用上**过几次。
+    #
+    # 为什么单独一张表而不是给 chunks 加列：
+    #   chunks 是权威层（vault 也写它），列越少越稳；而且 hit_count 是
+    #   **可重建的派生数据**（重建索引时归零也无所谓），混进权威层会被误当成事实。
+    #
+    # 为什么需要它：FTS5 的 bm25 只看词频，不看"这条以前有没有帮上过忙"。
+    #   同一段对话被问三次都命中的片段，比偶然命中一次的更该浮上来。
+    """CREATE TABLE IF NOT EXISTS chunk_hits (
+        chunk INTEGER PRIMARY KEY,
+        hits INTEGER NOT NULL DEFAULT 0,
+        last_hit INTEGER NOT NULL DEFAULT 0)""",
     # 反思水位：哪批消息已经被提炼过事实。
     """CREATE TABLE IF NOT EXISTS reflection_state (
         bank TEXT PRIMARY KEY, session TEXT NOT NULL DEFAULT '',
@@ -308,6 +352,33 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
     """CREATE TABLE IF NOT EXISTS impressions (
         bank TEXT NOT NULL, owner TEXT NOT NULL,
         note TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(bank, owner))""",
+
+    # ── v6：画像（她自己归纳的「这个人是什么样」）─────────────────────
+    #
+    # 为什么需要它：
+    #   事实层是**逐条**的。"爱吃辣""养了只猫""做设计"分开存，
+    #   几千条之后每轮只能进去十几条，剩下的等于不存在。
+    #   画像是**一段话**，900 字左右，把几百条事实压成"能整段带进提示词"的量。
+    #
+    # 它和 impressions 的区别（两张表，别混）：
+    #   impressions.note  你手写的评语。模型不许动。
+    #   profiles.text     她自己归纳的。你可以否决（enabled=0）。
+    #
+    # 为什么要 enabled 而不是直接删：
+    #   归纳是定期跑的，删了下次又生成。否决要留痕，让她知道"这段你不认"，
+    #   下次归纳时把被否的那部分当错误信号。删掉等于什么都不知道。
+    #
+    # facts_at / used_at：归纳时用掉了多少条事实、哪些。用来判断
+    #   "要不要重新归纳"（事实涨了 50 条就该重跑），以及出错时能倒查。
+    """CREATE TABLE IF NOT EXISTS profiles (
+        bank TEXT NOT NULL, owner TEXT NOT NULL,
+        text TEXT NOT NULL DEFAULT '',
+        facts_at INTEGER NOT NULL DEFAULT 0,
+        fact_ids TEXT NOT NULL DEFAULT '[]',
+        enabled INTEGER NOT NULL DEFAULT 1,
         created_at INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(bank, owner))""",
@@ -535,6 +606,9 @@ def _add_missing_columns(conn: sqlite3.Connection) -> None:
             if name not in existing:
                 conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
         for name, decl in FACT_COLUMNS_V5:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
+        for name, decl in FACT_COLUMNS_V6:
             if name not in existing:
                 conn.execute(f"ALTER TABLE facts ADD COLUMN {name} {decl}")
     existing_o = _columns(conn, "owners")
@@ -1078,6 +1152,28 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+#: SQL 表达式：拿当前毫秒时间。
+#: SQLite 的 unixepoch() 需要 3.38+；老版本退回 julianday 计算。
+_NOW_MS_SQL = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000.0) AS INTEGER)"
+
+#: 事实排序用的「取用分数」。SQL 表达式，与 _fresh_score() 同一套公式。
+#:
+#: 分数 = 置信度 × 衰减 + 使用加成
+#:
+#:   衰减  0.5 ** (距上次使用天数 / 90)     三个月没用 → 减半
+#:   加成  use_count × 0.03                 用得多的浮上来，但有上限
+#:
+#: ⚠ 两项都用 COALESCE 兜住：老库迁移后这两列是 0，0 的衰减算作 1（全新鲜），
+#:   不会因为"从没用过"而全体沉底。这一条很重要 —— 否则升级当天所有老条目
+#:   会一起掉到最后，用户会以为记忆全丢了。
+_FRESH_ORDER = (
+    "(COALESCE(confidence, 0.5) * "
+    "CASE WHEN COALESCE(last_used_at,0) = 0 THEN 1.0 ELSE "
+    f"POWER(0.5, (({_NOW_MS_SQL} - last_used_at) / 86400000.0) / {FACT_HALF_LIFE_DAYS}) END "
+    "+ COALESCE(use_count,0) * 0.03) DESC"
+)
+
+
 def _event(conn: sqlite3.Connection, bank: str, fact_id: Optional[int],
            kind: str, reason: str = "", payload: Optional[dict] = None) -> None:
     conn.execute(
@@ -1111,8 +1207,8 @@ _INSERT_FACT = (
     "INSERT INTO facts(bank,anchor,predicate,object,confidence,status,"
     "source_chunks,evidence,created_at,updated_at,note,"
     "owner,visibility,platform,pinned,person,person_at_write,"
-    "origin,topic) "
-    "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    "origin,topic,last_used_at,use_count) "
+    "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,0,0)")
 
 
 def _row_to_item(r: sqlite3.Row) -> Dict[str, Any]:
@@ -1140,6 +1236,8 @@ def _row_to_item(r: sqlite3.Row) -> Dict[str, Any]:
         "pinned": bool(r["pinned"]) if "pinned" in keys else False,
         "origin": (r["origin"] if "origin" in keys else "") or "",
         "topic": (r["topic"] if "topic" in keys else "") or "",
+        "lastUsedAt": int(r["last_used_at"] or 0) if "last_used_at" in keys else 0,
+        "useCount": int(r["use_count"] or 0) if "use_count" in keys else 0,
     }
 
 
@@ -1426,7 +1524,11 @@ def list_facts(path: str, bank: str, *, status: str = "", anchor: str = "",
         total = conn.execute(f"SELECT COUNT(*) FROM facts{clause}", params).fetchone()[0]
         rows = conn.execute(
             f"SELECT * FROM facts{clause} ORDER BY "
-            "pinned DESC, CASE status WHEN 'active' THEN 0 ELSE 1 END, id DESC "
+            "pinned DESC, CASE status WHEN 'active' THEN 0 ELSE 1 END, "
+            # v6：界面列表用「取用分数」，不用 id 倒序。
+            #   ⚠ 这个排序只是**给人看的顺序**，界面本来就要能看到全部，
+            #     所以这里不改任何可见范围，只改先看到谁。
+            + _FRESH_ORDER + " "
             "LIMIT ? OFFSET ?",
             params + [max(1, int(limit)), max(0, int(offset))]).fetchall()
         items = [_row_to_item(r) for r in rows]
@@ -1557,6 +1659,29 @@ def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
                           "role": r["role"], "text": r["text"], "time": int(r["t"] or 0),
                           "score": round(max(0.0, min(1.0, score)), 4)})
         cands.sort(key=lambda x: -x["score"])
+        # ── v6：把"以前帮上过忙"也算进去 ──
+        #
+        # bm25 只看词频，不看这段对话历史上有没有真的被用上过。
+        # 同一段被问三次都命中的片段，比偶然命中一次的更该浮上来 ——
+        # 尤其在这个"存了几十万条"的场景里，先验知识比单次匹配更可靠。
+        #
+        # 权重很小（最多 +0.15），只在分数接近时起作用。
+        # 调大就会出现"越用越用"的正反馈：老片段霸榜，新内容永远进不去。
+        hitmap = {}
+        try:
+            for r in conn.execute(
+                    f"SELECT chunk, hits FROM chunk_hits WHERE chunk IN ({marks})",
+                    ids).fetchall():
+                hitmap[int(r["chunk"])] = int(r["hits"] or 0)
+        except Exception:
+            hitmap = {}
+        if hitmap:
+            top = max(hitmap.values()) or 1
+            for c in cands:
+                h = hitmap.get(c["chunk"], 0)
+                if h:
+                    c["score"] = round(min(1.0, c["score"] + 0.15 * (h / top)), 4)
+            cands.sort(key=lambda x: -x["score"])
         picked = _mmr(cands, [None] * len(cands), len(cands))
         out, used = [], 0
         for c in picked:
@@ -1564,12 +1689,42 @@ def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
                 break
             out.append(c)
             used += len(c["text"])
+        # 记一次命中（只记真的进了返回集的那几条）
+        try:
+            _bump_chunk_hits(conn, [c["chunk"] for c in out])
+        except Exception:
+            pass
         return out[:limit]
     except Exception:
         return []
     finally:
         if conn is not None:
             conn.close()
+
+
+def _bump_chunk_hits(conn: sqlite3.Connection, chunk_ids: Sequence[int]) -> None:
+    """给一批片段记一次命中。
+
+    ⚠ 只记**真正进入了返回结果**的片段，不记候选池。
+      记候选会让"被搜到过"和"被用上过"混为一谈 —— 而这两件事的区别，
+      正是这套权重存在的理由。
+    """
+    ids = [int(c) for c in chunk_ids if str(c).strip()]
+    if not ids:
+        return
+    now = _now_ms()
+    for cid in ids:
+        try:
+            conn.execute(
+                "INSERT INTO chunk_hits(chunk,hits,last_hit) VALUES(?,1,?) "
+                "ON CONFLICT(chunk) DO UPDATE SET hits=hits+1, last_hit=excluded.last_hit",
+                (cid, now))
+        except Exception:
+            pass
+    try:
+        conn.commit()
+    except Exception:
+        pass
 
 
 def render_recall(items: List[Dict[str, Any]]) -> str:
@@ -1636,34 +1791,45 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
     #    tier 在这里唯一的作用是**决定要不要额外补开放信息**，
     #    它不能扩大可见范围。写成 list_facts(tier=tier) 的话，
     #    主人 tier 会把全库都捞进来 —— 那正是"跟 A 说话却带着 B 的秘密"。
+    #
+    # ② v6 取用策略：候选池放大到 limit 的 4 倍，再按"取用分数"（置信度 ×
+    #    时间衰减 + 使用次数）排序，最后用本轮问题挑出真正相关的。
+    #
+    #    为什么不能直接 list_facts(limit=N)：
+    #      以前 SQL 是 `ORDER BY pinned DESC, id DESC` —— 最新的在最前。
+    #      三年后你有 5000 条事实，每轮只看得到 id 最大的 8 条，
+    #      三年前那条"你拔过智齿"永远排在最后，永远进不来。
+    #      那不是"记得但想不起来"，那是**排序把它埋了**。
+    #
+    #    现在：先按"多久没被用到"排（久不用的降权，但不是删除），
+    #         再按相关性筛（本轮问的是牙，就优先牙相关的那几条）。
+    cand_n = max(24, (limit + pinned_limit) * 4)
     pinned = list_facts(path, bank, status=ACTIVE, owner=owner,
                         tier=TIER_OWNER,          # 只为让 scope_filter 放行 owner 自己
                         also_owners=siblings,
-                        limit=max(1, pinned_limit)).get("items") or []
-    normal = list_facts(path, bank, status=ACTIVE, owner=owner,
-                        tier=TIER_OWNER,
-                        also_owners=siblings,
-                        limit=max(1, limit)).get("items") or []
+                        limit=cand_n).get("items") or []
     # 上面用 TIER_OWNER 只是为了让 scope_filter 的"我自己的全可见"生效；
     # 结果集里仍然可能夹带 visibility=shared 的别人的东西，
     # 所以下面还要按 owner 再收一刀。
     pinned = [i for i in pinned if i["owner"] in mine]
-    normal = [i for i in normal if i["owner"] in mine]
 
-    # ② 追加：全库的开放信息。
+    # ③ 从候选里挑：置顶必进 → 与问题相关的优先 → 剩下的按取用分数补足
+    picked = _pick_facts(pinned, question, limit=limit, pinned_limit=pinned_limit)
+
+    # ④ 追加：全库的开放信息。
     #    B 问「你主人爱吃啥」，靠的就是这一段 —— 开放信息存在主人名下，
     #    但此刻跟她说话的是 B，所以要按"公共资料"的身份补进来。
+    have = {i["id"] for i in picked}
     extra = []
     for o in _all_owners(path):
         for it in open_facts_for(path, bank, o, limit=200):
-            if it["id"] not in {x["id"] for x in pinned} and \
-               it["id"] not in {x["id"] for x in normal}:
+            if it["id"] not in have:
                 extra.append(it)
     extra.sort(key=lambda x: -float(x.get("confidence") or 0))
     extra = extra[:4]          # 开放信息是补充，不该挤掉"我自己的事"
 
     seen, lines = set(), []
-    for item in [i for i in pinned if i.get("pinned")] + normal + extra:
+    for item in picked + extra:
         fid = item.get("id")
         if fid in seen:
             continue
@@ -1688,7 +1854,125 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
             shared_mark = "（可以告诉别人）"
         lines.append(f"- {star}{who}｜{item['predicate']}：{item['object']}"
                      f"{mark}{where}{shared_mark}")
+
+    # ⑤ 记一次"用上了"。
+    #    注意记的是**真的进了提示词**的那几条，不是候选池 ——
+    #    候选里没被选中的那些，这一轮没起作用，不该加分。
+    #    失败不影响这一轮：记不上最多是下次排序差一点，不能让聊天失败。
+    try:
+        mark_used(path, bank, [i["id"] for i in picked] + [i["id"] for i in extra])
+    except Exception:
+        pass
     return "\n".join(lines)
+
+
+def _fact_score(item: Dict[str, Any], now: int) -> float:
+    """一条事实的「取用分数」。与 SQL 里的 _FRESH_ORDER 同一套公式。
+
+    ⚠ 两处必须一致。改一处不改另一处，界面看到的顺序会和注入用的顺序对不上 ——
+      那种不一致最难查，因为两边看起来都"正常"。
+    """
+    conf = float(item.get("confidence") or 0.5)
+    used = int(item.get("lastUsedAt") or 0)
+    if used <= 0:
+        decay = 1.0                      # 从没用过 = 不算陈旧（见 _FRESH_ORDER 注释）
+    else:
+        days = max(0.0, (now - used) / 86_400_000.0)
+        decay = 0.5 ** (days / FACT_HALF_DAYS_EFFECTIVE)
+    return conf * decay + int(item.get("useCount") or 0) * 0.03
+
+
+#: _fact_score 里的半衰期。与 SQL 常数同一来源，只是这边要 float。
+FACT_HALF_DAYS_EFFECTIVE = FACT_HALF_LIFE_DAYS
+
+
+def _relevance(item: Dict[str, Any], question: str) -> int:
+    """这条事实和本轮问题有多相关。0 = 完全不相干。
+
+    只用本地词表匹配，不调模型 —— 每轮都跑，必须是 O(关键词数)。
+    用 memory.terms() 切词（与检索同一套），避免"牙疼"和"牙"切不出关系。
+    """
+    q = (question or "").strip()
+    if not q:
+        return 0
+    qterms = set(terms(q))
+    if not qterms:
+        return 0
+    body = f"{item.get('predicate') or ''} {item.get('object') or ''}"
+    hit = qterms & set(terms(body))
+    return len(hit)
+
+
+def _pick_facts(items: List[Dict[str, Any]], question: str, *,
+                limit: int, pinned_limit: int) -> List[Dict[str, Any]]:
+    """从候选里挑出这一轮该注入的事实。
+
+    三段式，顺序固定：
+
+        ① 置顶的**必进**（最多 pinned_limit 条）
+           —— 你手动钉住的东西，不该被任何算法挤掉。
+        ② 和本轮问题相关的，按相关度 + 取用分数排
+           —— 你说"我牙疼"，三年前"拔过智齿"该浮上来。
+        ③ 剩下的位置，按取用分数补足
+           —— 保持她"平时知道些什么"的连续性，不是每轮都换一批全新的。
+
+    ⚠ 相关性只在**有 question 时**才算。私聊闲聊问"在吗"时 qterms 很少，
+      ② 基本是空，于是全走 ③ —— 行为和以前一样，不会突然变。
+    """
+    now = _now_ms()
+    pinned = [i for i in items if i.get("pinned")][:max(0, int(pinned_limit))]
+    rest = [i for i in items if not i.get("pinned")]
+    # 取用分数：相关性当主序，分数当次序。
+    # 相关性只在"这一条真的和问题有交集"时才有意义，为 0 的不参与 ②。
+    scored = []
+    for i in rest:
+        rel = _relevance(i, question)
+        score = _fact_score(i, now)
+        scored.append((rel, score, i))
+    related = [(r, s, i) for r, s, i in scored if r > 0]
+    related.sort(key=lambda x: (-x[0], -x[1]))
+    others = [(r, s, i) for r, s, i in scored if r == 0]
+    others.sort(key=lambda x: -x[1])
+
+    out: List[Dict[str, Any]] = list(pinned)
+    have = {i["id"] for i in out}
+    for _r, _s, i in related + others:
+        if len(out) >= max(1, int(limit)) + len(pinned):
+            break
+        if i["id"] in have:
+            continue
+        have.add(i["id"])
+        out.append(i)
+    return out
+
+
+def mark_used(path: str, bank: str, fact_ids: Sequence[int]) -> int:
+    """把一批事实标记为"这一轮用上了"：last_used_at=now, use_count+1。
+
+    为什么单独一个函数、还要允许失败：
+      这是**排序的输入**，不是事实本身。记不上最多是下次排序差一点，
+      绝不能让"记这一次使用"把整轮对话搞崩。
+    """
+    ids = [int(x) for x in fact_ids if str(x).strip()]
+    if not ids:
+        return 0
+    try:
+        conn = connect(path)
+    except Exception:
+        return 0
+    try:
+        now = _now_ms()
+        marks = ",".join("?" * len(ids))
+        with conn:
+            conn.execute(
+                f"UPDATE facts SET last_used_at=?, use_count=COALESCE(use_count,0)+1 "
+                f"WHERE bank=? AND id IN ({marks})",
+                (now, bank, *ids))
+        return len(ids)
+    except Exception:
+        return 0
+    finally:
+        conn.close()
 
 
 def _all_owners(path: str) -> List[str]:
@@ -1840,6 +2124,239 @@ def pool_summary(path: str, bank: str, *, main_owner: str = "") -> Dict[str, Any
         conn.close()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 画像：她自己归纳的「这个人是什么样」
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 为什么需要这一层（这是 v6 的核心）：
+#
+#   事实层是**逐条**的。"爱吃辣""养了只猫""做设计"分开存。聊得越久越多，
+#   几千条之后每轮只进得去十几条 —— 剩下的等于不存在。
+#
+#   画像是**一段话**，900 字左右，把几百条事实压成"能整段带进提示词"的量。
+#   于是她每轮都完整地知道自己面前这个人是谁，而不是随机抽十几条片段。
+#
+# 这和"压缩"不是一回事：
+#   压缩 = 丢信息。画像**不替代**任何事实 —— 事实一条不少地还在，
+#   检索照样能翻到原话。画像是**多出来的一份概述**，和事实并存。
+#   所以它不违背"硬盘多大记忆就多大"：硬盘上是一份完整 + 一份概述，
+#   而不是完整被换成了概述。
+#
+# 谁生成：模型。谁否决：你。画像是她的判断，但你可以说"这段不对"。
+
+PROFILE_MAX_CHARS = 900
+
+PROFILE_SYSTEM = """你在帮一个角色写「关于面前这个人，我现在知道什么」。
+
+只输出一段话，不要 JSON、不要标题、不要分条、不要 markdown。
+
+要求：
+1. 只用下面给出的「已知事实」，不许补充任何没写的东西。
+2. 用一段连贯的话写，像在心里过一遍这个人，不要罗列。
+3. 先写最稳的（身份、长期习惯、性格），再写最近的（近况、心情）。
+4. 事实之间有矛盾的（比如改过口），以**后面的**为准，不要两边都写。
+5. 不超过 400 字。写不下就挑重要的，宁可短。
+6. 不要写"主人说""根据记忆"这类元信息，直接写这个人是什么样。
+7. 不确定的加"好像"，但不要滥用 —— 大部分事实是明确的。
+"""
+
+
+def _profile_prompt(items: List[Dict[str, Any]], name: str) -> str:
+    lines = []
+    for i, it in enumerate(items, 1):
+        who = it.get("anchor") or "他"
+        lines.append(f"[{i}] {who}｜{it['predicate']}：{it['object']}"
+                     f"（确认度 {int(round(float(it.get('confidence') or 0) * 100))}%）")
+    return (f"这个人叫：{name or '（不知道名字）'}\n\n"
+            "已知事实：\n" + "\n".join(lines))
+
+
+def get_profile(path: str, bank: str, owner: str) -> Dict[str, Any]:
+    """读一个人的画像。没有就返回空。"""
+    if not (path and os.path.isfile(path) and owner):
+        return {"owner": owner, "text": "", "enabled": True, "factsAt": 0}
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return {"owner": owner, "text": "", "enabled": True, "factsAt": 0}
+    try:
+        row = conn.execute(
+            "SELECT * FROM profiles WHERE bank=? AND owner=?",
+            (bank, owner)).fetchone()
+        if row is None:
+            return {"owner": owner, "text": "", "enabled": True, "factsAt": 0}
+        return {
+            "owner": owner, "text": row["text"] or "",
+            "enabled": bool(row["enabled"]),
+            "factsAt": int(row["facts_at"] or 0),
+            "updatedAt": int(row["updated_at"] or 0),
+        }
+    except Exception:
+        return {"owner": owner, "text": "", "enabled": True, "factsAt": 0}
+    finally:
+        conn.close()
+
+
+def profiles_for_prompt(path: str, bank: str, *, owner: str) -> str:
+    """把画像渲染成注入段。
+
+    ⚠ 前置条件写死在这里：
+      1. 画像必须 enabled —— 你否决过的，一个字都不注入。
+      2. 只注入**当前这个人**的画像，不注入别人的。
+         别人的画像里必然带着别人的私事，那正是 v5 立起来的那道墙。
+    """
+    if not owner:
+        return ""
+    p = get_profile(path, bank, owner)
+    if not p.get("text") or not p.get("enabled"):
+        return ""
+    return p["text"].strip()[:PROFILE_MAX_CHARS]
+
+
+def should_refresh_profile(path: str, bank: str, owner: str, *,
+                           min_growth: int = 40) -> bool:
+    """该不该重新归纳画像。
+
+    两个条件满足任一：
+      · 从没归纳过
+      · 上次归纳之后，这个人的 active 事实又涨了 min_growth 条
+
+    为什么不用"每隔 N 小时"：聊得少的人永远不该重算（浪费 token），
+    聊得多的人一小时就能涨 40 条。按增长量算才是对的尺子。
+    """
+    if not owner:
+        return False
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return False
+    try:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM facts WHERE bank=? AND owner=? AND status='active'",
+            (bank, owner)).fetchone()[0]
+        row = conn.execute(
+            "SELECT facts_at FROM profiles WHERE bank=? AND owner=?",
+            (bank, owner)).fetchone()
+        if row is None:
+            return int(cur) >= 3      # 少于 3 条事实不必写画像
+        return int(cur) - int(row["facts_at"] or 0) >= min_growth
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def refresh_profile(path: str, bank: str, owner: str, call_model,
+                    *, name: str = "", limit: int = 300,
+                    now: Optional[int] = None) -> Dict[str, Any]:
+    """重新归纳一个人的画像。
+
+    `call_model(system, user) -> str` 由调用方注入，和 reflect 一样 ——
+    这一层不碰网络。
+
+    归纳只读**这个人自己的** active 事实，不碰别人的。
+    最多取 limit 条（默认 300），按取用分数排 —— 常用的、重要的先入画。
+    """
+    if not (path and os.path.isfile(path) and owner):
+        return {"ok": False, "error": "缺少路径或 owner"}
+    now = now or _now_ms()
+    try:
+        conn = connect(path, read_only=True)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM facts WHERE bank=? AND owner=? AND status='active' "
+            f"ORDER BY pinned DESC, {_FRESH_ORDER} LIMIT ?",
+            (bank, owner, max(10, int(limit)))).fetchall()
+        items = [_row_to_item(r) for r in rows]
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+    if not items:
+        return {"ok": True, "skipped": True, "reason": "没有事实可归纳"}
+    try:
+        raw = call_model(PROFILE_SYSTEM, _profile_prompt(items, name))
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+    text = (raw or "").strip()
+    # 模型爱包 markdown / 加标题，剥掉
+    text = re.sub(r"^```[A-Za-z0-9_-]*\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+    if not text:
+        return {"ok": False, "error": "模型返回空"}
+    text = text[:PROFILE_MAX_CHARS]
+    ok = save_profile(path, bank, owner, text,
+                      fact_ids=[i["id"] for i in items], now=now)
+    return {"ok": ok[0], "error": ok[1], "chars": len(text),
+            "fromFacts": len(items)}
+
+
+def save_profile(path: str, bank: str, owner: str, text: str, *,
+                 fact_ids: Sequence[int] = (), now: Optional[int] = None
+                 ) -> Tuple[bool, str]:
+    """写入画像。
+
+    ⚠ `enabled` 不在这里改 —— 重新归纳不该顺手把"你否决过"变成"没否决"。
+      否则你否决一次，下次刷新又活了，否决就成了摆设。
+      要恢复必须显式调 set_profile_enabled(True)。
+    """
+    if not owner:
+        return False, "owner 为空"
+    now = now or _now_ms()
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            old = conn.execute(
+                "SELECT created_at, enabled FROM profiles WHERE bank=? AND owner=?",
+                (bank, owner)).fetchone()
+            created = int(old["created_at"]) if old else now
+            enabled = int(old["enabled"]) if old else 1
+            conn.execute(
+                "INSERT INTO profiles(bank,owner,text,facts_at,fact_ids,enabled,"
+                "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(bank,owner) DO UPDATE SET "
+                "text=excluded.text, facts_at=excluded.facts_at, "
+                "fact_ids=excluded.fact_ids, updated_at=excluded.updated_at",
+                (bank, owner, (text or "")[:PROFILE_MAX_CHARS],
+                 len(fact_ids), json.dumps(list(fact_ids)[:400]), enabled,
+                 created, now))
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
+def set_profile_enabled(path: str, bank: str, owner: str,
+                        enabled: bool) -> Tuple[bool, str]:
+    """启 / 停用画像。停用 = 她不再按这段画像理解你，但画像本身留着。
+
+    为什么不是删：删了下次归纳又生成，你的否决等于没说过。
+      留着并置 enabled=0，她才知道"这段你不认"，也才有据可查。
+    """
+    try:
+        conn = connect(path)
+    except Exception as exc:
+        return False, str(exc)
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE profiles SET enabled=?, updated_at=? WHERE bank=? AND owner=?",
+                (1 if enabled else 0, _now_ms(), bank, owner))
+        if not cur.rowcount:
+            return False, "还没有画像"
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        conn.close()
+
+
 def impression_board(path: str, bank: str) -> Dict[str, Any]:
     """「角色印象」页的数据：每个人一格，格子里是她的评语 + 开放信息清单。
 
@@ -1853,6 +2370,13 @@ def impression_board(path: str, bank: str) -> Dict[str, Any]:
 
     note：印象评语。存在 owners 表旁边的一张表里（见印象表 DDL），
     没有就返回空串，UI 显示输入框。
+
+    profile（v6）：她自己归纳的**画像**。和 note 是两回事：
+
+        note     你手写的评语，模型不参与，她也不看（只是存着给你自己）
+        profile  她从事实归纳的概述，**会注入提示词**，你不认可以否决
+
+    两个都返回，界面上分两栏显示，一眼能看出"她以为的"和"你以为的"差在哪。
     """
     out: Dict[str, Any] = {"people": []}
     if not (path and os.path.isfile(path)):
@@ -1864,6 +2388,10 @@ def impression_board(path: str, bank: str) -> Dict[str, Any]:
     try:
         rows = conn.execute(
             "SELECT * FROM owners ORDER BY last_seen DESC").fetchall()
+        # owners 表里没有、但有事实的（reflect 直接写过、没走 ensure_owner），
+        # 也要出现在印象页 —— 否则"她记住了这个人，但你翻不到他的画像"。
+        known = {r["owner"] for r in rows}
+        loose = [o for o in _all_owners(path) if o not in known]
         people = []
         for r in rows:
             owner = r["owner"]
@@ -1875,6 +2403,7 @@ def impression_board(path: str, bank: str) -> Dict[str, Any]:
                 note = (nr["note"] if nr else "") or ""
             except Exception:
                 note = ""
+            prof = get_profile(path, bank, owner)
             opens = open_facts_for(path, bank, owner, limit=60)
             total = 0
             priv = 0
@@ -1890,13 +2419,35 @@ def impression_board(path: str, bank: str) -> Dict[str, Any]:
                 pass
             people.append({
                 "owner": owner,
-                "name": r["display_name"] or r["external_id"] or owner,
+                "name": r["display_name"] or r["external_id"] or owner.rsplit(":", 1)[-1],
                 "kind": r["kind"], "tier": r["tier"] or TIER_GUEST,
                 "note": note,
+                "profile": prof.get("text") or "",
+                "profileEnabled": bool(prof.get("enabled", True)),
+                "profileFactsAt": int(prof.get("factsAt") or 0),
+                "profileUpdatedAt": int(prof.get("updatedAt") or 0),
                 "open": [{"id": it["id"], "topic": it["topic"],
                           "predicate": it["predicate"], "object": it["object"],
                           "visibility": it["visibility"]} for it in opens],
                 "facts": int(total), "private": int(priv),
+            })
+        for owner in loose:
+            prof = get_profile(path, bank, owner)
+            try:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM facts WHERE bank=? AND owner=? "
+                    "AND status='active'", (bank, owner)).fetchone()[0]
+            except Exception:
+                total = 0
+            people.append({
+                "owner": owner, "name": owner.rsplit(":", 1)[-1],
+                "kind": "group" if owner.startswith("group:") else "private",
+                "tier": TIER_GUEST, "note": "",
+                "profile": prof.get("text") or "",
+                "profileEnabled": bool(prof.get("enabled", True)),
+                "profileFactsAt": int(prof.get("factsAt") or 0),
+                "profileUpdatedAt": int(prof.get("updatedAt") or 0),
+                "open": [], "facts": int(total), "private": int(total),
             })
         out["people"] = people
         return out
