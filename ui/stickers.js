@@ -95,7 +95,7 @@ function stickerSrc(path) {
   return 'file:///' + encodeURI(String(path).replace(/\\/g, '/'));
 }
 
-function fmtBytes(n) {
+function stickerBytes(n) {
   if (!n) return '—';
   if (n < 1024) return n + ' B';
   if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
@@ -144,7 +144,7 @@ function openStickerDetail(code) {
   $('#stickerDetailImg').src = stickerSrc(it.path);
   setText('#stickerDetailCode', it.code);
   setText('#stickerDetailFile', it.file);
-  setText('#stickerDetailSize', fmtBytes(it.size));
+  setText('#stickerDetailSize', stickerBytes(it.size));
   setText('#stickerDetailFrames', String(it.frames || 1) + ' 帧');
 
   $('#stickerDetailBrief').value = it.brief || '';

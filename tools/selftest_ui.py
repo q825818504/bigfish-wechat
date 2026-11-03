@@ -205,6 +205,35 @@ for _gone in ("stickerEnabled", "stickerRate", "stickerCooldown", "stickerMode")
     expect("stickers", f"没有 #{_gone}", f"!!document.querySelector('#{_gone}')",
            lambda v: v is False, "开关和频率在插件页，不在这里")
 
+# ── 表情包：脚本真的执行了吗 ──
+#
+# ⚠ 这一组是补的，起因是一个很难查的 bug（2026-11-03）：
+#   stickers.js 里定义了 `fmtBytes`，而 app.js 里已经有一个
+#   `const fmtBytes`。重复声明是 SyntaxError，会让**整个文件后半段
+#   不执行** —— 但页面其它部分照常显示，只有按钮点了没反应。
+#
+#   所以不能只验"元素在不在"，要验"函数在不在、点了有没有效果"。
+expect("stickers", "脚本已执行(函数存在)",
+       "typeof openStickerAdd === 'function' && typeof openModal === 'function'",
+       lambda v: v is True, "按钮绑定的函数必须真的定义了")
+expect("stickers", "点添加能弹窗", """(() => {
+  try {
+    openStickerAdd();
+    const m = document.getElementById('stickerAddModal');
+    const open = m && m.classList.contains('is-open');
+    if (m) m.classList.remove('is-open');
+    return open;
+  } catch (e) { return 'EXC: ' + e.message; }
+})()""",
+       lambda v: v is True, "点了要能打开弹窗")
+# 注意：runJavaScript 拿不到 async 函数的 Promise 结果，所以这里
+# 只验槽位有没有注册（同步可判）。真正的调用在 ui_console.py 里验。
+expect("stickers", "后端槽位已注册",
+       "typeof (window.S && S.bridge && S.bridge.sticker_list) === 'function'"
+       " && typeof S.bridge.sticker_open_dir === 'function'"
+       " && typeof S.bridge.sticker_add === 'function'",
+       lambda v: v is True, "槽位要挂在 bridge 上")
+
 # ── 设置 ──
 expect("settings", "接口地址", "document.querySelector('#cfgEndpoint').value",
        lambda v: v.strip() != "", "要回填")

@@ -1,44 +1,28 @@
-修打包后找不到界面：__file__ 是相对路径
+修按钮没反应：fmtBytes 重名导致整个脚本不执行
 
-用户打开新 exe 报：
-    无法访问您的文件
-    ERR_FILE_NOT_FOUND
+用户截图：表情包页出来了，但「打开目录」「添加表情」点了没反应。
 
-根因不是文件丢了，是路径算错了。
+根因：
+    stickers.js 里定义了 function fmtBytes(n)
+    app.js 里已经有 const fmtBytes = (n) => {...}
 
-PyInstaller 打进去的模块，__file__ 可能是**相对路径**
-（形如 "bigfish/desktop.py"）。于是
+重复声明是 SyntaxError，**整个 stickers.js 后半段不执行**。
 
-    os.path.dirname(os.path.abspath(__file__))
+表现很坑：
+    · 页面照常显示（HTML 静态内容 + 前半段的函数提升还在）
+    · 只有按钮没反应（事件绑定在文件末尾，根本没跑到）
+    · 浏览器控制台报错，但 exe 没有控制台，用户看不到
 
-会按**当前工作目录**解析 —— 算出来的位置取决于用户从哪儿启动 exe，
-和 exe 在哪儿没关系。
+改名 stickerBytes。
 
-实测：从 dist/BigFish 启动时恰好算对（所以之前的打包版能用），
-换个目录启动就指向 <安装目录>/ui，而界面在 <安装目录>/_internal/ui。
+补两个防复发的东西：
 
-同一个隐患还藏在五个地方，其中两个更严重：
-    vault.install_root()   数据目录会跟着启动位置跑
-    watcher.WATERMARK_FILE 水位文件同理
-    wechat_sender/wechat/bridge_client  的 vendor 路径
-    replier 的 config.json 路径
+① tools/ui_console.py —— 用 QWebEngineView 加载真实界面，
+   把所有 console 消息（含未捕获异常）打出来，然后模拟点击。
+   这次就是靠它一眼看到 "Identifier 'fmtBytes' has already been declared"。
 
-新建 bigfish/paths.py 统一算：
-    app_root()  程序所在目录（data/、config.json 这些用户可见的）
-    res_root()  资源根（ui/、bridge/、vendor/，打包后是 sys._MEIPASS）
-它不 import 任何 bigfish 子模块，不会被循环拖累。
-
-六个文件全部改用 paths，不再自己拼 __file__。
-
-另外给 --selftest 加了「界面资源」一项：
-检查 index.html 真的在 UI_DIR 里、大小正常、bridge.mjs 在。
-这项错了以前只表现成 Chromium 的 ERR_FILE_NOT_FOUND，
-一个字都不提路径 —— 加进自检就不用再靠猜。
-
-验证（从 D:\大脑\_launchtest 启动，故意换个工作目录）：
-    [OK] 界面资源
-         UI_DIR=...\dist\BigFish\_internal\ui（59518 字节）
-    [OK] 数据根
-    通过 14 / 失败 1（UIA 需要管理员，正常）
-
-数据目录也确认建在 dist/BigFish/data，没跑到启动目录旁边。
+② selftest_ui 加三项：
+   · 脚本已执行（typeof openStickerAdd === 'function'）
+   · 点添加能弹窗（真的调一次，看 modal 有没有 is-open）
+   · 后端槽位已注册
+   光验"元素在不在"不够 —— 元素在但事件没绑，表现和"元素不在"完全不同。
