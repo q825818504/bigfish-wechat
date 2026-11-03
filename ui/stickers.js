@@ -334,19 +334,51 @@ document.addEventListener('keydown', (e) => {
   if (open) open.classList.remove('is-open');
 });
 
-/* ────────── 拖放 ────────── */
+/* ────────── 拖放 ──────────
+   ══════════════════════════════════════════════════════════════════
+
+   主路径是 Python 侧：bigfish/dropcatch.py 拦 QEvent.Drop，
+   从 QMimeData 拿路径，再调这里的 window.__onDropFiles(paths)。
+
+   为什么不靠 HTML5 的 dataTransfer.files：
+     · QWebEngineView 默认 acceptDrops=False，系统层面就拒了，
+       页面里的 dragover 根本收不到（鼠标显示禁止图标）
+     · 就算收到，QtWebEngine 的 File 对象也没有 path 属性 ——
+       拿不到路径就没法转 GIF
+
+   下面那套 dragenter/dragover 只负责**视觉反馈**（虚线框高亮），
+   真正拿到文件靠的是 __onDropFiles。两条都留着：
+   Python 侧万一没装上，用户至少还能看到框亮了然后失败，
+   而不是完全没反应。
+
+   ══════════════════════════════════════════════════════════════════ */
+
+// Python 侧拖放落点
+window.__onDropFiles = function (paths) {
+  const modal = document.getElementById('stickerAddModal');
+  if (!modal || !modal.classList.contains('is-open')) return;   // 不在添加页就忽略
+  if (!Array.isArray(paths) || !paths.length) return;
+
+  const zone = document.getElementById('stickerDropZone');
+  if (zone) zone.classList.remove('is-hot');
+
+  addPending(paths);
+  toast(`拖进来 ${paths.length} 张`);
+};
 
 (function bindStickerDrop() {
   const zone = $('#stickerDropZone');
   if (!zone) return;
 
-  // 整个窗口都接受拖放，不只是那个虚线框 —— 用户拖过来时
-  // 鼠标经常落在框外，只认框内会让人以为"拖不进来"
+  const inModal = () => {
+    const m = document.getElementById('stickerAddModal');
+    return m && m.classList.contains('is-open');
+  };
   const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
 
   ['dragenter', 'dragover'].forEach((ev) => {
     window.addEventListener(ev, (e) => {
-      if (!document.getElementById('stickerAddModal')?.classList.contains('is-open')) return;
+      if (!inModal()) return;
       stop(e);
       zone.classList.add('is-hot');
     });
@@ -356,22 +388,18 @@ document.addEventListener('keydown', (e) => {
     if (e.relatedTarget === null) zone.classList.remove('is-hot');
   });
 
+  // 兜底：万一 Python 侧没拦住，这里试一次 HTML5 的路径
   window.addEventListener('drop', (e) => {
-    if (!document.getElementById('stickerAddModal')?.classList.contains('is-open')) return;
+    if (!inModal()) return;
     stop(e);
     zone.classList.remove('is-hot');
 
     const files = [...(e.dataTransfer?.files || [])];
-    if (!files.length) {
-      toast('没识别到文件');
-      return;
-    }
-    // QtWebEngine 的 File 对象带 path（Chromium 标准没有这个属性）
     const paths = files.map((f) => f.path).filter(Boolean);
-    if (!paths.length) {
+    if (paths.length) {
+      addPending(paths);
+    } else if (files.length) {
       toast('拿不到文件路径，请用「浏览…」按钮');
-      return;
     }
-    addPending(paths);
   });
 })();

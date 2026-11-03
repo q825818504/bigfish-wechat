@@ -2255,7 +2255,7 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
-    @Slot(str, result=str)
+    @Slot(result=str)
     def list_owners(self) -> str:
         """列出所有出现过的人（owner）与等级。界面用来确认"谁是主人"。"""
         try:
@@ -2944,7 +2944,7 @@ class Backend(QObject):
             return json.dumps({"ok": False, "error": str(exc)},
                               ensure_ascii=False)
 
-    @Slot(str, result=str)
+    @Slot(result=str)
     def sticker_pick_files(self) -> str:
         """原生多选对话框。返回路径列表，不导入 —— 导入由前端调 sticker_add。
 
@@ -3398,6 +3398,24 @@ class MainWindow(QMainWindow):
 
         self.view = QWebEngineView(self)
         self.setCentralWidget(self.view)
+
+        # 拖放：QWebEngineView 默认 acceptDrops=False，系统层面就拒了，
+        # 页面里的 dragover 根本收不到（鼠标显示禁止图标）。
+        # 而且就算收到，HTML5 的 File 对象在 QtWebEngine 里也没有 path
+        # 属性 —— 拿不到路径就没法转 GIF。
+        # 所以改成 Python 侧拦 Drop，把路径数组丢给页面。
+        self.drop_catcher = None
+        try:
+            from bigfish.dropcatch import DropCatcher
+
+            self.drop_catcher = DropCatcher(self.view, self)
+            self.drop_catcher.install()
+            # ⚠ 页面加载前，view 的渲染子控件还没建出来，只装得上两三个。
+            #   加载完再装一次 —— 真正接收鼠标事件的是那层渲染控件。
+            self.view.loadFinished.connect(
+                lambda _ok: self.drop_catcher.install())
+        except Exception as exc:
+            print(f"[drop] 装载失败：{exc}", file=sys.stderr, flush=True)
 
         self.channel = QWebChannel(self.view.page())
         self.backend = Backend(self)

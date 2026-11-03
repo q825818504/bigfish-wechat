@@ -1,28 +1,55 @@
-修按钮没反应：fmtBytes 重名导致整个脚本不执行
+修拖拽和「浏览…」：一个被 Qt 拦住，一个签名写错
 
-用户截图：表情包页出来了，但「打开目录」「添加表情」点了没反应。
+用户反馈：添加表情弹窗出来了，但拖拽显示禁止图标、点「浏览…」没反应。
 
-根因：
-    stickers.js 里定义了 function fmtBytes(n)
-    app.js 里已经有 const fmtBytes = (n) => {...}
+── ① 「浏览…」：@Slot 签名写错 ──
 
-重复声明是 SyntaxError，**整个 stickers.js 后半段不执行**。
+    @Slot(str, result=str)
+    def sticker_pick_files(self) -> str:      # ← 方法没有参数
 
-表现很坑：
-    · 页面照常显示（HTML 静态内容 + 前半段的函数提升还在）
-    · 只有按钮没反应（事件绑定在文件末尾，根本没跑到）
-    · 浏览器控制台报错，但 exe 没有控制台，用户看不到
+Qt 按声明找 `sticker_pick_files(str)`，Python 里没有，调用静默失败。
+前端 await 拿到 undefined，JSON.parse 抛错被 async 吞掉，
+用户看到的就是"点了没反应"。
 
-改名 stickerBytes。
+这是**第二次**犯同一个错（上次是 list_memory_sessions）。
+所以加了 tools/check_slots.py：静态比对 @Slot 声明的输入参数个数
+和 Python 方法的参数个数。跑一遍还揪出 list_owners 也是同样的错
+（那个是死代码，一并修了）。
 
-补两个防复发的东西：
+── ② 拖拽：QWebEngineView 默认 acceptDrops=False ──
 
-① tools/ui_console.py —— 用 QWebEngineView 加载真实界面，
-   把所有 console 消息（含未捕获异常）打出来，然后模拟点击。
-   这次就是靠它一眼看到 "Identifier 'fmtBytes' has already been declared"。
+两条路都不通：
+  · HTML5 dataTransfer.files 在 QtWebEngine 里没有 path 属性，
+    拿不到路径就没法转 GIF（path 是 Electron 扩展，Chromium 标准没有）
+  · QWebEngineView 是 QWidget 子类，acceptDrops 默认 False，
+    系统层面就拒了，页面里的 dragover 根本收不到 ——
+    所以鼠标显示的是禁止图标
 
-② selftest_ui 加三项：
-   · 脚本已执行（typeof openStickerAdd === 'function'）
-   · 点添加能弹窗（真的调一次，看 modal 有没有 is-open）
-   · 后端槽位已注册
-   光验"元素在不在"不够 —— 元素在但事件没绑，表现和"元素不在"完全不同。
+改成 Python 侧拦 QEvent.Drop（bigfish/dropcatch.py），
+从 QMimeData 拿 urls()，再用 runJavaScript 把路径数组丢给页面。
+页面实现 window.__onDropFiles(paths) 接收。
+
+两个细节：
+  · 装到 view 的整棵子树。实测加载前只找得到 2 个控件，
+    加载后是 392 个 —— 真正接收鼠标事件的是渲染层那一个。
+    所以 loadFinished 后再装一次（install 做成幂等）。
+  · 路径用 json.dumps 传，不手拼字符串。
+    实测中文 + 反斜杠都完整保住。
+
+前端的 dragenter/dragover 保留，但只负责虚线框高亮 ——
+Python 侧万一没装上，用户至少能看到框亮了然后失败，
+而不是完全没反应。
+
+新增 tools/ui_console.py：用 QWebEngineView 加载真实界面，
+把 console 消息全打出来 + 模拟点击。上一个 fmtBytes 重名就是靠它查到的。
+
+测试：
+  check_slots           无问题（新）
+  check_method_calls    无问题
+  selftest_ui           全通过
+  selftest_sticker      40/40
+  selftest_vault        148/148
+  selftest_engine_fixes 60/60
+  test_no_leak          30/30
+  test_persona_parity   18/18
+  selftest_plugins      89/89
