@@ -161,26 +161,49 @@ for _gone in ("scopeWorkspace", "scopeSessions", "scopeMode"):
     expect("data", f"没有 #{_gone}", f"!!document.querySelector('#{_gone}')",
            lambda v: v is False, "不该存在（越界读 DSH 会话库）")
 
-# ── 表情包 ──
-expect("stickers", "有开关", "!!document.querySelector('#stickerEnabled')",
-       lambda v: v is True, "总开关必须存在")
-expect("stickers", "默认关", "document.querySelector('#stickerEnabled').checked",
-       lambda v: v is False, "新装默认不发表情")
-expect("stickers", "有频率滑块", "!!document.querySelector('#stickerRate')",
-       lambda v: v is True, "频率可调")
-expect("stickers", "有冷却输入", "!!document.querySelector('#stickerCooldown')",
-       lambda v: v is True, "冷却可调")
-expect("stickers", "有两种挑选模式", """(() =>
-  document.querySelectorAll('#stickerMode option').length)()""",
-       lambda v: int(v) == 2, "ai / random")
-expect("stickers", "有导入按钮", "!!document.querySelector('#btnStickerImport')",
-       lambda v: v is True, "表情库要能加东西")
-expect("stickers", "有保存按钮", "!!document.querySelector('#btnStickerSave')",
-       lambda v: v is True, "配置要能落盘")
-expect("stickers", "路径已填", "document.querySelector('#stickerDirPath').textContent",
-       lambda v: v.strip() not in ("", "—"), "要显示盘上位置")
-expect("stickers", "空库有提示", "document.querySelector('#stickerList').textContent",
+# ── 表情包（2026-11-03 重构：这一页只做库） ──
+# 开关和频率搬去了插件页，这里只剩「她手里有什么」。
+expect("stickers", "有添加按钮", "!!document.querySelector('#btnStickerAdd')",
+       lambda v: v is True, "库要能加东西")
+expect("stickers", "有打开目录", "!!document.querySelector('#btnStickerOpenDir')",
+       lambda v: v is True, "要能直接去磁盘看")
+expect("stickers", "有库容器", "!!document.querySelector('#stickerList')",
+       lambda v: v is True, "网格容器存在")
+expect("stickers", "库有提示", "document.querySelector('#stickerList').textContent",
        lambda v: len(v.strip()) > 0, "空的时候也要说话")
+# 插件关着时这一页其实进不去（会被踢回插件页），所以只验元素存在。
+# 「有几张」的内容检查放到下面插件开着的那组里。
+expect("stickers", "有数量标签", "!!document.querySelector('#stickerCount')",
+       lambda v: v is True, "顶部要有个地方显示张数")
+# 关键设计：表情包是插件，侧边栏那一项要跟着开关走。
+# 断言的是**两者一致**，不是"一定隐藏" —— 插件开着时它就该出现。
+expect("stickers", "导航跟随插件开关", """(() => {
+  const nav = document.querySelector('.nav-item[data-page="stickers"]');
+  if (!nav) return 'no-nav';
+  const on = !!(window.S && S.plugEnabled && S.plugEnabled.sticker);
+  return nav.hidden === !on ? 'ok' : ('mismatch on=' + on + ' hidden=' + nav.hidden);
+})()""",
+       lambda v: v == "ok", "插件开着才显示，关着就消失")
+# 添加弹窗
+expect("stickers", "有添加弹窗", "!!document.querySelector('#stickerAddModal')",
+       lambda v: v is True, "弹窗要存在")
+expect("stickers", "有拖放区", "!!document.querySelector('#stickerDropZone')",
+       lambda v: v is True, "要能拖进来")
+expect("stickers", "有浏览按钮", "!!document.querySelector('#btnStickerBrowse')",
+       lambda v: v is True, "也要能选文件")
+expect("stickers", "有自动备注开关", "!!document.querySelector('#stickerAutoDesc')",
+       lambda v: v is True, "导入时让模型写说明")
+# 详情弹窗
+expect("stickers", "有详情弹窗", "!!document.querySelector('#stickerDetailModal')",
+       lambda v: v is True, "双击要看详情")
+expect("stickers", "详情有概览输入", "!!document.querySelector('#stickerDetailBrief')",
+       lambda v: v is True, "概览可改")
+expect("stickers", "详情有详细输入", "!!document.querySelector('#stickerDetailDesc')",
+       lambda v: v is True, "详细可改")
+# 关键：这一页不该再有开关/频率（它们属于插件页）
+for _gone in ("stickerEnabled", "stickerRate", "stickerCooldown", "stickerMode"):
+    expect("stickers", f"没有 #{_gone}", f"!!document.querySelector('#{_gone}')",
+           lambda v: v is False, "开关和频率在插件页，不在这里")
 
 # ── 设置 ──
 expect("settings", "接口地址", "document.querySelector('#cfgEndpoint').value",

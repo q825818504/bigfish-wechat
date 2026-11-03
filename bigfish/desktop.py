@@ -362,6 +362,43 @@ class EngineWorker(QThread):
     def _log(self, text: str, kind: str = "") -> None:
         self.log.emit(text, kind)
 
+    def _learn_sticker(self, msg, body: str) -> None:
+        """主人纠正表情用法时，改那张表情的备注。
+
+        **只在真的在说表情时才动**：should_learn 做关键词粗筛，
+        不命中就直接返回，连磁盘都不读。
+
+        为什么不做成异步：
+          放后台的话，她这一轮已经用旧理解生成回复了，下一轮才改过来。
+          用户会觉得"我说了你怎么还不改"。而粗筛之后绝大多数消息
+          根本走不到这里，同步的代价可以接受。
+
+        失败只记日志 —— 学不会不该影响这一轮聊天。
+        """
+        try:
+            from bigfish.plugins import sticker as _st
+
+            if not _st.should_learn({"user_text": body,
+                                     "chat_id": msg.chat_id}):
+                return
+            res = _st.learn({"user_text": body,
+                             "chat_id": msg.chat_id,
+                             "chat_name": msg.chat_name})
+        except Exception as exc:
+            self._log(f"[学习] 判断失败：{exc}", "err")
+            return
+
+        if not res.get("learned"):
+            why = res.get("why") or ""
+            if why and why != "没听出在说表情":
+                self._log(f"[学习] 没学：{why}", "think")
+            return
+
+        code = res.get("code") or ""
+        brief = res.get("brief") or ""
+        self._log(f"[学习] 记住了 {code}"
+                  f"{('：' + brief) if brief else ''}", "in")
+
     # ==================================================================
     # 表情包
     # ==================================================================
@@ -370,18 +407,24 @@ class EngineWorker(QThread):
 
         三层判断，任何一层否决就安静地不发：
 
-          ① 总开关关着 / 冷却中 / 本轮概率没中
+          ① 插件开着 / 冷却中 / 本轮概率没中
           ② 插件（scope=sticker）给出的选择
           ③ 文件真能发（存在、格式对、尺寸没超）
 
         为什么冷却放在这么前面：表情包的杀伤力在于稀缺。
         每句都发就成了噪音，用户会把它关掉，然后这个功能等于没有。
-        """
-        from bigfish import vault
 
-        cfg = vault.read_sticker_config()
-        if not cfg.get("enabled"):
+        ⚠ 配置从 2026-11-03 起住在**插件**里，不再是独立的
+          sticker-config.json。理由：开关和参数属于「她要不要发、
+          多久发一次」这类行为决策，和「库里有哪些图」是两件事。
+          前者归插件页，后者归表情包页。
+        """
+        from bigfish import plugins as _plugins
+
+        _plugins.ensure_loaded()
+        if not _plugins.is_enabled("sticker"):
             return ""
+        cfg = _plugins.config_of("sticker")
 
         # ---- 冷却 ----
         now = time.time()
@@ -869,6 +912,16 @@ class EngineWorker(QThread):
             if _silent:
                 self._log(f"[静默] {msg.chat_name}：{_why}", "think")
                 return
+
+            # ── 表情包学习：主人纠正用法时，改那张表情的备注 ──
+            #
+            # 放在生成回复**之前**，而且同步做。
+            #
+            # 为什么同步：如果放后台，她这一轮已经在用旧的（错的）理解了，
+            # 下一轮才改过来 —— 用户会觉得"我说了你怎么还不改"。
+            # 而 should_learn 已经做了关键词粗筛，绝大多数消息走不到这里，
+            # 只有真的在说表情时才会多花 1~2 秒。
+            self._learn_sticker(msg, body)
 
             # ---- 组装上下文 ----
             ctx = load_context(query=body or "")
@@ -2811,122 +2864,189 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
-    # ── 表情包 ──
+    # ── 表情库 ──
     #
-    # 这是「她手里有什么」的唯一入口。三个动作：看、调、增删。
-    # 刻意不提供「去网上抓表情」—— 表情包的版权和来源都不可控，
-    # 用户自己放什么进来，她就发什么。
+    # 2026-11-03 重构：这一页只做**库**，不再管开关和频率。
+    #
+    #   表情包页  →  她手里有什么（浏览、添加、编辑备注、删除）
+    #   插件页    →  她要不要发、多久发一次、怎么挑
+    #
+    # 分开的理由：前者是素材，后者是行为。混在一起时用户想"关掉表情"
+    # 得先找到表情包页，而插件页明明已经有一个开关了 —— 两个开关
+    # 控制同一件事，迟早互相打脸。
+    #
+    # 库层的活（转 GIF、编号、描述）全在 bigfish/stickers.py，
+    # 这里只做「给界面用」的适配。
+
     @Slot(result=str)
     def sticker_list(self) -> str:
-        """表情库 + 当前配置。一次拿全，界面不用点两次。"""
+        """表情库全量。界面一次拿全，不用点两次。"""
         try:
-            from bigfish import vault
+            from bigfish import plugins as _plugins
+            from bigfish import stickers
 
-            root = vault.resolve_data_root()
-            cfg = vault.read_sticker_config(root)
-            items = vault.list_stickers(root)
-            usage = vault.sticker_usage("")
+            _plugins.ensure_loaded()
+            items = stickers.list_stickers()
+            usage = stickers.read_usage("")
             return json.dumps({
                 "ok": True,
-                "config": cfg,
                 "items": items,
-                "dir": vault.sticker_dir(root),
+                "dir": stickers.sticker_dir(),
                 "last": (usage.get("_last") if isinstance(usage, dict) else None),
+                # 插件状态一起给，界面顶部要显示"当前能不能发"
+                "enabled": _plugins.is_enabled("sticker"),
+                "count": len(items),
             }, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-
-    @Slot(str, result=str)
-    def sticker_save_config(self, patch_json: str) -> str:
-        try:
-            from bigfish import vault
-
-            patch = json.loads(patch_json or "{}")
-            ok, err = vault.write_sticker_config(
-                patch if isinstance(patch, dict) else {})
-            return json.dumps({"ok": ok, "error": err},
+            return json.dumps({"ok": False, "error": str(exc)},
                               ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
     @Slot(str, result=str)
-    def sticker_import(self, start: str) -> str:
-        """选图片 → 拷进表情库。多选，一次能放一堆。"""
+    def sticker_add(self, paths_json: str) -> str:
+        """把一批文件收进库。
+
+        界面那边可能是「浏览…」选的，也可能是拖进来的，都走这里。
+        每张都会：转 GIF → 分配代码 → 落盘。
+        """
         try:
-            from PySide6.QtWidgets import QFileDialog
+            from bigfish import stickers
 
-            from bigfish import vault
-
-            files, _ = QFileDialog.getOpenFileNames(
-                self.window, "选择表情（.gif 才会被微信认成原生表情）",
-                start or "",
-                "表情图片 (*.gif *.png *.jpg *.jpeg *.webp *.bmp);;"
-                "GIF 表情 (*.gif);;所有文件 (*.*)")
-            if not files:
-                return json.dumps({"ok": True, "added": []}, ensure_ascii=False)
+            paths = json.loads(paths_json or "[]")
+            if not isinstance(paths, list):
+                return json.dumps({"ok": False, "error": "参数不对"},
+                                  ensure_ascii=False)
             added, failed = [], []
-            for f in files:
-                ok, res = vault.import_sticker(f)
+            for p in paths:
+                ok, res, item = stickers.import_sticker(str(p))
                 if ok:
-                    added.append(res)
+                    added.append(item)
                 else:
-                    failed.append({"file": os.path.basename(f), "why": res})
+                    failed.append({"file": os.path.basename(str(p)),
+                                   "why": res})
             return json.dumps({"ok": True, "added": added, "failed": failed},
                               ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
-
-    @Slot(str, str, result=str)
-    def sticker_set_desc(self, name: str, desc: str) -> str:
-        try:
-            from bigfish import vault
-
-            ok, err = vault.write_sticker_desc(name, desc)
-            return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
-        except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     @Slot(str, result=str)
-    def sticker_delete(self, name: str) -> str:
-        try:
-            from bigfish import vault
+    def sticker_pick_files(self) -> str:
+        """原生多选对话框。返回路径列表，不导入 —— 导入由前端调 sticker_add。
 
-            ok, err = vault.delete_sticker(name)
+        为什么不在这里直接导：用户可能想先看看选了哪些、去掉几张。
+        分两步，界面才有机会显示"这 8 张里我只要 6 张"。
+        """
+        try:
+            from PySide6.QtWidgets import QFileDialog
+
+            files, _ = QFileDialog.getOpenFileNames(
+                self.window, "选择表情（任意格式，导入时统一转 GIF）",
+                "",
+                "图片 (*.gif *.png *.jpg *.jpeg *.webp *.bmp *.ico);;"
+                "GIF 表情 (*.gif);;所有文件 (*.*)")
+            return json.dumps({"ok": True, "paths": files or []},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def sticker_autodesc(self, codes_json: str) -> str:
+        """让模型给这几张表情写备注。返回每张的 brief/detail/tags。
+
+        ⚠ 同步阻塞：每张约 1~2 秒。界面那边要显示进度，
+          一次别传太多（超过 20 张就该分批）。
+        """
+        try:
+            from bigfish import sticker_desc, stickers
+
+            codes = json.loads(codes_json or "[]")
+            if not isinstance(codes, list):
+                return json.dumps({"ok": False, "error": "参数不对"},
+                                  ensure_ascii=False)
+            out = []
+            for code in codes:
+                item = stickers.get_sticker(str(code))
+                if not item:
+                    out.append({"code": code, "ok": False,
+                                "error": "没有这张表情"})
+                    continue
+                res = sticker_desc.describe(item["path"])
+                if res.get("ok"):
+                    stickers.update_sticker(
+                        str(code),
+                        brief=res.get("brief") or "",
+                        detail=res.get("detail") or "",
+                        tags=res.get("tags") or [],
+                        auto=True)
+                    out.append({"code": code, "ok": True,
+                                "brief": res.get("brief") or "",
+                                "detail": res.get("detail") or ""})
+                else:
+                    out.append({"code": code, "ok": False,
+                                "error": res.get("error") or "模型没给内容"})
+            return json.dumps({"ok": True, "results": out},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, str, str, result=str)
+    def sticker_update(self, code: str, brief: str, detail: str) -> str:
+        """改一张表情的概览和详细。"""
+        try:
+            from bigfish import stickers
+
+            ok, err = stickers.update_sticker(
+                code, brief=brief, detail=detail, auto=False)
             return json.dumps({"ok": ok, "error": err}, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def sticker_delete(self, code: str) -> str:
+        try:
+            from bigfish import stickers
+
+            ok, note = stickers.delete_sticker(code)
+            return json.dumps({"ok": ok, "note": note, "error": ""},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     @Slot(result=str)
     def sticker_open_dir(self) -> str:
         try:
-            from bigfish import vault
+            from bigfish import stickers
 
-            d = vault.sticker_dir()
-            os.makedirs(d, exist_ok=True)
+            d = stickers.ensure_dir()
             if sys.platform == "win32":
                 os.startfile(d)  # noqa: S606
             return json.dumps({"ok": True, "path": d}, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     @Slot(str, result=str)
-    def sticker_test_send(self, name: str) -> str:
+    def sticker_test_send(self, code: str) -> str:
         """把一张表情发到「文件传输助手」，验证通道通不通。
 
         ⚠ 会真的写微信、真的抢焦点。这是唯一能让用户自己验证
           「这台机器上她到底能不能发表情」的办法，所以保留。
         """
         try:
-            from bigfish import vault
+            from bigfish import stickers
             from bigfish.wechat_sender import SendError, UiaSender
 
-            path = os.path.join(vault.sticker_dir(), name)
-            if not os.path.isfile(path):
-                return json.dumps({"ok": False, "error": f"找不到：{name}"},
+            item = stickers.get_sticker(code)
+            if not item:
+                return json.dumps({"ok": False, "error": f"找不到：{code}"},
                                   ensure_ascii=False)
             s = UiaSender()
             s.wake()
-            r = s.send_media("文件传输助手", path)
+            r = s.send_media("文件传输助手", item["path"])
             return json.dumps({"ok": bool(r.ok),
                                "error": "" if r.ok else r.detail},
                               ensure_ascii=False)

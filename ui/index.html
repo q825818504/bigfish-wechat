@@ -799,69 +799,26 @@
 
         <div class="card">
           <div class="card-head">
-            <h2>发不发</h2>
-            <span class="tag" id="stickerStateTag">—</span>
-          </div>
-          <div class="card-desc" style="margin-bottom:14px">
-            默认是关的。打开之后，她会在情绪到位的时候，说完话再跟一张。<br>
-            <b>只发 .gif</b> 才能被微信认成原生表情（对方可以长按添加、会动）；
-            其他格式会发成普通图片。
-          </div>
-          <div class="form">
-            <div class="field full">
-              <label class="switch-row">
-                <input type="checkbox" id="stickerEnabled">
-                <span>让她能发表情包</span>
-              </label>
-              <small>关着的时候，这个功能完全不参与，连日志都不会有。</small>
-            </div>
-            <div class="form-grid">
-              <div class="field">
-                <label>多频繁</label>
-                <div class="range-row">
-                  <input type="range" id="stickerRate" min="0" max="100" step="5">
-                  <span class="range-val" id="stickerRateVal">—</span>
-                </div>
-                <small>每一轮回复有多大概率考虑配一张。15% 大约十句一张。</small>
-              </div>
-              <div class="field">
-                <label>同一个会话隔多久</label>
-                <div class="input-suffix">
-                  <input type="number" id="stickerCooldown" min="0" max="3600" step="30">
-                  <span>秒</span>
-                </div>
-                <small>刚发过就不会再发。密度太高会被当成刷屏。</small>
-              </div>
-              <div class="field full">
-                <label>怎么挑</label>
-                <select id="stickerMode">
-                  <option value="ai">看这句话的意思挑（慢一点，但搭）</option>
-                  <option value="random">随便挑一张（快，常不搭）</option>
-                </select>
-                <small>「看意思」会额外调一次模型判断该不该发、发哪张。</small>
-              </div>
-            </div>
-          </div>
-          <div class="memory-toolbar" style="margin-top:14px">
-            <button class="btn btn-primary" id="btnStickerSave">保存</button>
-          </div>
-        </div>
-
-        <div class="card" style="margin-top:16px">
-          <div class="card-head">
-            <h2>她的表情库</h2>
+            <h2>表情库</h2>
             <div class="card-actions">
-              <button class="btn btn-sm" id="btnStickerImport">导入…</button>
-              <button class="btn btn-sm" id="btnStickerRefresh">刷新</button>
+              <button class="btn btn-sm" id="btnStickerOpenDir">打开目录</button>
+              <button class="btn btn-sm btn-primary" id="btnStickerAdd">添加表情</button>
             </div>
           </div>
           <div class="card-desc" style="margin-bottom:12px">
-            放在 <code id="stickerDirPath">stickers\</code> 里。
-            每个文件可以写一句话说明 —— <b>她靠这句话判断该不该用</b>，
-            没写的话只能靠文件名猜。
+            任意格式的图片都可以放进来 —— 导入时统一转成 <b>GIF</b>，
+            因为只有 .gif 会被微信认成原生表情（对方能长按添加、会动）。<br>
+            <b>双击</b>一张表情可以看完整说明。
           </div>
           <div id="stickerList" class="sticker-grid">
-            <div class="empty-hint">还没有表情。</div>
+            <div class="empty-hint">还没有表情。点右上角「添加表情」放几张进来。</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px" id="stickerHintCard">
+          <div class="card-desc" style="margin:0">
+            发表情的开关和频率在 <a href="#" data-goto="plugins" style="color:var(--accent)">插件</a> 页的「表情包」里 ——
+            这一页只管她手里有哪些牌，不管什么时候出。
           </div>
         </div>
       </section>
@@ -1229,7 +1186,92 @@
 
     </main>
   </div>
+
+
+
 </div>
+
+    <!-- ══ 添加表情弹窗 ══ -->
+    <div class="modal" id="stickerAddModal">
+      <div class="modal-box">
+        <div class="modal-head">
+          <h2>添加表情</h2>
+          <button class="modal-x" data-close="stickerAddModal">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="drop-zone" id="stickerDropZone">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5"/>
+              <path d="M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3"/>
+            </svg>
+            <p>把图片拖到这里</p>
+            <p class="drop-sub">支持 gif / png / jpg / webp / bmp，可一次拖多张</p>
+            <button class="btn btn-sm" id="btnStickerBrowse">或者浏览…</button>
+          </div>
+
+          <div class="pending-list" id="stickerPending" hidden>
+            <div class="pending-head">
+              <span id="stickerPendingCount">已选 0 张</span>
+              <button class="btn btn-sm" id="btnStickerClearPending">清空</button>
+            </div>
+            <div class="pending-grid" id="stickerPendingGrid"></div>
+          </div>
+
+          <label class="check-row">
+            <input type="checkbox" id="stickerAutoDesc" checked>
+            <span>
+              <b>让大肥鱼看一眼，自动写说明</b>
+              <small>她会描述画面内容和使用情景。每张约 1~2 秒，慢但值得 —— 没有说明她只能瞎挑。</small>
+            </span>
+          </label>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" data-close="stickerAddModal">取消</button>
+          <button class="btn btn-primary" id="btnStickerDoImport">开始导入</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══ 表情详情弹窗 ══ -->
+    <div class="modal" id="stickerDetailModal">
+      <div class="modal-box" style="max-width:560px">
+        <div class="modal-head">
+          <h2 id="stickerDetailTitle">—</h2>
+          <button class="modal-x" data-close="stickerDetailModal">×</button>
+        </div>
+        <div class="modal-body">
+          <div class="detail-top">
+            <div class="detail-thumb"><img id="stickerDetailImg" alt=""></div>
+            <div class="detail-meta">
+              <div class="detail-row"><span>代码</span><code id="stickerDetailCode">—</code></div>
+              <div class="detail-row"><span>文件</span><code id="stickerDetailFile">—</code></div>
+              <div class="detail-row"><span>大小</span><code id="stickerDetailSize">—</code></div>
+              <div class="detail-row"><span>帧数</span><code id="stickerDetailFrames">—</code></div>
+            </div>
+          </div>
+
+          <div class="field full">
+            <label>概览</label>
+            <input type="text" id="stickerDetailBrief" maxlength="12"
+                   placeholder="两个字，比如「生气」「害羞」">
+            <small>列表里显示这一句。也是她挑表情时唯一能看到的信息，所以要准。</small>
+          </div>
+
+          <div class="field full">
+            <label>详细说明</label>
+            <textarea id="stickerDetailDesc" rows="4" maxlength="200"
+                      placeholder="画面是什么样，什么情景适合发它"></textarea>
+            <small>只在你双击查看时显示。写清楚「对方说了什么话时可以用」对她最有用。</small>
+          </div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn" id="btnStickerDetailTest">发一条试试</button>
+          <span style="flex:1"></span>
+          <button class="btn" id="btnStickerDetailDelete" style="color:var(--error)">删除</button>
+          <button class="btn btn-primary" id="btnStickerDetailSave">保存</button>
+        </div>
+      </div>
+    </div>
 
 <div class="toast-wrap" id="toastWrap"></div>
 

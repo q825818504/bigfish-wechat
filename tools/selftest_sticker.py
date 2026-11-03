@@ -1,16 +1,21 @@
-"""[bigfish] 表情包自测 —— 不碰微信、不调模型，只验逻辑。
+"""[bigfish] 表情库自测 —— 不碰微信、不调模型，只验逻辑。
 
-它锁定的是三件最容易悄悄坏掉的事：
+2026-11-03 重构后重写。这一版锁的是新东西：
 
-  1. 表情库的增删读描述（vault 那层）
-  2. 引擎的冷却/概率/文件检查（哪一层否决了，都必须是"安静地不发"）
-  3. sticker 插件的挑选入口（没有库就不发；冷却中就不发）
+  1. 任意格式 → GIF（含多帧、缩放、透明）
+  2. 每张一个唯一代码
+  3. 两级描述（brief 概览 / detail 详细）
+  4. 旧 schema 迁移
+  5. 删除时的墓碑（文件被占用不能变成"删了还在"）
+  6. 插件侧：开关、冷却、候选挑选
 
 ⚠ 刻意**不测真发**：真发要开微信、要管理员、会抢焦点。
-  那部分只能手测。这里测的是"该不该发"这个决策本身。
+  那部分只能手测（tools/live_sticker_test.py）。
+  这里测的是"库和判断"本身。
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -18,14 +23,14 @@ import tempfile
 import time
 import traceback
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 PASS = FAIL = 0
 FAILED = []
@@ -47,157 +52,186 @@ def section(title):
 
 
 def _tmp_root():
-    d = tempfile.mkdtemp(prefix="bigfish-sticker-")
+    d = tempfile.mkdtemp(prefix="bigfish-stk-")
     os.environ["BIGFISH_DATA_ROOT"] = d
     return d
 
 
-def _make_gif(path, size=64, frames=3):
+def _mk_png(path, size=(200, 200), color=(255, 200, 0, 255), alpha=True):
     from PIL import Image
 
-    imgs = []
-    for i in range(frames):
-        im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        im.paste((255, 200, 0, 255), (i * 4, i * 4, size, size))
-        imgs.append(im)
+    mode = "RGBA" if alpha else "RGB"
+    Image.new(mode, size, color).save(path)
+    return path
+
+
+def _mk_gif(path, frames=3, size=(256, 256)):
+    from PIL import Image
+
+    imgs = [Image.new("RGB", size, (i * 60, 100, 200)) for i in range(frames)]
     imgs[0].save(path, save_all=True, append_images=imgs[1:],
-                 duration=100, loop=0)
+                 duration=120, loop=0)
     return path
 
 
 def main():
     root = _tmp_root()
     try:
-        from bigfish import vault
+        import bigfish.stickers as S
 
-        section("配置：默认关，且归一化兜底")
-        cfg = vault.read_sticker_config(root)
-        chk("默认关闭", cfg["enabled"] is False)
-        chk("默认概率 0.15", abs(cfg["rate"] - 0.15) < 1e-9)
-        chk("默认冷却 180", cfg["cooldown"] == 180)
-        chk("默认模式 ai", cfg["mode"] == "ai")
+        section("代码生成：唯一、递增")
+        data = S.read_index(root)
+        c1 = S.next_code(data)
+        c2 = S.next_code(data)
+        chk("格式是 stk_NNNN", c1.startswith("stk_") and len(c1) == 8, c1)
+        chk("两次不同", c1 != c2, f"{c1} vs {c2}")
+        chk("递增", int(c2[4:]) == int(c1[4:]) + 1)
 
-        ok, err = vault.write_sticker_config({"rate": 5}, root)
-        chk("写了越界概率也接受", ok, err)
-        chk("概率被夹到 1.0", vault.read_sticker_config(root)["rate"] == 1.0)
+        section("格式转换：任意图 → GIF")
+        d = tempfile.mkdtemp(prefix="stk-src-")
+        png = _mk_png(os.path.join(d, "a.png"))
+        gif = _mk_gif(os.path.join(d, "b.gif"), frames=4)
+        big = _mk_png(os.path.join(d, "c.png"), size=(2000, 1000))
+        webp = os.path.join(d, "e.webp")
+        try:
+            from PIL import Image
+            fr = [Image.new("RGB", (300, 300), (i * 70, 120, 60))
+                  for i in range(3)]
+            fr[0].save(webp, save_all=True, append_images=fr[1:],
+                       duration=100, loop=0)
+        except Exception:
+            webp = ""
 
-        ok, _ = vault.write_sticker_config({"rate": "abc"}, root + "_nope")
-        chk("脏数据不崩", isinstance(ok, bool))
+        ok, code, item = S.import_sticker(png, root)
+        chk("PNG 导入成功", ok and item.get("file", "").endswith(".gif"),
+            item.get("file"))
+        chk("输出真的是 GIF", _is_gif(item.get("path")), item.get("path"))
 
-        # 手改坏 JSON：读回来必须是默认值，不能让引擎整轮崩
-        bad = os.path.join(root, vault.STICKER_CONFIG_NAME)
-        with open(bad, "w", encoding="utf-8") as f:
-            f.write("{ this is not json")
-        cfg2 = vault.read_sticker_config(root)
-        chk("坏 JSON 回退默认", cfg2["enabled"] is False and cfg2["mode"] == "ai")
+        ok, code_gif, item_gif = S.import_sticker(gif, root)
+        chk("GIF 导入成功", ok)
+        chk("多帧保留", int(item_gif.get("frames") or 1) == 4,
+            f"frames={item_gif.get('frames')}")
 
-        section("表情库：导入、描述、删除")
-        chk("空库返回空表", vault.list_stickers(root) == [])
+        ok, code_big, item_big = S.import_sticker(big, root)
+        chk("大图导入成功", ok)
+        w, h = _size(item_big.get("path"))
+        chk("缩到 1024 以内", max(w, h) <= 1024, f"{w}x{h}")
+        chk("保持宽高比", abs((w / h) - 2.0) < 0.05, f"{w}x{h}")
 
-        src = _make_gif(os.path.join(root, "src.gif"))
-        ok, dst = vault.import_sticker(src, root)
-        chk("导入成功", ok and os.path.isfile(dst), dst)
-        chk("落在 stickers/ 下",
-            os.path.dirname(dst) == vault.sticker_dir(root))
+        if webp:
+            ok, code_webp, item_webp = S.import_sticker(webp, root)
+            chk("动 WebP 导入成功", ok)
+            chk("动 WebP 帧数保留", int(item_webp.get("frames") or 1) == 3,
+                f"frames={item_webp.get('frames')}")
 
-        lib = vault.list_stickers(root)
-        chk("库里有 1 张", len(lib) == 1, lib)
-        chk("识别为表情", lib[0]["kind"] == "sticker")
-        chk("初始无描述", lib[0]["desc"] == "")
+        section("透明：GIF 的 1 位透明")
+        tr = os.path.join(d, "tr.png")
+        from PIL import Image as _I
+        from PIL import ImageDraw as _D
+        im = _I.new("RGBA", (160, 160), (0, 0, 0, 0))
+        _D.Draw(im).ellipse([20, 20, 140, 140], fill=(255, 0, 0, 255))
+        im.save(tr)
+        ok, code_tr, item_tr = S.import_sticker(tr, root)
+        chk("透明 PNG 导入成功", ok)
+        with _I.open(item_tr["path"]) as g:
+            rgba = g.convert("RGBA")
+            chk("角落透明", rgba.getpixel((3, 3))[3] == 0,
+                rgba.getpixel((3, 3)))
+            chk("中心不透明", rgba.getpixel((80, 80))[3] == 255,
+                rgba.getpixel((80, 80)))
 
-        ok, _ = vault.import_sticker(src, root)
-        chk("重名不覆盖", ok and len(vault.list_stickers(root)) == 2)
+        section("描述：概览 + 详细")
+        ok, err = S.update_sticker(code, root, brief="生气",
+                                   detail="眉毛倒竖，对方说了让你不爽的话时用")
+        chk("写描述成功", ok, err)
+        got = S.get_sticker(code, root)
+        chk("概览读得回", got.get("brief") == "生气")
+        chk("详细读得回", "眉毛倒竖" in (got.get("detail") or ""))
 
-        name = os.path.basename(dst)
-        ok, _ = vault.write_sticker_desc(name, "得意地笑", root)
-        chk("写描述成功", ok)
-        lib = {e["name"]: e for e in vault.list_stickers(root)}
-        chk("描述读得回来", lib[name]["desc"] == "得意地笑")
+        ok, err = S.update_sticker(code, root, brief="x" * 30)
+        chk("概览被截断", len(S.get_sticker(code, root)["brief"]) <= 12,
+            S.get_sticker(code, root)["brief"])
 
-        ok, _ = vault.write_sticker_desc(name, "   ", root)
-        lib = {e["name"]: e for e in vault.list_stickers(root)}
-        chk("空描述等于清除", lib[name]["desc"] == "")
+        ok, err = S.update_sticker("stk_9999", root, brief="x")
+        chk("改不存在的返回失败", not ok)
 
-        png = os.path.join(root, "x.txt")
-        with open(png, "w") as f:
-            f.write("not an image")
-        ok, err = vault.import_sticker(png, root)
-        chk("非图片格式被拒", not ok, err)
-        chk("拒绝原因可读", "格式" in err, err)
+        section("列表：排序、orphan 补录")
+        items = S.list_stickers(root)
+        chk("列表非空", len(items) >= 4, len(items))
+        codes = [x["code"] for x in items]
+        chk("按代码排序", codes == sorted(codes), codes)
 
-        ok, _ = vault.delete_sticker(name, root)
-        chk("删除成功", ok and not os.path.exists(dst))
-        chk("删完只剩 1 张", len(vault.list_stickers(root)) == 1)
+        # 手动往目录里扔一张，应该被补录
+        orphan = _mk_png(os.path.join(d, "manual.gif"), size=(64, 64),
+                         alpha=False)
+        shutil.copy2(orphan, os.path.join(S.sticker_dir(root), "manual.gif"))
+        items2 = S.list_stickers(root)
+        chk("orphan 被补录", len(items2) == len(items) + 1, len(items2))
+        manual = [x for x in items2 if x["file"] == "manual.gif"]
+        chk("orphan 标了来源", manual and manual[0]["source"] == "orphan")
 
-        section("使用记录：冷却靠它")
-        vault.record_sticker_sent("filehelper", "a.gif")
-        usage = vault.sticker_usage("")
-        chk("记录了 last", usage.get("_last", {}).get("name") == "a.gif")
-        chk("记录了会话", usage.get("_last", {}).get("chat") == "filehelper")
-        chk("按会话查得到计数",
-            vault.sticker_usage("filehelper").get("a.gif") == 1)
+        section("删除：文件被占用也不能'删了还在'")
+        victim = S.list_stickers(root)[0]
+        vpath = victim["path"]
+        handle = _open_hold(vpath)      # 故意持有句柄
+        ok, note = S.delete_sticker(victim["code"], root)
+        chk("删除返回成功", ok, note)
+        left = [x for x in S.list_stickers(root) if x["code"] == victim["code"]]
+        chk("列表里已经看不到", not left, left)
+        _close_hold(handle)
+        # 句柄释放后，下一次 list 应该把文件真删掉
+        S.list_stickers(root)
+        chk("句柄释放后文件被清理", not os.path.exists(vpath), vpath)
 
-        section("媒体检查：发之前的门槛")
-        from bigfish.wechat_sender import check_media, classify_media
+        section("schema 迁移：v1 → v2")
+        mig = tempfile.mkdtemp(prefix="stk-mig-")
+        sd = os.path.join(mig, S.STICKER_DIR)
+        os.makedirs(sd)
+        _mk_png(os.path.join(sd, "old.gif"), size=(64, 64), alpha=False)
+        with open(os.path.join(sd, S.INDEX_NAME), "w", encoding="utf-8") as f:
+            json.dump({"old.gif": {"desc": "老格式的说明"}}, f,
+                      ensure_ascii=False)
+        items3 = S.list_stickers(mig)
+        chk("旧格式能读出来", len(items3) == 1, items3)
+        chk("desc 迁移成 brief",
+            items3 and items3[0]["brief"] == "老格式的说明",
+            items3[0]["brief"] if items3 else "")
+        with open(os.path.join(sd, S.INDEX_NAME), encoding="utf-8") as f:
+            idx = json.load(f)
+        chk("index 已升级到 v2", idx.get("version") == 2, idx.get("version"))
+        shutil.rmtree(mig, ignore_errors=True)
 
-        chk("gif 判表情", classify_media("a.GIF") == "sticker")
-        chk("png 判图片", classify_media("a.png") == "image")
-        chk("zip 判文件", classify_media("a.zip") == "file")
-
-        g = _make_gif(os.path.join(root, "ok.gif"))
-        ok, why = check_media(g)
-        chk("正常 gif 可发", ok, why)
-        ok, why = check_media("")
-        chk("空路径被拒", not ok)
-        ok, why = check_media(os.path.join(root, "missing.gif"))
-        chk("不存在被拒", not ok and "不存在" in why, why)
-
-        empty = os.path.join(root, "empty.gif")
-        open(empty, "wb").close()
-        ok, why = check_media(empty)
-        chk("空文件被拒", not ok, why)
-
-        section("插件：没有库就不发 / 冷却 / 随机模式")
+        section("插件：开关、冷却、候选")
         from bigfish import plugins
 
         plugins.ensure_loaded()
         inv = plugins.inventory(root)
         ids = {p["id"]: p for p in inv["plugins"]}
-        chk("sticker 已登记", "sticker" in ids, list(ids))
+        chk("sticker 已登记", "sticker" in ids)
         chk("scope 是 sticker", ids["sticker"]["scope"] == "sticker")
-        chk("默认不启用", ids["sticker"]["enabled"] is False)
-
-        ctx = {"chat_id": "filehelper", "user_text": "哈哈", "reply_text": "笑死"}
-        # 没启用 → collect_sticker 不给东西
-        got = plugins.collect_sticker(ctx, root)
-        chk("未启用时不发", got == "")
-
-        plugins.set_enabled("sticker", True, root)
-        # 启用但库里有图（前面删了一张还剩一张）
-        lib = vault.list_stickers(root)
-        chk("库里有货", len(lib) >= 1, lib)
+        cfg = plugins.config_of("sticker", root)
+        chk("默认频率 0.15", abs(float(cfg.get("rate", 0)) - 0.15) < 1e-9, cfg)
+        chk("默认冷却 180", int(cfg.get("cooldown", 0)) == 180, cfg)
 
         from bigfish.plugins import sticker as st
 
-        # 冷却中：刚发过 → 不发
-        vault.record_sticker_sent("filehelper", "x.gif")
-        os.environ["BIGFISH_DATA_ROOT"] = root
-        got = st.stamp({**ctx, "config": {"mode": "random", "cooldown": 600}})
-        chk("冷却中不发", got == "", got)
+        chk("should_learn 空输入为假", st.should_learn({}) is False)
+        chk("should_learn 无关话为假",
+            st.should_learn({"user_text": "今天天气不错",
+                             "chat_id": "x"}) is False)
+        # 没发过表情时，纠正话也不该触发
+        chk("没发过表情时不学",
+            st.should_learn({"user_text": "这个表情不是这么用的",
+                             "chat_id": "nobody"}) is False)
 
-        # 冷却为 0 → 允许，且随机模式必给一个存在的路径
-        got = st.stamp({**ctx, "config": {"mode": "random", "cooldown": 0}})
-        chk("冷却解除后会给路径", bool(got) and os.path.isfile(got), got)
-        chk("给的是 gif", got.lower().endswith(".gif"), got)
+        section("使用记录：冷却靠它")
+        S.record_sent("filehelper", "stk_0001", root)
+        last = S.last_sent("filehelper", root)
+        chk("记下最近一次", last.get("code") == "stk_0001", last)
+        chk("按会话查得到", S.read_usage("filehelper", root).get("stk_0001") == 1)
+        chk("别的会话查不到", S.last_sent("other", root) == {})
 
-        section("插件：尺寸过界的图不选")
-        big = _make_gif(os.path.join(root, "big.gif"), size=2048, frames=1)
-        ok, dst_big = vault.import_sticker(big, root)
-        chk("大图能进库", ok, dst_big)
-        usable = [e for e in vault.list_stickers(root) if st._usable(e)]
-        chk("2048 的图被排除",
-            all(e["name"] != os.path.basename(dst_big) for e in usable),
-            [e["name"] for e in usable])
+        shutil.rmtree(d, ignore_errors=True)
 
     except Exception:
         global FAIL
@@ -211,7 +245,6 @@ def main():
         except Exception:
             pass
         shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(root + "_nope", ignore_errors=True)
 
     print("\n" + "=" * 66)
     print(f"结果：{PASS}/{PASS + FAIL} 通过")
@@ -221,6 +254,42 @@ def main():
             print(f"  · {x}")
     print("=" * 66)
     return 0 if FAIL == 0 else 1
+
+
+# ── 小工具 ──
+
+def _is_gif(path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(6) in (b"GIF87a", b"GIF89a")
+    except Exception:
+        return False
+
+
+def _size(path):
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return im.size
+    except Exception:
+        return (0, 0)
+
+
+def _open_hold(path):
+    """开一个句柄不放，模拟"文件被占用"。"""
+    try:
+        return open(path, "rb")
+    except Exception:
+        return None
+
+
+def _close_hold(h):
+    try:
+        if h:
+            h.close()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

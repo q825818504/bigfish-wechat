@@ -5,6 +5,8 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
+// 顶层 const 不会挂到 window 上，但调试和自测需要能读到状态。
+// 显式挂一份，代价是一个全局引用，收益是出问题时能在控制台直接看。
 const S = {
   bridge: null,
   running: false,
@@ -12,6 +14,8 @@ const S = {
   watching: new Set(),
   soul: null,
 };
+
+window.S = S;
 
 const PAGE_TITLES = {
   overview: '概览', chats: '会话', soul: '灵魂',
@@ -63,7 +67,15 @@ function go(page) {
   if (page === 'mood') loadMood();
   if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); loadPersons(); loadPoolSummary(); }
   if (page === 'impression') loadImpression();
-  if (page === 'stickers') loadStickers();
+  if (page === 'stickers') {
+    if (!S.plugEnabled || !S.plugEnabled.sticker) {
+      // 插件关着时这一页不该存在。跳回插件页，让用户先开它。
+      toast('先在插件页启用「表情包」');
+      go('plugins');
+      return;
+    }
+    loadStickers();
+  }
   if (page === 'data') loadDataRoot();
   if (page === 'plugins') { closePlugin(); loadPlugins(); }
 }
@@ -2333,6 +2345,9 @@ const PLUG_ICONS = {
   prompt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M5 6h14M5 11h10M5 16h7"/></svg>',
   gate: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 17h16M12 7v10"/><circle cx="12" cy="12" r="2"/></svg>',
   hook: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h11M12 7l5 5-5 5"/></svg>',
+  // 表情包插件：一张笑脸。和其它三类视觉上要能分开 ——
+  // 它是唯一一个会往聊天里"发东西"的插件。
+  sticker: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="3.5" width="17" height="17" rx="4.5"/><path d="M9 10h.01M15 10h.01" stroke-linecap="round"/><path d="M9 14.5c.9 1.1 1.9 1.6 3 1.6s2.1-.5 3-1.6" stroke-linecap="round"/></svg>',
 };
 
 function plugById(id) {
@@ -2610,6 +2625,7 @@ async function togglePlugin(id, enabled) {
     renderPluginList();
     renderPluginSeats();
     if (PLUG.current === id) openPlugin(id);
+    if (typeof syncPluginNav === 'function') syncPluginNav();
     toast(enabled ? '已启用，下一轮对话起生效' : '已停用，下一轮对话起不再注入');
   } catch (e) {
     toast('切换失败：' + (e.message || e));
@@ -2736,6 +2752,11 @@ async function onBridgeReady(b) {
   await loadSettings();
   await refreshAccountLabel();
   await refreshStatus();
+
+  // 侧边栏要看插件开没开 —— 表情包是插件，关着就不该有那一项。
+  // 必须在首屏渲染之前跑完，否则会先闪一下再消失。
+  if (typeof syncPluginNav === 'function') await syncPluginNav();
+
   setInterval(refreshStatus, 2000);
 
   // 版本号 + 启动时静默检查一次更新
