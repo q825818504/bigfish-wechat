@@ -1,55 +1,35 @@
-修拖拽和「浏览…」：一个被 Qt 拦住，一个签名写错
+拖放改走原生 WM_DROPFILES —— 前两条路都是错的
 
-用户反馈：添加表情弹窗出来了，但拖拽显示禁止图标、点「浏览…」没反应。
+用户试了三次都不行。把三条路都试过一遍之后才找对：
 
-── ① 「浏览…」：@Slot 签名写错 ──
+① HTML5 dataTransfer.files
+   QtWebEngine 里能拿到 File 对象，但没有 path 属性 ——
+   那是 Electron 扩展，Chromium 标准没有。没路径就没法转 GIF。
 
-    @Slot(str, result=str)
-    def sticker_pick_files(self) -> str:      # ← 方法没有参数
+② QWidget eventFilter + OLE drag-drop
+   直接构造 QDropEvent 塞给控件时 eventFilter 是正常的（日志有、
+   accepted 为 True），但真实拖动时鼠标显示禁止图标、事件根本没产生。
+   后来查出来是 UIPI：程序要 UIA 所以是管理员权限（高完整性），
+   资源管理器是中完整性，Windows 拦住跨完整性的 OLE 拖放。
+   加了 ChangeWindowMessageFilterEx 放行三条消息（API 都返回 True），
+   事件还是没到。
 
-Qt 按声明找 `sticker_pick_files(str)`，Python 里没有，调用静默失败。
-前端 await 拿到 undefined，JSON.parse 抛错被 async 吞掉，
-用户看到的就是"点了没反应"。
+③ 现在：Windows 原生 WM_DROPFILES
+   DragAcceptFiles(hwnd, TRUE) 让系统知道这个窗口收文件，
+   之后系统直接发 WM_DROPFILES，不经过 OLE，绕开跨进程那套。
+   配合 QAbstractNativeEventFilter 全局拦消息 —— 比装 eventFilter
+   到某个子控件可靠，不管落在哪一层都会经过。
 
-这是**第二次**犯同一个错（上次是 list_memory_sessions）。
-所以加了 tools/check_slots.py：静态比对 @Slot 声明的输入参数个数
-和 Python 方法的参数个数。跑一遍还揪出 list_owners 也是同样的错
-（那个是死代码，一并修了）。
+我自己构造了一个 WM_DROPFILES（GlobalAlloc + DROPFILES + PostMessage）
+验证整条链路：
+    WM_DROPFILES hdrop=... 文件数=2
+    已交给页面：2 个
+    页面 pending: {"n":2,"p":["动图_512.gif","动图_240.gif"]}
 
-── ② 拖拽：QWebEngineView 默认 acceptDrops=False ──
+批量拖拽本来就是支持的（DragQueryFileW 逐条读）。
 
-两条路都不通：
-  · HTML5 dataTransfer.files 在 QtWebEngine 里没有 path 属性，
-    拿不到路径就没法转 GIF（path 是 Electron 扩展，Chromium 标准没有）
-  · QWebEngineView 是 QWidget 子类，acceptDrops 默认 False，
-    系统层面就拒了，页面里的 dragover 根本收不到 ——
-    所以鼠标显示的是禁止图标
+拖放出问题很难查（界面在管理员权限下跑，看不到控制台），
+所以加了 <程序目录>/data/_drop.log，记录 install / 收到消息 /
+解析出几个文件 / 有没有交给页面。下次再坏能一眼看出卡在哪。
 
-改成 Python 侧拦 QEvent.Drop（bigfish/dropcatch.py），
-从 QMimeData 拿 urls()，再用 runJavaScript 把路径数组丢给页面。
-页面实现 window.__onDropFiles(paths) 接收。
-
-两个细节：
-  · 装到 view 的整棵子树。实测加载前只找得到 2 个控件，
-    加载后是 392 个 —— 真正接收鼠标事件的是渲染层那一个。
-    所以 loadFinished 后再装一次（install 做成幂等）。
-  · 路径用 json.dumps 传，不手拼字符串。
-    实测中文 + 反斜杠都完整保住。
-
-前端的 dragenter/dragover 保留，但只负责虚线框高亮 ——
-Python 侧万一没装上，用户至少能看到框亮了然后失败，
-而不是完全没反应。
-
-新增 tools/ui_console.py：用 QWebEngineView 加载真实界面，
-把 console 消息全打出来 + 模拟点击。上一个 fmtBytes 重名就是靠它查到的。
-
-测试：
-  check_slots           无问题（新）
-  check_method_calls    无问题
-  selftest_ui           全通过
-  selftest_sticker      40/40
-  selftest_vault        148/148
-  selftest_engine_fixes 60/60
-  test_no_leak          30/30
-  test_persona_parity   18/18
-  selftest_plugins      89/89
+DragFinish 必须调 —— 否则系统侧资源不释放，第二次拖放会失败。

@@ -3410,8 +3410,8 @@ class MainWindow(QMainWindow):
 
             self.drop_catcher = DropCatcher(self.view, self)
             self.drop_catcher.install()
-            # ⚠ 页面加载前，view 的渲染子控件还没建出来，只装得上两三个。
-            #   加载完再装一次 —— 真正接收鼠标事件的是那层渲染控件。
+            # 页面加载前 view 的渲染子控件还没建出来，加载完再设一次
+            # "接受文件"（DragAcceptFiles 要对最终那层窗口调）。
             self.view.loadFinished.connect(
                 lambda _ok: self.drop_catcher.install())
         except Exception as exc:
