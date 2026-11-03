@@ -32,7 +32,24 @@ import zipfile
 ROOT = os.path.abspath(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DIST = os.path.join(ROOT, "dist")
 PAYLOAD = os.path.join(DIST, "BigFish")
-VERSION = "0.1.0"
+
+
+def _pkg_version() -> str:
+    """版本号真源在 bigfish/__init__.py，打包脚本不另写一份。
+
+    以前这里硬编码 0.1.0，而 updater 里是 0.2.1、__init__ 里又是
+    0.1.0 —— 发版时改一处忘两处，装出来的包版本号和程序自称的不一样。
+    """
+    try:
+        import sys as _sys
+        _sys.path.insert(0, ROOT)
+        from bigfish import __version__ as v
+        return str(v)
+    except Exception:
+        return "0.0.0"
+
+
+VERSION = _pkg_version()
 
 APP_NAME = "BigFish"
 APP_DISPLAY = "大肥鱼"

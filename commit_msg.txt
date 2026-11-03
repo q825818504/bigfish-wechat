@@ -1,55 +1,39 @@
-表情接上心情：先对维度，再对强度
+发布 v0.3.0：表情包
 
-用户提的：「大肥鱼在不同的心情下，如果有同类的表情包，就根据不同
-的心情展示不同的表情包，比如同样是高兴，一个一般高兴，一个非常高兴」
-并强调「一定要配合到我们的心情插件，里面就有情绪维度」
+planning 更新：
+  progress.md    重写。这一版三件事分开记 ——
+                 表情发送通道（凌晨）、表情库+插件化（晚上）、
+                 心情匹配（刚才）。每件都写了当时踩的坑。
+  decisions.md   补 D-47 ~ D-51：
+                   D-47 表情要标情绪维度，和心情系统同一套
+                   D-48 强度存成字段，不让模型每次推
+                   D-49 心情读最新落盘的那份，不用本轮快照
+                   D-50 拖放只能走原生 WM_DROPFILES
+                   D-51 版本号只有一个真源
+  architecture.md 模块表补 paths/stickers/sticker_desc/dropcatch，
+                  新增「表情挑选：先对维度，再对强度」和
+                  「拖放：三条路只有一条通」两节。
 
-先纠正一个说法：**不需要新增"情绪值"** —— 心情系统已经有两层：
-    score  0~100
-    dims   七根维度（开心/踏实/甜蜜/心疼/担心/难过/吃醋）
+版本号统一：
+  以前散在三处（__init__ 0.1.0 / updater 0.2.1 / make_installer 0.1.0），
+  发版时改一处忘两处 —— 装出来的包版本号和程序自称的不一样，
+  更新检查也会判断错。
+  现在只在 bigfish/__init__.py 定义，另两处 import。
+  updater 取不到退回 "0.0.0"（会让它认为有新版，但比显示假版本号安全）。
 
-真正缺的是两个：
-    ① 挑表情时完全没读心情（插件只看对话文本）
-    ② 表情没有维度也没有强度（十张都叫"高兴"，不知道哪张是微笑）
+CHANGELOG 补 0.3.0 整节。
 
-── 改动 ──
+发布产物：
+  dist/BigFish-0.3.0-setup.zip        204.7 MB（14 个文件）
+  dist/BigFish-0.3.0-portable.zip     198.7 MB（325 个文件）
+  dist/BigFish-0.3.0-manifest.json
+  dist/BigFish-0.3.0-installer/       214.0 MB
 
-表情加两个字段（schema 兼容，老数据用默认值）：
-    mood_dim   七根维度之一，或空表示"不归类"（无语/疑惑这类）
-    intensity  1~5
+exe 自检 14/15 通过（UIA 那项需要管理员，正常），版本显示 0.3.0。
 
-为什么存 key 不存中文：标签会改，key 不会。标签显示时查表。
-MOOD_DIM_KEYS / MOOD_DIM_LABELS 和 vault.MOOD_DIMS 对齐，
-有测试断言两边一致 —— 不一致的话挑表情就永远匹配不上。
-
-视觉备注的 prompt 加两个输出：
-    intensity  1=很淡 5=极强（是"这张图本身有多强烈"，不是适合什么心情）
-    mood_dim   只能从七个里选，或者空。像"无语""疑惑"不许硬塞进 happy
-
-挑表情时：
-    引擎 _current_mood() 读**当前落盘的那份**心情（不是本轮开始时的
-    快照 —— 心情判断是上一轮结束后写的，用最新的更准）
-    → 传进插件 ctx["mood"]
-    → _mood_line() 压成两三行：分数 + 标签 + 活跃的前三根维度
-    → 候选列表带维度标签和强度
-    → prompt 说明"先对维度，再对强度"
-
-UI 详情弹窗加两个控件：情绪维度下拉 + 强度滑块。可手改。
-
-── 实测 ──
-
-造两张图让模型判断：
-    微笑（小弧线嘴、圆眼）  → calm  强度 2  brief=微笑
-    大笑（大弧嘴、弯眼）    → happy 强度 3  brief=开心
-
-── 测试 ──
-  selftest_sticker      61/61（新增 13 项：维度对齐、脏数据、强度夹取、
-                        _mood_line 的各种输入）
+测试：
+  selftest_sticker      61/61
   selftest_vault        148/148
   selftest_engine_fixes 60/60
-  test_no_leak          30/30
-  test_persona_parity   18/18
-  selftest_ui           全通过
-  selftest_plugins      89/89
-  check_method_calls    无问题
   check_slots           无问题
+  check_method_calls    无问题

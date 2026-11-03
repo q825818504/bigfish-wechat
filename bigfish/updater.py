@@ -36,7 +36,15 @@ import time
 import urllib.error
 import urllib.request
 
-__version__ = "0.2.1"
+# 版本号真源在 bigfish/__init__.py，这里不重复定义。
+# 取不到就退回 0.0.0 —— 更新检查会因此认为"有新版"，
+# 但那比显示一个假的版本号安全。
+try:
+    from bigfish import __version__ as _PKG_VERSION
+except Exception:
+    _PKG_VERSION = "0.0.0"
+
+__version__ = _PKG_VERSION
 
 GITHUB_API = "https://api.github.com/repos/{repo}/releases/latest"
 UA = f"bigfish-updater/{__version__}"
