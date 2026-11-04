@@ -2028,3 +2028,46 @@ CHANGELOG 保留 0.4.1 的独立条目（历史记录），但在 0.5.0 开头�
 - 真实查询 GitHub Release：0.8s，`latest=0.4.0 / current=0.5.0`
 - 真实调 agnes：`GET /v1/models` 拿到 9 个模型，`chat/completions` 返回「收到」
 - 打包版 `--selftest` 17 项：15 通过，2 失败（UIA 需管理员 + agnes 额度耗尽 429）
+
+---
+
+## D-65 · 发布流程：deploy 必须在 build_portable 之前
+
+**背景**
+
+0.5.0 第一次打包，SHA-256 和上一次**一模一样**：
+
+```
+1ca94d94497fd9f5be3d60d0aa214a4722e422639321123cec6d40cf7d08596d
+```
+
+代码明明改了。查下来 `build_portable.py` 是从 `dist/BigFish` 打包的，
+而 `dist/BigFish` 是上一次 `deploy.py` 部署的旧版本 —— 源码改了但没 deploy，
+打出来的还是旧包。
+
+**正确的顺序**
+
+```
+改代码 → 跑测试 → deploy.py（打包 exe + 部署到 dist/BigFish）
+       → build_portable.py（把 dist/BigFish 打成 zip）
+       → git commit + tag + push
+       → make_release.py
+```
+
+**怎么识别踩了这个坑**
+
+看 SHA。同一份代码两次打包 SHA 必然相同，但**改过代码后 SHA 不变就是没打进去**。
+这比"打开 zip 翻文件"快得多。
+
+**第二个坑：make_release 跳过已存在的附件**
+
+原来 `if name in existing: 跳过`。于是"改完代码重新发一次"会静默保留旧包 ——
+版本号一样、Release 页面看着也对，但下载下来是上一版。
+
+现在加 `--force`：先 `DELETE /releases/assets/{id}` 再上传。
+删完 `sleep 1.5` —— 立刻传偶尔会撞 422。
+
+**教训**
+
+发布链路里每一步的输入都必须是"刚刚生成的东西"。任何一步读的是缓存/上次的产物，
+都会得到"看起来成功、实际是旧的"的结果。SHA 是这条链路上唯一诚实的信号。

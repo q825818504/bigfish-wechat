@@ -19,6 +19,9 @@ DIST = os.path.join(ROOT, "dist")
 TOKEN_FILE = os.path.join(ROOT, ".secrets", "github_token.txt")
 REPO = "q825818504/bigfish-wechat"
 
+#: 覆盖模式：附件已存在时先删再传。`--force` 打开。
+FORCE = False
+
 
 def _read_version() -> str:
     """版本号从 bigfish/__init__.py 读，不在这里硬编码。
@@ -113,8 +116,10 @@ def sha256_of(path: str) -> str:
 
 
 def main() -> int:
+    global FORCE
+    FORCE = "--force" in sys.argv or "-f" in sys.argv
     print("=" * 66)
-    print("  创建 GitHub Release")
+    print("  创建 GitHub Release" + ("（覆盖模式）" if FORCE else ""))
     print("=" * 66)
 
     # 检查附件
@@ -143,14 +148,33 @@ def main() -> int:
         print(f"    创建成功 #{rel['id']}")
 
     upload_url = rel["upload_url"].split("{")[0]
-    existing = {a["name"] for a in rel.get("assets", [])}
+    existing = {a["name"]: a["id"] for a in rel.get("assets", [])}
 
     # 上传附件
     print("\n[2] 上传附件")
     for name, path in ASSETS:
         if name in existing:
-            print(f"    {name} 已存在，跳过")
-            continue
+            if not FORCE:
+                print(f"    {name} 已存在，跳过（要覆盖加 --force）")
+                continue
+            # 覆盖：GitHub 不允许同名附件并存，必须先删旧的。
+            # 没有这条的时候，"改完代码重新打包再发一次"会静默保留旧包 ——
+            # 版本号一样、Release 页面看着也对，但下载下来是上一版。
+            aid = existing[name]
+            print(f"    {name} 已存在，删除旧附件 #{aid}")
+            try:
+                req = urllib.request.Request(
+                    f"https://api.github.com/repos/{REPO}/releases/assets/{aid}",
+                    method="DELETE",
+                    headers={"User-Agent": "bigfish-release",
+                             "Accept": "application/vnd.github+json",
+                             "Authorization": f"Bearer {token()}"})
+                urllib.request.urlopen(req, timeout=60).read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+                print(f"      ✗ 删除失败 HTTP {exc.code}: {detail}")
+                return 1
+            time.sleep(1.5)          # 删完立刻传偶尔会撞 422
 
         size = os.path.getsize(path)
         digest = sha256_of(path)
