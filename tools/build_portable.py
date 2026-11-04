@@ -13,7 +13,24 @@ from datetime import datetime, timezone
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIST = os.path.join(ROOT, 'dist', 'BigFish')
 OUT = os.path.join(ROOT, 'release')
-VERSION = '0.3.1'
+
+
+def _read_version() -> str:
+    """从 bigfish/__init__.py 读版本号 —— 和 make_release 用同一个真源。"""
+    import re
+
+    src = os.path.join(ROOT, 'bigfish', '__init__.py')
+    try:
+        with open(src, 'r', encoding='utf-8') as f:
+            m = re.search(r'__version__\s*=\s*"([^"]+)"', f.read())
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return '0.0.0'
+
+
+VERSION = _read_version()
 
 if not os.path.isdir(DIST):
     sys.exit('dist/BigFish 不存在，先打包')
