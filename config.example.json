@@ -1,15 +1,22 @@
 {
-  "_comment": "大肥鱼 × 微信配置。api_key 留空表示走本地 Magpie 网关。",
-  "endpoint": "http://127.0.0.1:3425/v1/chat/completions",
-  "model": "workbuddy-ai/deepseek-v4.1-flash",
-  "api_key": "",
-  "temperature": 1.0,
-  "max_tokens": 2600,
-  "timeout": 90,
+  "_comment": "大肥鱼 × 微信配置。模型接入看 docs/模型接入.md：选一家填 Key 就行，地址和协议已内置。",
+
+  "llm": {
+    "_comment": "channel 选预设（deepseek / moonshot / zhipu / qwen / volcengine / minimax / openai / anthropic / gemini / openrouter / siliconflow / magpie / ollama / custom …）。base_url 和 protocol 留空就用预设的。",
+    "channel": "deepseek",
+    "base_url": "",
+    "model": "deepseek-v4-flash",
+    "api_key": "",
+    "protocol": "",
+    "temperature": 1.0,
+    "max_tokens": 2600,
+    "timeout": 90
+  },
 
   "auto_reply": {
     "_comment": "chats 是要监听的会话。私聊写联系人昵称，群聊写群名。",
     "chats": ["文件传输助手"],
+    "_comment_allow_self": "只对文件传输助手生效（自测通道）。私聊和群聊里自己发的消息一律不处理。",
     "allow_self": true,
     "interval": 1.2,
     "max_reply_chars": 300,
@@ -21,9 +28,8 @@
   },
 
   "update": {
-    "_comment": "填 owner/repo 后启用自动更新。留空则跳过检查。",
+    "_comment": "repo 留空就用内置的 q825818504/bigfish-wechat。fork 的人填自己的 owner/repo（填完整 URL 也行，会自动收拾）。",
     "repo": "",
-    "enabled": true,
-    "current": "0.1.0"
+    "enabled": true
   }
 }

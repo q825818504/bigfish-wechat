@@ -1052,27 +1052,52 @@
           <div class="form">
             <div class="form-grid">
               <div class="field full">
-                <label>接口地址</label>
-                <input type="text" id="cfgEndpoint" placeholder="http://127.0.0.1:3425/v1/chat/completions">
-                <small>任何 OpenAI 兼容接口都可以。本地 Magpie 网关默认就是这个地址。</small>
+                <label>用哪家</label>
+                <select id="cfgChannel"></select>
+                <small id="channelNote">选一家，粘上 Key 就能用。地址和协议已经内置好了。</small>
               </div>
-              <div class="field">
-                <label>模型 ID</label>
-                <input type="text" id="cfgModel" placeholder="workbuddy-ai/deepseek-v4.1-flash">
-              </div>
-              <div class="field">
+              <div class="field full">
                 <label>API Key</label>
-                <input type="password" id="cfgApiKey" placeholder="本地网关留空">
-                <small>连本地网关时不需要填写。</small>
+                <div class="key-row">
+                  <input type="password" id="cfgApiKey" placeholder="sk-…" autocomplete="off">
+                  <a id="keyHint" href="#" target="_blank" rel="noreferrer">去哪拿？</a>
+                </div>
+                <small id="keyNote">本地网关和本地模型不用填。</small>
+              </div>
+              <div class="field full">
+                <label>接口地址</label>
+                <input type="text" id="cfgBaseUrl" placeholder="https://api.deepseek.com/v1">
+                <small>选预设时自动填好。中转站、公司内网、自建服务改这里。</small>
+              </div>
+              <div class="field full">
+                <label>模型</label>
+                <div class="key-row">
+                  <select id="cfgModelSel">
+                    <option value="">— 先点右边获取 —</option>
+                  </select>
+                  <button class="btn btn-sm" id="btnFetchModels" type="button">获取模型</button>
+                </div>
+                <small id="modelNote">填好上面的地址和 Key，点「获取模型」从这家拉真实列表。</small>
+                <input type="text" id="cfgModel" aria-label="手填模型 ID" placeholder="或者直接手填模型 ID，比如 deepseek-v4-flash">
+              </div>
+              <div class="field">
+                <label>协议</label>
+                <select id="cfgProtocol"></select>
+                <small>选预设时自动带出正确的那个，一般不用动。</small>
               </div>
               <div class="field">
                 <label>温度</label>
                 <input type="number" id="cfgTemp" step="0.1" min="0" max="2">
                 <small>越高越活泼，越低越稳定。1.0 适合日常聊天。</small>
               </div>
-              <div class="field">
+              <div class="field full">
                 <label>最大 token</label>
                 <input type="number" id="cfgMaxTokens" step="100" min="100">
+                <small>推理模型要留够，否则只出思考不出正文。</small>
+              </div>
+              <div class="test-row">
+                <button class="btn btn-sm" id="btnTestModel">测试连接</button>
+                <span id="testResult" class="test-result">真发一次请求验证。填完先点这个。</span>
               </div>
             </div>
           </div>
@@ -1101,7 +1126,7 @@
             <div class="switch-row">
               <div class="switch-copy">
                 <strong>处理自己发的消息</strong>
-                <p>仅用于文件传输助手自测。日常使用请关闭。</p>
+                <p>仅对文件传输助手生效（自测通道）。私聊和群聊里自己发的消息一律不处理。</p>
               </div>
               <label class="switch-control">
                 <input type="checkbox" id="cfgAllowSelf">
@@ -1139,9 +1164,16 @@
           <div class="switch-row">
             <div class="switch-copy">
               <strong>检查更新</strong>
-              <p>从 GitHub Releases 读取最新版本。发现新版可以一键下载并静默安装。</p>
+              <p id="updateSource">从 GitHub Releases 读取最新版本。发现新版可以一键下载并静默安装。</p>
             </div>
             <button class="btn btn-sm" id="btnCheckUpdate">检查</button>
+          </div>
+          <div class="switch-row" id="updateRow" hidden>
+            <div class="switch-copy">
+              <strong id="updateTitle">发现新版本</strong>
+              <p id="updateNotes"></p>
+            </div>
+            <button class="btn btn-sm" id="btnDoUpdate">下载并安装</button>
           </div>
         </div>
       </section>

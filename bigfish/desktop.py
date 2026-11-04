@@ -94,6 +94,20 @@ for cand in (os.path.join(_APP_DIR, "bridge"),
 if not BRIDGE_DIR:
     BRIDGE_DIR = os.path.join(_APP_DIR, "bridge")
 
+# ⚠ 配置和 data/ 是同一层的东西，都放**exe 旁边**（_APP_DIR），不放 _internal。
+#
+#   <安装目录>/BigFish.exe
+#   <安装目录>/config.json     ← 用户可见、可备份、重装不丢
+#   <安装目录>/data/           ← 记忆 / 情绪 / 插件
+#   <安装目录>/_internal/...   ← 程序自己的东西，升级时整个覆盖
+#
+#   这里曾经写成 _ROOT（= _internal），于是出现了一个很难看的现象：
+#   设置页保存成功、配置文件里明明是新值，但界面刷新后又变回旧的 ——
+#   因为写的是 _internal，读的是…… 其实是同一份，但 packaging 时的
+#   deploy 会把它连同整个 _internal 一起换掉。更早还有一份外层的老配置
+#   在 `paths.app_root()` 那套里被读到，两边打架。
+#
+#   现在只有一个来源：paths.app_root()/config.json。
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 
 
@@ -166,12 +180,85 @@ from PySide6.QtWebEngineWidgets import QWebEngineView                # noqa: E40
 from PySide6.QtWidgets import QApplication, QMainWindow               # noqa: E402
 
 UI_DIR = os.path.join(_ROOT, "ui")
-CONFIG_PATH = os.path.join(_ROOT, "config.json")
+# ⚠ 别在这里再写一次 CONFIG_PATH。
+#   这里曾经有一行 `CONFIG_PATH = os.path.join(_ROOT, "config.json")`，
+#   静默覆盖了上面那个指向 exe 目录的定义 —— 于是「保存成功但界面刷新
+#   又变回去」。UI_DIR 用 _ROOT 是对的（ui/ 确实在 _internal 里），
+#   但配置不在那里，它是用户的文件。
 
 
 # ══════════════════════════════════════════════════════════════════
 #  配置
 # ══════════════════════════════════════════════════════════════════
+def _migrate_config_path(old: str, new: str) -> None:
+    """把早先误写在 `_internal` 里的配置搬到 exe 旁边。
+
+    2026-11-04 之前的版本把 `CONFIG_PATH` 指向了 `_ROOT`（=`_internal`），
+    于是用户在设置页保存的模型配置全写在那儿。路径改回来之后要搬一次 ——
+    不搬的话用户看到的是「昨晚配好的 agnes 又变回 magpie 了」。
+
+    只在两份都有明确内容时才挑：外层已经有 `llm` 段就以它为准，
+    旧的那份改名 `.bak` 留个证据，不直接删。
+    """
+    if not os.path.isfile(old) or os.path.abspath(old) == os.path.abspath(new):
+        return
+    try:
+        with open(old, "r", encoding="utf-8") as f:
+            od = json.load(f)
+    except Exception:
+        return
+    if not isinstance(od, dict):
+        return
+
+    cur: dict = {}
+    if os.path.isfile(new):
+        try:
+            with open(new, "r", encoding="utf-8") as f:
+                cur = json.load(f)
+        except Exception:
+            cur = {}
+    if not isinstance(cur, dict):
+        cur = {}
+
+    # 外层已经是新结构 → 以它为准，旧份收起来
+    if isinstance(cur.get("llm"), dict) or not isinstance(od.get("llm"), dict):
+        try:
+            os.replace(old, old + ".bak")
+        except Exception:
+            pass
+        return
+
+    merged = dict(cur)
+    merged.update(od)          # _internal 那份更新，覆盖外层
+    try:
+        tmp = new + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, new)
+        os.replace(old, old + ".bak")
+    except Exception:
+        pass
+
+
+_config_migrated = False
+
+
+def _ensure_config_home() -> None:
+    """跑一次：把配置固定在 exe 旁边。
+
+    frozen 时才有"两份"的问题；开发态 _APP_DIR == _ROOT，不用管。
+    """
+    global _config_migrated
+    if _config_migrated:
+        return
+    _config_migrated = True
+    if not FROZEN:
+        return
+    lo = os.path.join(_RES_DIR, "config.json")
+    if os.path.isfile(lo):
+        _migrate_config_path(lo, CONFIG_PATH)
+
+
 def _source_ms(msg) -> "int | None":
     """入站消息的发生时间，毫秒。取不到就返回 None（让写入方用当前时间）。
 
@@ -358,6 +445,7 @@ def _habits_block(owner: str, tier: str, *, limit: int = 6) -> str:
 
 
 def load_json_config() -> dict:
+    _ensure_config_home()
     if os.path.isfile(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -375,6 +463,7 @@ def load_json_config() -> dict:
 
 
 def save_json_config(d: dict) -> None:
+    _ensure_config_home()
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
@@ -781,6 +870,7 @@ class EngineWorker(QThread):
     def _run(self) -> None:
         from bigfish.replier import ModelConfig, ModelError, call_model
         from bigfish.soul import load_soul
+        from bigfish.loopguard import LoopGuard
         from bigfish.watcher import MessageWatcher
         from bigfish.wechat import WeChatReader
         from bigfish.wechat_sender import SendError, UiaSender
@@ -790,7 +880,7 @@ class EngineWorker(QThread):
         self._log(f"灵魂：{self.soul.name}（rev {self.soul.revision}）", "in")
 
         self.mcfg = ModelConfig.load()
-        self._log(f"模型：{self.mcfg.model}")
+        self._log(f"模型：{self.mcfg.preset.name} / {self.mcfg.eff_model}", "in")
 
         self._log("打开微信数据库 ...")
         acc = self.account or str(
@@ -881,27 +971,30 @@ class EngineWorker(QThread):
         from bigfish.bridge_client import load_context
 
         convs: dict[str, list] = {}
-        # ── 回环防护 ──
+        # ── 自环防护 ──
         #
-        # 要防的是**一个具体场景**：文件传输助手 / 自己给自己发消息时，
-        # 我们发出去的那条会被监听器当成"对方的新消息"再读回来，
-        # 于是又回一遍 —— 无限自问自答。
+        # 2026-11-04 线上事故后抽成独立模块（bigfish/loopguard.py）。
         #
-        # ⚠ 这里踩过一个大坑：早期版本靠「文本内容相同」判定回环，
-        #   结果**对方原样复述她的话**（调侃、鹦鹉学舌，聊天里极常见）
-        #   也被判成回环。实测把正常对话拦了两次，还触发了熔断。
+        # 当时她跟「老爸」私聊里连续两分钟自问自答十几条，只能杀进程。
+        # 四个原因叠在一起：
+        #   ① allow_self=True 留在生产配置里 —— 那是文件传输助手自测开关，
+        #      但它是全局的，于是老爸的会话也变成"我自己发的也算数"。
+        #   ② 记账晚于写库：UIA 回车 → 微信异步写库 → watcher 1.2s 轮询，
+        #      记账和读回谁先谁后没有保证。漏一次，这条就被当成对方说的。
+        #   ③ 没有轮级熔断，漏一次就进入正反馈，雪崩。
+        #   ④ 防护全埋在 _run() 的闭包里，4500 行的函数，写不了测试 ——
+        #      所以这次事故没有任何用例能提前发现。
         #
-        #   正确的判据不是"文字像"，而是"**这条消息是我们自己发的**"。
-        #   两条独立证据，缺一不可：
+        # 现在四层闸门，任何一层单独失手都不成环：
+        #   L0 静音     熔断后该会话完全不处理
+        #   L1 白名单   allow_self 只对 filehelper 生效
+        #   L2 记账     发送前先记、发失败回滚（消灭竞态窗口）
+        #   L3 熔断     连续 4 轮自动回复且中间无对方消息 → 静音 120s
         #
-        #     ① msg.is_self  —— 微信数据库里 sender 就是本机账号
-        #     ② 内容匹配刚发出去的某条（用来排除"我自己手动发的"）
-        #
-        #   只有"我自己发的 + 内容刚发过"才算回环。
-        #   对方发来的 is_self 就是 False，永远不会被拦。
-        recently_sent: list = []        # [(文本, 时间戳)]
-        ECHO_WINDOW = 12.0              # 秒。够覆盖数据库写入+轮询延迟即可
-        ECHO_MAX = 20
+        # 对方发来的消息 is_self 恒为 False，永远不会被这四层误伤。
+        guard = LoopGuard(allow_self=bool(allow_self))
+        remember_sent = guard.note_sent        # 旧名字，表情包路径还在用
+        forget_sent = guard.rollback_sent
 
         # 第二层：单会话连发上限。
         #
@@ -912,56 +1005,12 @@ class EngineWorker(QThread):
         #   现在的判据是"**我们自己主动连发**"：只统计引擎自动发的，
         #   而且要密集到不正常（30 秒 6 条）。人聊天的节奏不会这样。
         last_reply_at: dict = {}        # chat_id -> [时间戳...]
+        # 昵称缓存：chat_id -> 上次记下的名字。
+        # 微信里改备注/昵称之后，wxid 不变但名字变了 —— 每次来消息顺手
+        # 比对一次，变了才写库（不然每条消息都要开一次 sqlite，聊天密了会拖）。
+        _name_seen: dict = {}
         BURST_WINDOW = 30.0
         BURST_MAX = 6
-
-        def _normalize(t: str) -> str:
-            """归一化后再比对。
-
-            读回来的文本可能多出：
-              - 群消息的 "wxid_xxx: " 前缀
-              - 发送时自己加的 "@昵称 "
-            这些必须剥掉，否则回环识别会失效（实测群里漏拦）。
-            """
-            import re as _re
-            v = (t or "").strip()
-            v = _re.sub(r"^[A-Za-z0-9_@-]{4,}:\s?", "", v)
-            v = _re.sub(r"^(@\S+\s*)+", "", v)
-            return v.strip()
-
-        def text_is_echo(text: str) -> bool:
-            """这段文字是不是我们自己刚发出去的那条。
-
-            ⚠ 单独调它**没有意义** —— 必须和 msg.is_self 一起判断。
-              对方原样复述她的话时，这里也会返回 True，但那是正常聊天。
-        """
-            now = time.time()
-            cutoff = now - ECHO_WINDOW
-            while recently_sent and recently_sent[0][1] < cutoff:
-                recently_sent.pop(0)
-
-            t = _normalize(text)
-            if not t:
-                return False
-            for sent_text, _ in recently_sent:
-                n = _normalize(sent_text)
-                if not n:
-                    continue
-                if t == n:
-                    return True
-                # ⚠ 前缀匹配曾经是 6 个字，太松 ——「那还是叫大肥鱼吧」和
-                #   「那还是叫大肥鱼」的开头一样，正常对话会被误判。
-                #   收紧到「短的那边至少 12 字，且是长的那边的开头」，
-                #   只可能命中"同一条消息被截断"这种真回环。
-                k = min(len(n), len(t))
-                if k >= 12 and (t.startswith(n) or n.startswith(t)):
-                    return True
-            return False
-
-        def remember_sent(text: str) -> None:
-            recently_sent.append((text.strip(), time.time()))
-            if len(recently_sent) > ECHO_MAX:
-                del recently_sent[:-ECHO_MAX]
 
         def handle(msg) -> None:
             nonlocal gate          # 群聊触发器在 run 里建，这里只改引用
@@ -972,16 +1021,15 @@ class EngineWorker(QThread):
             if not text:
                 return
 
-            # 自己发的消息：默认不处理（那是我们自己的尾巴）。
-            # allow_self 打开时（文件传输助手自测）继续往下走，
-            # 但要额外做内容比对，防止真回环。
-            if msg.is_self:
-                if not allow_self:
-                    return
-                # 是我们刚发的那条 → 回环，丢弃
-                if text_is_echo(text):
-                    self._log(f"[回环] 读到自己刚发的，跳过：{msg.preview(30)}", "")
-                    return
+            now_ts = time.time()
+
+            # ── 闸门 L0~L2：静音 / 白名单 / 记账比对 ──
+            # 全在 LoopGuard 里，一行调用。返回值带原因码，直接进日志。
+            verdict = guard.admit(msg)
+            if not verdict.allow:
+                self._log(f"[回环] {msg.chat_name}：{verdict.detail}"
+                          f"（{msg.preview(30)}）", "")
+                return
 
             # ⚠ 对方发来的消息**永远不做内容比对**。
             #   他原样复述她的话，是聊天，不是回环。
@@ -1055,6 +1103,26 @@ class EngineWorker(QThread):
 
             self._log(f"[收] {msg.chat_name}：{msg.preview(50)}", "in")
             self.chat_event.emit(msg.chat_name, msg.preview(60), "in")
+
+            # 昵称跟着微信走：wxid 是稳定的，昵称/备注会改。
+            # 记下当前名字，印象页和记忆页显示的就是最新的那个。
+            # 只在变化时写库（见 _name_seen 的注释）。
+            try:
+                _nick = (msg.chat_name or "").strip()
+                if (_nick and _nick != msg.chat_id
+                        and _name_seen.get(msg.chat_id) != _nick):
+                    from bigfish import memory as _Mn, vault as _Vn
+
+                    _dbn = _Vn.memory_db_path()
+                    if _dbn:
+                        _is_grp = msg.chat_id.endswith("@chatroom")
+                        _ownn = (_Mn.owner_of_group(msg.chat_id) if _is_grp
+                                 else _Mn.owner_of_private(msg.chat_id))
+                        _Mn.ensure_owner(_dbn, "dafeiyu", _ownn,
+                                         display_name=_nick)
+                        _name_seen[msg.chat_id] = _nick
+            except Exception:
+                pass
 
             # ── 插件判定（gate 类）：该不该回 ──
             #
@@ -1332,13 +1400,23 @@ class EngineWorker(QThread):
                     if _i > 0:
                         # 条间停顿：像在打字，不是一口气刷屏
                         time.sleep(gaps[_i] if _i < len(gaps) else 0.8)
+                    # ⭐ 先记账，再发送。
+                    #
+                    #   以前是发完才 remember_sent —— 而「UIA 按回车」到
+                    #   「微信写库」是异步的：行可能先落库，账还没记上，
+                    #   watcher 恰好在那一刻轮询，这条就被当成对方说的。
+                    #   1.2 秒一轮，单个窗口很窄，但聊一晚上必然撞上；
+                    #   撞上一次就进入自问自答（线上真发生了）。
+                    #   顺序反过来就没有窗口：库里出现的那一刻，账早就记好了。
+                    remember_sent(_part)
                     r = self.sender.send(msg.chat_name, _part)
                     if not r.ok:
+                        # 没发出去，这笔账必须撤 —— 留着会让对方
+                        # 原样说一句同样的话时被误判成回环。
+                        forget_sent(_part)
                         self._log(f"[发] ✗ {r.detail}", "err")
                         break
                     sent_any = True
-                    # 记下来，等这条消息被监听器读回来时能认出来
-                    remember_sent(_part)
                 if sent_any:
                     # ⚠ 只有真的发出去了才写进对话历史。
                     #   以前这行在发送之前，于是「打开会话失败」那轮也被记成
@@ -1348,6 +1426,16 @@ class EngineWorker(QThread):
                     self.reply_count += 1
                     remember_sent(reply)
                     last_reply_at.setdefault(msg.chat_id, []).append(time.time())
+
+                    # 闸门 L3：轮级熔断。一轮自动回复 = 一次。
+                    # 中间只要夹了一条对方的消息，guard.admit 已经清零了。
+                    if guard.note_reply(msg.chat_id):
+                        self._log(
+                            f"[自环熔断] {msg.chat_name} 连续 {guard.trip} 轮"
+                            f"自动回复、中间一条对方消息都没有 —— "
+                            f"判定她在自问自答，该会话静音 {int(guard.mute)}s。"
+                            f"检查 allow_self 与回环识别。", "err")
+
                     self.stats.emit(self.recv_count, self.reply_count)
                     self._log(f"[发] {reply[:60]}", "out")
                     self.chat_event.emit(msg.chat_name, reply[:60], "out")
@@ -1426,10 +1514,18 @@ class EngineWorker(QThread):
 # ══════════════════════════════════════════════════════════════════
 #  后端接口（暴露给 JS）
 # ══════════════════════════════════════════════════════════════════
+def _parse_payload(raw: str) -> dict:
+    """前端传过来的 JSON。坏了就当空，不让它把后台线程炸掉。"""
+    try:
+        d = json.loads(raw or "{}")
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
 class Backend(QObject):
     log_message = Signal(str, str)
     chat_event = Signal(str, str, str)
-
     def __init__(self, window):
         super().__init__()
         self.window = window
@@ -1446,6 +1542,12 @@ class Backend(QObject):
         self._log_buffer = []
         self._log_seq = 0
         self._log_sent = 0
+        # 「测试连接」的票据表。测试要真发一次请求（可能几秒到几十秒），
+        # 同步做会把整个界面卡住 —— Qt 的 slot 在 GUI 线程里跑。
+        # 所以开线程测，前端拿 ticket 轮询。
+        self._tests: dict = {}
+        # 「获取模型列表」的票据表。同一个理由，另一件事。
+        self._fetches: dict = {}
 
     # ------------------------------------------------------------------
     # 账号选择
@@ -2442,12 +2544,61 @@ class Backend(QObject):
             return json.dumps({"pools": [], "total": 0,
                                "error": str(exc)}, ensure_ascii=False)
 
+    def _lazy_reader(self):
+        """尽力拿一个 reader；拿不到就返回 None，不抛。
+
+        印象页要显示昵称，而昵称只有微信的 contact 库知道。用户可能
+        还没在「会话」页点过选号，但配置文件里有 account —— 那就按它开一个。
+
+        为什么不复用 `_reader_or_open`：那个在没选号时会 raise，
+        而「显示昵称」这种附加信息不该让整页报错。
+        """
+        if self._reader is not None:
+            return self._reader
+        try:
+            acc = str((load_json_config().get("auto_reply") or {})
+                      .get("account") or "")
+            if not acc:
+                return None
+            from bigfish.wechat import WeChatReader
+
+            self._reader = WeChatReader(account=acc).open()
+            return self._reader
+        except Exception:
+            return None
+
+    def _nick_of(self, uid: str) -> str:
+        """wxid → 当前昵称。查不到返回空串。
+
+        `_display_name` 已经有一整条解析链（备注 → 昵称 → 微信号 → 群名 →
+        filehelper → 兜底），这里只是包一层异常。
+        """
+        if not uid:
+            return ""
+        r = self._lazy_reader()
+        if r is None:
+            return ""
+        try:
+            name = r._display_name(uid) or ""
+        except Exception:
+            return ""
+        # 兜底占位（「未知联系人(abc123)」）别写进库里 ——
+        # 那是"查不到"的显示形态，不是真昵称，写进去就永远修不掉了。
+        if name.startswith("未知联系人("):
+            return ""
+        return name[:80]
+
     @Slot(result=str)
     def impression_board(self) -> str:
         """「角色印象」页：一人一格，格子里是她的评语 + 开放信息清单。
 
         主人那一格永远排第一（界面上第一个横向分页）。
         排序在这里做一次，不让前端猜。
+
+        ⚠ 昵称在这里补一次。owners 表里的 display_name 以前从来没人写
+          （四处 ensure_owner 都没传），所以印象页的标签是裸 wxid。
+          每次打开这一页顺手把最新昵称刷进库：微信里改了备注或昵称，
+          下次进页面就是新的 —— wxid 不变，只是名字跟着变。
         """
         try:
             from bigfish import memory as M, vault as V
@@ -2458,6 +2609,7 @@ class Backend(QObject):
             people = data.get("people") or []
             for p in people:
                 p["isOwner"] = (p["owner"] == me)
+                self._refresh_display_name(db, p)
             # 主人置顶，其余按事实数排 —— 聊得多的人排前面
             people.sort(key=lambda p: (0 if p.get("isOwner") else 1,
                                        -int(p.get("facts") or 0)))
@@ -2467,6 +2619,30 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"people": [], "error": str(exc)},
                               ensure_ascii=False)
+
+    def _refresh_display_name(self, db: str, p: dict) -> None:
+        """把一个人格子的 name 换成当前昵称（并写回 owners 表）。"""
+        owner = str(p.get("owner") or "")
+        if not owner or not db:
+            return
+        uid = owner.rsplit(":", 1)[-1]
+        cur = str(p.get("name") or "")
+        # 已经是昵称（不等于 wxid/external_id）就不折腾
+        already = bool(cur) and cur != uid
+        nick = self._nick_of(uid)
+        if not nick:
+            return
+        if nick == cur:
+            return
+        p["name"] = nick
+        if already and nick == cur:
+            return
+        try:
+            from bigfish import memory as M
+
+            M.ensure_owner(db, "dafeiyu", owner, display_name=nick)
+        except Exception:
+            pass
 
     @Slot(str, str, result=str)
     def set_impression(self, owner: str, note: str) -> str:
@@ -3514,30 +3690,46 @@ class Backend(QObject):
 
     @Slot(result=str)
     def check_update(self) -> str:
+        """查有没有新版。
+
+        ⚠ 当前版本**只认 `bigfish.__version__`**。
+          以前用的是 config.json 里的 `update.current`，而那份配置里写死了
+          "0.1.0" —— 程序走到 0.4.1 了它还是 0.1.0，于是拿 0.1.0 去比
+          Release 的 tag，0.4.0 就会显示成"有新版"。用户点了更新，
+          装回来还是同一个版本。
+
+        ⚠ 仓库也**不再要求用户自己配**。零配置能用是底线：
+          `update.repo` 留空就用内置的 DEFAULT_REPO，fork 的人填自己的。
+        """
+        from bigfish import __version__ as _ver
         try:
-            from bigfish.updater import Updater, read_update_config
+            from bigfish.updater import (DEFAULT_REPO, Updater,
+                                         normalize_repo, read_update_config)
 
             uc = read_update_config(CONFIG_PATH)
-            repo = uc.get("repo") or ""
-            if not repo:
-                return json.dumps({"has_update": False,
-                                   "error": "未配置更新仓库（config.json 的 update.repo）"},
-                                  ensure_ascii=False)
-            cache = os.path.join(_ROOT, ".tmp", "update")
-            up = Updater(repo, uc.get("current") or "0.1.0", cache,
+            repo = normalize_repo(uc.get("repo") or "") or DEFAULT_REPO
+            current = _ver
+
+            cache = os.path.join(_APP_DIR, ".tmp", "update")
+            up = Updater(repo, current, cache,
                          enabled=bool(uc.get("enabled", True)))
             info = up.check()
+            info["current"] = current
+            info["repo"] = repo
             self._update_info = info
             return json.dumps(info, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"has_update": False, "error": str(exc)},
+            return json.dumps({"has_update": False, "error": str(exc),
+                               "current": _ver},
                               ensure_ascii=False)
 
     @Slot(result=str)
     def apply_update(self) -> str:
         """下载新版并安排替换。调用后建议用户手动关闭程序。"""
+        from bigfish import __version__ as _ver
         try:
-            from bigfish.updater import Updater, read_update_config
+            from bigfish.updater import (DEFAULT_REPO, Updater,
+                                         normalize_repo, read_update_config)
 
             info = getattr(self, "_update_info", None)
             if not info or not info.get("has_update"):
@@ -3545,8 +3737,9 @@ class Backend(QObject):
                                   ensure_ascii=False)
 
             uc = read_update_config(CONFIG_PATH)
-            cache = os.path.join(_ROOT, ".tmp", "update")
-            up = Updater(uc.get("repo") or "", "0", cache)
+            repo = normalize_repo(uc.get("repo") or "") or DEFAULT_REPO
+            cache = os.path.join(_APP_DIR, ".tmp", "update")
+            up = Updater(repo, _ver, cache)
 
             target = sys.executable
             # 打包后 sys.executable 是 exe；开发态是 python.exe，不能覆盖
@@ -3571,14 +3764,39 @@ class Backend(QObject):
 
     @Slot(result=str)
     def get_config(self) -> str:
+        from bigfish import providers as _P
+        from bigfish.replier import ModelConfig
+
         c = load_json_config()
         ar = c.get("auto_reply") or {}
+        mc = ModelConfig.load()
+        ready, why = mc.status()
         return json.dumps({
-            "endpoint": c.get("endpoint", ""),
-            "model": c.get("model", ""),
-            "api_key": c.get("api_key", ""),
-            "temperature": c.get("temperature", 1.0),
-            "max_tokens": c.get("max_tokens", 2600),
+            # 模型接入的完整状态。界面不再直接编辑 endpoint ——
+            # 用户只需要「选一家 + 粘 Key」，地址和协议由预设给。
+            "llm": {
+                "channel": mc.channel,
+                "base_url": mc.base_url or mc.preset.base_url,
+                "model": mc.model or mc.eff_model,
+                "api_key": mc.api_key,
+                "protocol": mc.eff_protocol,
+                "temperature": mc.temperature,
+                "max_tokens": mc.max_tokens,
+                "timeout": mc.timeout,
+                "eff_base_url": mc.eff_base_url,
+                "url": mc.url,
+                "ready": ready,
+                "status": why,
+                "needs_key": mc.needs_key,
+                "preset_name": mc.preset.name,
+                "note": mc.preset.note,
+                "key_hint": mc.preset.key_hint,
+                "doc": mc.preset.doc,
+                "suggest": list(mc.preset.models),
+            },
+            "channels": _P.channels(),
+            "protocols": [{"id": p, "label": _P.PROTOCOL_LABEL[p]}
+                          for p in _P.PROTOCOLS],
             "interval": ar.get("interval", 1.2),
             "max_reply_chars": ar.get("max_reply_chars", 300),
             "quiet_hours": ar.get("quiet_hours", []),
@@ -3590,13 +3808,36 @@ class Backend(QObject):
     @Slot(str, result=str)
     def save_config(self, payload: str) -> str:
         try:
+            from bigfish import providers as _P
+
             d = json.loads(payload)
             c = load_json_config()
-            c["endpoint"] = d.get("endpoint", c.get("endpoint"))
-            c["model"] = d.get("model", c.get("model"))
-            c["api_key"] = d.get("api_key", "")
-            c["temperature"] = float(d.get("temperature", 1.0))
-            c["max_tokens"] = int(d.get("max_tokens", 2600))
+
+            # 模型接入写进 llm 段，同时清掉老的顶层字段 ——
+            # 留着会和 llm 打架（replier 优先读 llm，老字段变成没人看的
+            # 僵尸配置，用户改它不生效，跟 CONFIG_PATH 那个坑同一个形状）。
+            llm = d.get("llm")
+            if isinstance(llm, dict):
+                old = c.get("llm") if isinstance(c.get("llm"), dict) else {}
+                merged = {
+                    "channel": str(llm.get("channel")
+                                   or old.get("channel")
+                                   or _P.DEFAULT_CHANNEL),
+                    "base_url": str(llm.get("base_url", old.get("base_url", ""))),
+                    "model": str(llm.get("model", old.get("model", ""))),
+                    "api_key": str(llm.get("api_key", old.get("api_key", ""))),
+                    "protocol": str(llm.get("protocol", old.get("protocol", ""))),
+                    "temperature": float(llm.get("temperature",
+                                                 old.get("temperature", 1.0))),
+                    "max_tokens": int(llm.get("max_tokens",
+                                              old.get("max_tokens", 2600))),
+                    "timeout": float(llm.get("timeout",
+                                             old.get("timeout", 90.0))),
+                }
+                c["llm"] = merged
+                for k in ("endpoint", "model", "api_key", "temperature",
+                          "max_tokens", "timeout"):
+                    c.pop(k, None)
 
             ar = c.setdefault("auto_reply", {})
             ar["interval"] = float(d.get("interval", 1.2))
@@ -3612,6 +3853,104 @@ class Backend(QObject):
             return json.dumps({"ok": True})
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    # ── 测试连接 / 获取模型列表 ──
+    #
+    # 两个都是「真发一次网络请求」，都要等 0.5~25 秒。Qt 的 slot 跑在 GUI
+    # 线程，同步做会把窗口冻住。所以统一走「开线程 + 票据轮询」：
+    #   xxx() 立刻返回 ticket → 前端每秒 poll_xxx(ticket) → done 了就显示。
+    @Slot(str, result=str)
+    def test_model(self, payload: str) -> str:
+        import threading
+        import uuid
+
+        d = _parse_payload(payload)
+        tid = uuid.uuid4().hex[:10]
+        self._tests[tid] = {"done": False, "ok": False, "text": "正在连接…"}
+        if len(self._tests) > 20:
+            for k in list(self._tests)[:-20]:
+                self._tests.pop(k, None)
+
+        def work() -> None:
+            try:
+                from bigfish.replier import ModelConfig, test_connection
+
+                cfg = ModelConfig(
+                    channel=str(d.get("channel") or "custom"),
+                    base_url=str(d.get("base_url") or ""),
+                    model=str(d.get("model") or ""),
+                    api_key=str(d.get("api_key") or ""),
+                    protocol=str(d.get("protocol") or ""),
+                    temperature=float(d.get("temperature") or 1.0),
+                    max_tokens=int(d.get("max_tokens") or 2600),
+                )
+                ok, text = test_connection(cfg, timeout=25.0)
+                self._tests[tid] = {"done": True, "ok": ok, "text": text}
+            except Exception as exc:
+                self._tests[tid] = {
+                    "done": True, "ok": False,
+                    "text": f"{type(exc).__name__}: {exc}"}
+
+        threading.Thread(target=work, name="bigfish-test",
+                         daemon=True).start()
+        return json.dumps({"ticket": tid})
+
+    @Slot(str, result=str)
+    def fetch_models(self, payload: str) -> str:
+        """拉这家「你这把 Key 能用哪些模型」。
+
+        这一步是必须的：预设里写的模型 ID 只是样本，会过期；而
+        「你这把 Key 能用哪些」只有对方知道（免费额度、区域、企业版都不一样）。
+        """
+        import threading
+        import uuid
+
+        d = _parse_payload(payload)
+        tid = uuid.uuid4().hex[:10]
+        self._fetches[tid] = {"done": False, "ok": False,
+                              "text": "正在获取…", "models": []}
+        if len(self._fetches) > 20:
+            for k in list(self._fetches)[:-20]:
+                self._fetches.pop(k, None)
+
+        def work() -> None:
+            try:
+                from bigfish.replier import ModelConfig, list_models
+
+                cfg = ModelConfig(
+                    channel=str(d.get("channel") or "custom"),
+                    base_url=str(d.get("base_url") or ""),
+                    model=str(d.get("model") or ""),
+                    api_key=str(d.get("api_key") or ""),
+                    protocol=str(d.get("protocol") or ""),
+                )
+                ok, models, text = list_models(cfg, timeout=20.0)
+                self._fetches[tid] = {"done": True, "ok": ok,
+                                      "text": text, "models": models}
+            except Exception as exc:
+                self._fetches[tid] = {
+                    "done": True, "ok": False, "models": [],
+                    "text": f"{type(exc).__name__}: {exc}"}
+
+        threading.Thread(target=work, name="bigfish-models",
+                         daemon=True).start()
+        return json.dumps({"ticket": tid})
+
+    @Slot(str, result=str)
+    def poll_test(self, ticket: str) -> str:
+        r = self._tests.get(ticket or "")
+        if not r:
+            return json.dumps({"done": True, "ok": False, "text": "这次测试已失效"},
+                              ensure_ascii=False)
+        return json.dumps(r, ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def poll_fetch(self, ticket: str) -> str:
+        r = self._fetches.get(ticket or "")
+        if not r:
+            return json.dumps({"done": True, "ok": False, "models": [],
+                               "text": "这次获取已失效"}, ensure_ascii=False)
+        return json.dumps(r, ensure_ascii=False)
 
     # ── 启停 ──
     @Slot(result=str)
@@ -4064,6 +4403,59 @@ def _run_selftest_inner() -> int:
         return f"{len(parts)} 条 / {total:.1f}s｜" + "｜".join(parts)
     item("说法", t_say)
 
+    # 自环防护：这个模块坏了的表现是"她会自己跟自己聊"，启动不报错、
+    # 界面正常、只有聊天时才出事 —— 必须在自检里验一次。
+    def t_loop():
+        from bigfish.loopguard import LoopGuard
+
+        class _M:
+            def __init__(self, chat, text, is_self):
+                self.chat_id, self.text, self.is_self = chat, text, is_self
+
+        # 生产默认：自己发的一律丢
+        g = LoopGuard(allow_self=True)
+        v = g.admit(_M("wxid_dad", "我自己发的", True))
+        assert not v.allow and v.reason == "self", f"私聊没拦住：{v}"
+
+        # 自测通道还能用
+        g2 = LoopGuard(allow_self=True)
+        assert g2.admit(_M("filehelper", "自测消息", True)).allow, "filehelper 被拦了"
+
+        # 记账 + 熔断
+        g2.note_sent("自测消息")
+        assert not g2.admit(_M("filehelper", "自测消息", True)).allow, "echo 没认出"
+
+        g3 = LoopGuard(trip=4)
+        tripped = [g3.note_reply("c") for _ in range(4)]
+        assert tripped == [False, False, False, True], f"熔断点不对：{tripped}"
+
+        # 对方的消息永远放行
+        g4 = LoopGuard(allow_self=True)
+        g4.note_sent("一句她刚说的话")
+        assert g4.admit(_M("wxid_dad", "一句她刚说的话", False)).allow, \
+            "对方复述被误杀了"
+
+        return "私聊拦住 / 自测放行 / 第4轮熔断 / 对方不误杀"
+    item("自环", t_loop)
+
+    # 更新：只验"配置读得通、仓库名收拾得对"，不联网。
+    # 自检要能离线跑 —— 联网的那次留给用户点「检查」。
+    def t_update():
+        from bigfish import __version__ as _v
+        from bigfish.updater import (DEFAULT_REPO, Updater, normalize_repo,
+                                     read_update_config)
+
+        uc = read_update_config(CONFIG_PATH)
+        repo = normalize_repo(uc.get("repo") or "") or DEFAULT_REPO
+        assert "/" in repo, f"仓库名不合法：{repo!r}"
+        # 完整 URL 也要能收拾成 owner/repo
+        assert normalize_repo("https://github.com/a/b.git") == "a/b"
+        up = Updater(repo, _v, os.path.join(_APP_DIR, ".tmp", "update"))
+        assert up.repo == repo
+        src = "配置里填的" if (uc.get("repo") or "").strip() else "内置默认"
+        return f"{repo}（{src}）｜当前 v{_v}"
+    item("更新", t_update)
+
     # 2. 心情
     def t_mood():
         from bigfish import vault as V
@@ -4116,11 +4508,15 @@ def _run_selftest_inner() -> int:
     # 4. 模型
     def t_model():
         from bigfish.replier import ModelConfig, call_model
+
         c = ModelConfig.load()
-        assert c.ready, f"模型未就绪 {c.endpoint}"
+        ok, why = c.status()
+        # c.endpoint 是老属性，已经没有了 —— 报错信息要用 status，
+        # 它会说清缺的是 Key、地址还是模型 ID。
+        assert ok, f"模型未就绪：{why}"
         r = call_model(c, "你叫大肥鱼。", "回两个字")
         assert r
-        return f"{c.model} -> {r[:20]!r}"
+        return f"{c.preset.name} · {c.eff_model} -> {r[:20]!r}"
     item("模型", t_model)
 
     # 5. 数据库
@@ -4128,10 +4524,20 @@ def _run_selftest_inner() -> int:
 
     def t_db():
         from bigfish.wechat import WeChatReader
-        r = WeChatReader().open()
+
+        # ⚠ 优先用配置里那个账号。
+        #   无参 WeChatReader() 会按数据库 mtime 自动挑 —— 这台机器上同时
+        #   登录着三个微信号，自检就挑到了没用过的那个，打出一行别人的昵称，
+        #   看着像"接错号了"。自检要验的是配置的那条路，不是任意一条。
+        acc = str((load_json_config().get("auto_reply") or {}).get("account") or "")
+        try:
+            r = WeChatReader(account=acc).open() if acc else WeChatReader().open()
+        except Exception:
+            r = WeChatReader().open()
         disk_db["r"] = r
         info = r.self_info()
-        return (f"{info.get('nick_name')}，"
+        tag = "" if acc else "（未配置账号，按 mtime 自动挑）"
+        return (f"{info.get('nick_name')}{tag}，"
                 f"密钥 {len(r._db._keys)}/{len(r._db._db_files)}")
     item("微信数据库", t_db)
 

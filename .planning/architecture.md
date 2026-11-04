@@ -122,7 +122,9 @@ session scope 过滤。Python 重写必然产生偏差，结果是
 1. 手机发「在吗」
 2. 微信写入本地 SQLCipher 数据库
 3. MessageWatcher 轮询发现 sort_seq 变大
-4. 取出消息，render.py 语义化
+   取出消息，render.py 语义化
+4. **LoopGuard.admit()** 四层闸门（见下节「自环防护」）
+   放行后才继续；自己发的消息在这里被拦掉
 5. GroupGate 判定（私聊直接过）
 6. BigFishApp 组装 prompt：
      system = soul.render_persona() + mood.injected_text
@@ -133,7 +135,9 @@ session scope 过滤。Python 重写必然产生偏差，结果是
      定位 mmui::ChatInputField → 校验 Name
      写入文本 → 回车
 9. 微信把消息发出去，写回数据库
-10. remember_sent() 记住这条，防止被读回来时再次触发
+10. **发送之前**就 guard.note_sent(part)（乐观记账），
+    发失败 guard.rollback_sent()。注意顺序 ——
+    发完再记账有竞态窗口（见下节）
 11. **发送成功之后**（这一步以前完全没有）：
       vault.record_exchange()  → 一问一答两条进记忆库
         · event_key = wx-u-<local_id>，幂等
@@ -147,6 +151,47 @@ session scope 过滤。Python 重写必然产生偏差，结果是
 **为什么写在第 11 步而不是第 6 步**：
 第 6 步只是"准备要说的话"，那时还没发出去。
 没发出去的一轮不算对话发生过 —— 记了会让记忆里多出她从没说过的内容。
+
+## 自环防护：一条消息回到自己身上时
+
+UIA 发出去的消息会立刻被自己的监听器读回来（同一个数据库）。
+
+```
+她发 → 微信写库 → watcher 读到 → 判定这条该不该回
+```
+
+如果判定错了，就进入**她自己跟自己聊**的循环。2026-11-04 真发生过一次，
+两分钟十几条，只能杀进程。
+
+`bigfish/loopguard.py` 的四层闸门：
+
+| 层 | 机制 | 挡住什么 |
+|---|---|---|
+| L0 | 静音 | 熔断后该会话完全不处理 |
+| L1 | 白名单 | `allow_self` 只对 `filehelper` 生效；私聊/群聊就算开着也拦 |
+| L2 | 乐观记账 | 发送**之前**记账、失败回滚 |
+| L3 | 轮级熔断 | 连续 4 轮自动回复且中间无对方消息 → 静音 120 秒 |
+
+### 为什么不能只靠「精确识别」
+
+L1（`is_self`）和 L2（内容比对）都是**精确判断**：判断对了没事，错了没兜底。
+
+而 L2 有天然竞态：UIA 按回车就返回，微信**异步**写库。发完再记账的话，
+数据库可能先落地、watcher 恰好在这一刻轮询到 —— 这条就"没有账可对"。
+1.2 秒一轮窗口很窄，但聊一晚上必然撞上；撞上就是正反馈。
+
+所以：**顺序反过来**（先记账再发），外加 L3 做症状级兜底。
+L3 不看原因只看症状 —— "连续 4 轮回复之间一句对方的话都没有"，
+这个判据不可能是正常聊天。
+
+### 为什么 L3 按「轮」不按「条」
+
+一次回复分 2~4 条发出去，那是**一轮**。按条计会把分条功能本身判成自环。
+
+### 为什么对方不会被误杀
+
+`is_self=False` 时 `admit()` 直接放行并清零计数，**不做任何内容比对**。
+早期版本靠"文字相同"判回环，老爸原样复述她的话（聊天里极常见）被拦过两次。
 
 ## 发表情：第二条发送通道
 
@@ -681,3 +726,76 @@ decay = 0.5 ** (距上次使用天数 / 90)
 ```
 
 这是「让模型主动查」的穷人版：不改架构，只在明显没料时补一枪。
+
+## 模型接入：三条路与三种协议
+
+```
+                ┌─────────────────────────────────────────┐
+   设置页  ───►  │ config.json 的 llm 段                    │
+   选一家/填Key  │  channel / base_url / model / api_key    │
+                │  protocol / temperature / max_tokens     │
+                └────────────────┬────────────────────────┘
+                                 │
+                    ModelConfig.load()
+                                 │
+              ┌──────────────────┴───────────────────┐
+              │  预设兜底：bigfish/providers.py       │
+              │  空字段 → 取预设的 base_url / protocol │
+              │        / 模型列表第一个               │
+              └──────────────────┬───────────────────┘
+                                 │
+                        call_model(cfg, system, user)
+                                 │
+        ┌────────────────┬───────┴────────┬────────────────┐
+        ▼                ▼                ▼                ▼
+    openai           anthropic         gemini           错误处理
+    Bearer           x-api-key         ?key=            翻中文
+    messages[]       system 顶层       systemInstruction 401/404/429…
+    choices[0]       content[]         candidates[0]
+```
+
+### 三条路
+
+| channel | 谁用 |
+|---|---|
+| 预设 id | 绝大多数人：选一家，粘 Key |
+| `custom` | 中转站、公司内网、自建服务：填 base_url + 模型 ID |
+| `magpie` | 本机或别人的 Magpie 网关：不用 Key |
+
+预设是**填好的默认值**，不是白名单。地址、协议、模型三项都能改 ——
+这个设计很重要：预设写错了不致命，用户改一次就好。
+
+### 三种协议不是「换个地址」
+
+| | OpenAI 兼容 | Anthropic | Gemini |
+|---|---|---|---|
+| 认证 | `Authorization: Bearer` | `x-api-key` + `anthropic-version` | `?key=` 查询串 |
+| system | `messages[0]` | **顶层 `system`** | `systemInstruction` |
+| 正文 | `choices[0].message.content` | `content[]` 挑 `type=="text"` | `candidates[0].content.parts[]` |
+| 推理 | `message.reasoning_content` | `content[]` 挑 `type=="thinking"` | `parts[]` 挑 `thought: true` |
+| token | `max_tokens` | `max_tokens` | `generationConfig.maxOutputTokens` |
+
+三个必须记住的：Anthropic 的 system 不能塞 messages（400）；Gemini 的 key
+不能放请求头（400）；Gemini 的模型名在 URL 里不在请求体里。
+
+### 为什么不用 SDK
+
+`openai` + `anthropic` 两个包 10MB+，而实际要的只有「发一个 POST、取一个
+字符串」。这个程序打包已经 201MB，不值得再肥。urllib 够用，
+而且三种协议的细节控制在自己手里 —— 用 SDK 反而要为「兼容层怎么翻译」
+再查一遍文档。
+
+### 地址归一化
+
+用户粘 `https://api.deepseek.com/v1/chat/completions` 是最常见的事。
+不剥后缀会拼成 `.../chat/completions/chat/completions`，报一句 404 ——
+而用户"明明填对了"。`normalize_base()` 统一剥掉 `/chat/completions`、
+`/messages`、`/models/xxx:generateContent` 这类尾巴。
+
+### 测试连接为什么要真发请求
+
+只检查字段填没填，验不出 Key 无效、地址不通、模型名不存在 —— 这三样
+恰好是第一次配置最容易撞的。真发一次 `max_tokens=24`，0.5~3 秒出结果。
+
+Qt 的 slot 跑在 GUI 线程，同步做会把窗口冻住（最长 25 秒）。
+所以 `test_model` 开线程、立刻返回 ticket，前端 `poll_test` 每秒取一次。

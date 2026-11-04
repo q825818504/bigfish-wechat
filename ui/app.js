@@ -116,7 +116,7 @@ const CHECK_LABELS = {
   desktop: ['桌面可操作', '锁屏时无法发送'],
   wechat: ['微信进程', '需已登录并可见'],
   db: ['数据库密钥', '聊天记录解密'],
-  model: ['模型接口', 'Magpie 网关'],
+  model: ['模型接入', '选一家填 Key'],
   soul: ['灵魂数据', 'DSH 插件'],
 };
 
@@ -2329,15 +2329,222 @@ $('#btnDataRootDefault').addEventListener('click', async () => {
 
 /* ────────── 设置 ────────── */
 
+/* 模型接入。
+ *
+ * 流程照抄各家客户端（也照抄 magpie）：填地址 + Key → **从厂商拉真实模型
+ * 列表** → 选一个。预设给的只是"地址和协议的默认值"，模型名不能靠猜 ——
+ * 各家自己出什么模型，只有它自己的 /models 知道。
+ *
+ * 第一版这里写的是硬编码的模型建议值（datalist），那是偷工减料：
+ * 模型一更新就过期，而且"你这把 Key 能用哪些"本来就不是常量。
+ */
+let CHANNELS = [];
+let PROTOCOLS = [];
+let FETCHED_MODELS = [];
+
+function channelById(id) {
+  return CHANNELS.find((c) => c.id === id) || CHANNELS[CHANNELS.length - 1];
+}
+
+/** 把模型列表灌进下拉。当前值不在列表里也保留 —— 别让用户以为丢了。 */
+function setModelOptions(models, current) {
+  const sel = $('#cfgModelSel');
+  sel.innerHTML = '';
+
+  if (!models || !models.length) {
+    const o = document.createElement('option');
+    o.value = current || '';
+    o.textContent = current || '— 先点右边「获取模型」 —';
+    sel.appendChild(o);
+    return;
+  }
+
+  const seen = new Set();
+  models.forEach((m) => {
+    if (seen.has(m)) return;
+    seen.add(m);
+    const o = document.createElement('option');
+    o.value = m;
+    o.textContent = m;
+    sel.appendChild(o);
+  });
+
+  if (current && !seen.has(current)) {
+    const o = document.createElement('option');
+    o.value = current;
+    o.textContent = current + '（不在这个列表里）';
+    sel.insertBefore(o, sel.firstChild);
+  }
+  const pick = current || models[0] || '';
+  sel.value = pick;
+  if (!current) $('#cfgModel').value = pick;
+}
+
+/** 渠道变了：填地址/协议，并清掉上一个渠道的模型列表。 */
+function applyChannel(id, { keepValues = false } = {}) {
+  const ch = channelById(id);
+  if (!ch) return;
+
+  if (!keepValues) {
+    $('#cfgBaseUrl').value = ch.base_url || '';
+    $('#cfgProtocol').value = ch.protocol || 'openai';
+    FETCHED_MODELS = [];
+    setModelOptions([], '');
+    $('#cfgModel').value = '';
+  }
+
+  $('#channelNote').textContent = ch.note || '选一家，粘上 Key 就能用。';
+  const keyBox = $('#cfgApiKey');
+  keyBox.placeholder = ch.needs_key ? 'sk-…' : '这一家不需要 Key';
+  keyBox.disabled = !ch.needs_key;
+  $('#keyNote').textContent = ch.needs_key
+    ? (ch.key_hint ? `从 ${ch.key_hint} 拿。` : '这一家需要 API Key。')
+    : '本地服务，不需要 Key。';
+
+  const hint = $('#keyHint');
+  if (ch.doc) {
+    hint.href = ch.doc;
+    hint.textContent = ch.needs_key ? '去哪拿？' : '官网';
+    hint.classList.remove('hidden');
+  } else {
+    hint.classList.add('hidden');
+  }
+}
+
+function setTestResult(kind, text) {
+  const el = $('#testResult');
+  el.className = 'test-result' + (kind ? ' ' + kind : '');
+  el.textContent = text;
+}
+
+function setModelNote(kind, text) {
+  const el = $('#modelNote');
+  el.textContent = text;
+  // 它是 <small>，跟着 .field > small 的样式走。这里只改颜色，
+  // 换 className 会把那套样式丢掉。
+  el.style.color = kind === 'ok' ? 'var(--ok)'
+    : kind === 'err' ? 'var(--error)' : '';
+}
+
+/** 当前表单值装成后端要的 payload。 */
+function llmPayload() {
+  return {
+    channel: $('#cfgChannel').value,
+    base_url: $('#cfgBaseUrl').value.trim(),
+    model: $('#cfgModel').value.trim(),
+    api_key: $('#cfgApiKey').value,
+    protocol: $('#cfgProtocol').value,
+    temperature: parseFloat($('#cfgTemp').value) || 1.0,
+    max_tokens: parseInt($('#cfgMaxTokens').value, 10) || 2600,
+  };
+}
+
+/** 拉模型列表。成功就灌进下拉；失败只提示，不挡手填。 */
+async function fetchModels(quiet = false) {
+  if (!S.bridge) return;
+  const btn = $('#btnFetchModels');
+  btn.disabled = true;
+  setModelNote('', '正在获取…（最多 20 秒）');
+  try {
+    const r = JSON.parse(await S.bridge.fetch_models(JSON.stringify(llmPayload())));
+    if (!r.ticket) {
+      setModelNote('err', r.error || '获取失败');
+      return;
+    }
+    for (let i = 0; i < 22; i++) {
+      await new Promise((res) => setTimeout(res, 1000));
+      const p = JSON.parse(await S.bridge.poll_fetch(r.ticket));
+      if (p.done) {
+        if (p.ok) {
+          FETCHED_MODELS = p.models || [];
+          setModelOptions(FETCHED_MODELS, $('#cfgModel').value.trim());
+          setModelNote('ok', `拉到 ${FETCHED_MODELS.length} 个模型，在上面选一个。`);
+          if (!quiet) toast(`拿到 ${FETCHED_MODELS.length} 个模型`);
+        } else {
+          setModelNote('err', (p.text || '获取失败') + '　—— 也可以直接在下面手填。');
+          if (!quiet) toast('获取失败');
+        }
+        return;
+      }
+      setModelNote('', `正在获取…（${i + 1}s）`);
+    }
+    setModelNote('err', '等太久了，检查地址和网络。也可以直接手填。');
+  } catch (e) {
+    setModelNote('err', '获取出错：' + (e.message || e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('#btnFetchModels')?.addEventListener('click', () => fetchModels());
+
+$('#cfgModelSel')?.addEventListener('change', (e) => {
+  if (e.target.value) $('#cfgModel').value = e.target.value;
+});
+
+$('#cfgModel')?.addEventListener('input', (e) => {
+  const v = e.target.value.trim();
+  const sel = $('#cfgModelSel');
+  if ([...sel.options].some((o) => o.value === v)) sel.value = v;
+});
+
+$('#cfgChannel')?.addEventListener('change', async (e) => {
+  applyChannel(e.target.value);
+  setTestResult('', '换了渠道，先「获取模型」再「测试连接」。');
+  // 本地服务（Magpie / Ollama / LM Studio）不用填 Key，直接拉一次更顺
+  const ch = channelById(e.target.value);
+  if (ch && !ch.needs_key && ch.base_url) {
+    await fetchModels(true);
+  }
+});
+
 async function loadSettings() {
   if (!S.bridge) return;
   try {
     const c = JSON.parse(await S.bridge.get_config());
-    $('#cfgEndpoint').value = c.endpoint || '';
-    $('#cfgModel').value = c.model || '';
-    $('#cfgApiKey').value = c.api_key || '';
-    $('#cfgTemp').value = c.temperature ?? 1.0;
-    $('#cfgMaxTokens').value = c.max_tokens ?? 1600;
+
+    CHANNELS = c.channels || [];
+    PROTOCOLS = c.protocols || [];
+
+    const sel = $('#cfgChannel');
+    if (sel.options.length !== CHANNELS.length) {
+      sel.innerHTML = '';
+      CHANNELS.forEach((ch) => {
+        const o = document.createElement('option');
+        o.value = ch.id;
+        o.textContent = ch.name;
+        sel.appendChild(o);
+      });
+    }
+    const psel = $('#cfgProtocol');
+    if (psel.options.length !== PROTOCOLS.length) {
+      psel.innerHTML = '';
+      PROTOCOLS.forEach((p) => {
+        const o = document.createElement('option');
+        o.value = p.id;
+        o.textContent = p.label;
+        psel.appendChild(o);
+      });
+    }
+
+    const llm = c.llm || {};
+    sel.value = llm.channel || 'deepseek';
+    $('#cfgBaseUrl').value = llm.base_url || '';
+    $('#cfgModel').value = llm.model || '';
+    $('#cfgApiKey').value = llm.api_key || '';
+    $('#cfgProtocol').value = llm.protocol || 'openai';
+    $('#cfgTemp').value = llm.temperature ?? 1.0;
+    $('#cfgMaxTokens').value = llm.max_tokens ?? 2600;
+    applyChannel(sel.value, { keepValues: true });
+    // ⚠ 每次重新读配置都要清空上次拉到的列表。
+    //   不清的话，换了渠道/重载之后下拉里还挂着别家的模型 ——
+    //   用户会以为"这个渠道也有这些模型"（实测踩过：切回 Magpie 之后
+    //   下拉里还在显示上一个自定义供应商的 agnes-*）。
+    FETCHED_MODELS = [];
+    setModelOptions([], llm.model || '');
+
+    setModelNote('', '点「获取模型」从这家拉真实列表。拉不到就直接手填。');
+
     $('#cfgInterval').value = c.interval ?? 1.2;
     $('#cfgMaxChars').value = c.max_reply_chars ?? 300;
     $('#cfgQuiet').value = (c.quiet_hours || []).join(',');
@@ -2346,19 +2553,57 @@ async function loadSettings() {
     $('#cfgGroupAllowAll').value = (c.group_allow_all || []).join(',');
 
     const tag = $('#modelTag');
-    tag.textContent = c.model ? c.model.split('/').pop() : '未配置';
-    tag.className = 'tag ok';
+    tag.textContent = llm.ready
+      ? (llm.preset_name || '已配置')
+      : (llm.status || '未配置');
+    tag.className = 'tag ' + (llm.ready ? 'ok' : 'warn');
+
+    setTestResult('', '真发一次请求验证。填完先点这个。');
   } catch (e) { toast('读取设置失败'); }
 }
+
+$('#btnTestModel')?.addEventListener('click', async () => {
+  if (!S.bridge) return toast('后端未就绪');
+  const btn = $('#btnTestModel');
+  btn.disabled = true;
+  setTestResult('', '正在连接…（最多等 25 秒）');
+  try {
+    const r = JSON.parse(await S.bridge.test_model(JSON.stringify(llmPayload())));
+    if (!r.ticket) {
+      setTestResult('err', r.error || '启动测试失败');
+      return;
+    }
+    // 轮询。测试要真发一次请求，同步做会把窗口冻住，所以走票据。
+    for (let i = 0; i < 30; i++) {
+      await new Promise((res) => setTimeout(res, 1000));
+      const p = JSON.parse(await S.bridge.poll_test(r.ticket));
+      if (p.done) {
+        setTestResult(p.ok ? 'ok' : 'err', p.text || '');
+        toast(p.ok ? '连接正常' : '连接失败');
+        return;
+      }
+      setTestResult('', `正在连接…（${i + 1}s）`);
+    }
+    setTestResult('err', '等太久了，可能网络卡住或者地址不对');
+  } catch (e) {
+    setTestResult('err', '测试出错：' + (e.message || e));
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 $('#btnSave').addEventListener('click', async () => {
   if (!S.bridge) return toast('后端未就绪');
   const p = {
-    endpoint: $('#cfgEndpoint').value.trim(),
-    model: $('#cfgModel').value.trim(),
-    api_key: $('#cfgApiKey').value,
-    temperature: parseFloat($('#cfgTemp').value) || 1.0,
-    max_tokens: parseInt($('#cfgMaxTokens').value, 10) || 1600,
+    llm: {
+      channel: $('#cfgChannel').value,
+      base_url: $('#cfgBaseUrl').value.trim(),
+      model: $('#cfgModel').value.trim(),
+      api_key: $('#cfgApiKey').value,
+      protocol: $('#cfgProtocol').value,
+      temperature: parseFloat($('#cfgTemp').value) || 1.0,
+      max_tokens: parseInt($('#cfgMaxTokens').value, 10) || 2600,
+    },
     interval: parseFloat($('#cfgInterval').value) || 1.2,
     max_reply_chars: parseInt($('#cfgMaxChars').value, 10) || 300,
     quiet_hours: $('#cfgQuiet').value.split(',')
@@ -2382,50 +2627,116 @@ $('#btnSave').addEventListener('click', async () => {
   } catch (e) { toast('保存失败'); }
 });
 
-/* ────────── 更新 ────────── */
+/* ────────── 更新 ──────────
+ *
+ * 两条信息必须同时可读：**当前版本** 和 **最新版本**。
+ * 只报"发现新版"而不说自己在哪一版，用户没法判断该不该装。
+ */
+function fmtDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function renderUpdate(d) {
+  const row = $('#updateRow');
+  if (!row) return;
+  const top = $('#btnUpdate');          // 顶栏那个图标按钮
+  if (!d || !d.has_update) {
+    row.hidden = true;
+    if (top) top.hidden = true;
+    return;
+  }
+  row.hidden = false;
+  if (top) {
+    top.hidden = false;
+    top.title = `发现新版本 ${d.latest}（当前 ${d.current}）`;
+  }
+  const when = fmtDate(d.published);
+  $('#updateTitle').textContent =
+    `新版本 ${d.latest}（当前 ${d.current}${when ? '，' + when : ''}）`;
+  const notes = (d.notes || '').trim();
+  $('#updateNotes').textContent = notes
+    ? notes.split('\n').slice(0, 3).join(' ').slice(0, 160)
+    : '点右边下载。装完需要手动关一下程序。';
+}
 
 async function checkUpdate(manual = false) {
-  if (!S.bridge) return;
+  if (!S.bridge || !S.bridge.check_update) return;
+  const btn = $('#btnCheckUpdate');
+  if (manual && btn) { btn.disabled = true; btn.textContent = '检查中'; }
   try {
     const d = JSON.parse(await S.bridge.check_update());
-    if (d.disabled) return;
+    if (d.repo) {
+      const el = $('#updateSource');
+      if (el) el.textContent = `从 GitHub（${d.repo}）读取最新版本。发现新版可以一键下载。`;
+    }
+    if (d.disabled) {
+      if (manual) toast('自动更新已关闭（config.json 的 update.enabled）');
+      return;
+    }
     if (d.error) {
       if (manual) toast(d.error);
+      renderUpdate(null);
       return;
     }
+    renderUpdate(d);
     if (!d.has_update) {
-      if (manual) toast(`已是最新（${d.latest || '未知'}）`);
+      if (manual) {
+        toast(d.cached
+          ? `已是最新（${d.current}，本轮走缓存）`
+          : `已是最新（${d.current}）`);
+      }
       return;
     }
-    // 有新版：亮出顶栏按钮
-    $('#btnUpdate').hidden = false;
-    $('#btnUpdate').title = `发现新版 ${d.latest}`;
-    toast(`发现新版本 ${d.latest}`);
     S.updateInfo = d;
+    if (manual || !d.cached) toast(`发现新版本 ${d.latest}`);
   } catch (e) {
-    if (manual) toast('检查失败');
+    if (manual) toast('检查失败：' + (e.message || e));
+  } finally {
+    if (manual && btn) { btn.disabled = false; btn.textContent = '检查'; }
   }
 }
 
-$('#btnCheckUpdate').addEventListener('click', () => checkUpdate(true));
+$('#btnCheckUpdate')?.addEventListener('click', () => checkUpdate(true));
 
-$('#btnUpdate').addEventListener('click', async () => {
+/** 真正执行下载替换。顶栏图标和卡片按钮都走这里。 */
+async function doUpdate() {
   const d = S.updateInfo;
-  if (!d) return toast('没有可用更新');
+  if (!d) return toast('没有可用更新，先点「检查」');
   const ok = confirm(
     `发现新版本 ${d.latest}\n\n` +
     `当前版本 ${d.current}\n\n` +
-    `现在下载并安装？安装完成后需要手动关闭本程序。`);
+    `现在下载并安装？下载完成后需要手动关闭本程序，`
+    + `关掉后会自动替换。`);
   if (!ok) return;
 
-  toast('开始下载…');
-  const r = JSON.parse(await S.bridge.apply_update());
-  if (r.ok) {
-    toast('下载完成。关闭本程序后会自动替换并重启。');
-  } else {
-    toast(r.error || '更新失败');
+  toast('开始下载…（两百兆左右，看网速）');
+  try {
+    const r = JSON.parse(await S.bridge.apply_update());
+    if (r.ok) {
+      toast('下载完成。关闭本程序后会自动替换并重启。');
+      $('#updateNotes').textContent =
+        '已下载完成。关掉本程序，替换脚本会把新版装上去。';
+    } else {
+      toast(r.error || '更新失败');
+    }
+  } catch (e) {
+    toast('更新失败：' + (e.message || e));
   }
+}
+
+// 顶栏那个图标按钮：跳到设置页的更新那一行，不直接下载 ——
+// 图标一点就开始下载两百兆，太容易误触。
+$('#btnUpdate')?.addEventListener('click', () => {
+  go('settings');
+  const row = $('#updateRow');
+  if (row && !row.hidden) row.scrollIntoView({ block: 'center' });
 });
+
+$('#btnDoUpdate')?.addEventListener('click', doUpdate);
 
 /* ────────── 插件 ────────── */
 

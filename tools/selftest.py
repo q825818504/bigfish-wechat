@@ -296,7 +296,8 @@ section("6. 模型")
 def t_model():
     from bigfish.replier import ModelConfig, call_model
     cfg = ModelConfig.load()
-    assert cfg.ready, f"模型未就绪 endpoint={cfg.endpoint}"
+    _ok, _why = cfg.status()
+    assert _ok, f"模型未就绪：{_why}"
     t0 = time.time()
     reply = call_model(cfg, "你叫大肥鱼，说话简短。", "说三个字")
     dt = time.time() - t0

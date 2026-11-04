@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -100,6 +101,19 @@ def deploy() -> None:
     if internal_old.exists():
         shutil.rmtree(internal_old, ignore_errors=True)
 
+    # ⚠ 必须在覆盖 _internal **之前**把旧配置读出来。
+    #   第一次写这段时读在 copytree 之后 —— 那时文件已经被新包顶掉了，
+    #   于是"迁移"永远什么都不做，而且不报错（2026-11-04 实测踩）。
+    legacy: dict = {}
+    legacy_path = DIST / "_internal" / "config.json"
+    if legacy_path.is_file():
+        try:
+            raw = json.loads(legacy_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                legacy = raw
+        except Exception:
+            legacy = {}
+
     moved_old = False
     if (DIST / "_internal").exists():
         (DIST / "_internal").rename(internal_old)
@@ -118,6 +132,24 @@ def deploy() -> None:
         if moved_old and internal_old.exists():
             internal_old.rename(DIST / "_internal")
         raise
+
+    # 配置属于用户，归 app_root()/config.json（exe 旁边），不归 _internal。
+    # 早先的版本把 CONFIG_PATH 指到了 _internal，用户的设置写在那儿 ——
+    # 这里把那份救到 exe 旁边，再把残留改名，别让两套并存。
+    live = DIST / "config.json"
+    if legacy:
+        try:
+            cur = json.loads(live.read_text(encoding="utf-8")) if live.is_file() else {}
+            if not isinstance(cur, dict):
+                cur = {}
+            if isinstance(legacy.get("llm"), dict) and not isinstance(cur.get("llm"), dict):
+                merged = dict(cur)
+                merged.update(legacy)
+                live.write_text(json.dumps(merged, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+                log("旧配置已从 _internal 迁到 exe 旁边")
+        except Exception as exc:
+            log(f"配置迁移失败（不影响程序）：{exc}")
 
     if internal_old.exists():
         shutil.rmtree(internal_old, ignore_errors=True)

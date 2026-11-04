@@ -54,7 +54,10 @@ from bigfish.wechat_sender import (SendError, UiaSender,        # noqa: E402
                                    desktop_available, is_admin)
 
 HR = "=" * 70
-CONFIG_PATH = os.path.join(_ROOT, "config.json")
+#: 配置在「用户看得见」的那层，不在程序资源里（paths.py 的规范）。
+from bigfish.paths import app_root as _app_root               # noqa: E402
+
+CONFIG_PATH = os.path.join(_app_root(), "config.json")
 HISTORY_LIMIT = 16
 
 #: 分条标记。必须与 `bigfish.say.SplitPolicy.marker` 一致 ——
@@ -384,7 +387,10 @@ class BigFishApp:
     # ------------------------------------------------------------------
     def _accept(self, msg: Incoming) -> Optional[BatchMessage]:
         """过滤 + 群聊判定。通过则返回可入批的消息，否则 None。"""
-        if msg.is_self and not self.cfg.allow_self:
+        # allow_self 只对文件传输助手生效。
+        # 它是自测通道，不是生产开关 —— 线上误开会被自己的每一条消息喂饱。
+        if msg.is_self and not (self.cfg.allow_self
+                                and msg.chat_id == "filehelper"):
             self.stats["skip"] += 1
             return None
         if not (msg.text or "").strip():
@@ -604,7 +610,7 @@ def main() -> int:
 
     # ---- 模型 ----
     mcfg = ModelConfig.load()
-    print(f"  模型       : {mcfg.model}")
+    print(f"  模型       : {mcfg.preset.name} / {mcfg.eff_model}")
     if not mcfg.ready:
         print("  [!] 模型未就绪（检查 config.json 或 Magpie 网关）")
         return 1

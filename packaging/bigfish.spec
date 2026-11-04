@@ -73,6 +73,9 @@ hiddenimports = [
     "bigfish.wechat",
     "bigfish.bridge_client",
     "bigfish.replier",
+    # 模型接入：预设表。replier 顶部 import 它，静态分析能看到；
+    # 但 providers 里没有任何动态 import，显式列出只是防分析器抽风。
+    "bigfish.providers",
     "bigfish.watcher",
     "bigfish.wechat_sender",
     "bigfish.updater",
@@ -93,6 +96,11 @@ hiddenimports = [
     # 三个都属于「漏了不会启动失败，只在真聊天时才炸」的类型。
     "bigfish.say",
     "bigfish.listen",
+    # 自环防护：LoopGuard 在 EngineWorker._run() 里局部 import。
+    # 漏了它的后果很隐蔽 —— 程序照常启动、界面照常打开，只有真正开始
+    # 收消息时才 ImportError，而且那个异常会被 handle 的 try 吞掉，
+    # 表现成"她不回话了"，看不出是缺模块。
+    "bigfish.loopguard",
     "bigfish.plugins.say",
     "wechatauto",
     "wechatauto.db",

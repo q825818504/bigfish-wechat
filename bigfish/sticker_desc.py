@@ -220,11 +220,20 @@ def describe(path: str, endpoint: str = "", model: str = "",
         from bigfish.replier import ModelConfig
 
         mc = ModelConfig.load()
-        endpoint = endpoint or mc.endpoint
-        model = model or mc.model
+        endpoint = endpoint or mc.url
+        model = model or mc.eff_model
         api_key = api_key or mc.api_key
+        proto = mc.eff_protocol
     except Exception as exc:
         out["error"] = f"读配置失败：{exc}"
+        return out
+
+    # 这条路径是自己拼的 OpenAI 图片格式。换成 Anthropic / Gemini 要另写
+    # 三份请求体，而表情描述是可选功能（失败了只影响表情的语义标签），
+    # 不值得。干脆说清楚，别发一个必然失败的请求。
+    if proto != "openai":
+        out["error"] = (f"表情描述只支持 OpenAI 兼容渠道，"
+                        f"当前是 {proto}。换渠道或关掉表情描述。")
         return out
 
     body = {

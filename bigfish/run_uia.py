@@ -125,7 +125,8 @@ class BigFish:
 
     # ------------------------------------------------------------------
     def handle(self, msg: Incoming) -> None:
-        if msg.is_self and not self.allow_self:
+        # allow_self 只对文件传输助手生效（自测通道，不能当生产开关）
+        if msg.is_self and not (self.allow_self and msg.chat_id == "filehelper"):
             return                      # 自己发的跳过
         if not (msg.text or "").strip():
             self.on_log(f"[跳过] {msg.chat_name}: 空内容({msg.msg_type})")
@@ -212,8 +213,8 @@ def main() -> int:
     # ---- 模型 ----
     from bigfish.replier import ModelConfig
     cfg = ModelConfig.load()
-    print(f"  模型       : {cfg.model}")
-    print(f"  接口       : {cfg.endpoint}")
+    print(f"  模型       : {cfg.preset.name} / {cfg.eff_model}")
+    print(f"  接口       : {cfg.url}")
     if not cfg.ready:
         print("  [!] 模型未就绪")
         return 1

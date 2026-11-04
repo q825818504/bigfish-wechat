@@ -49,6 +49,43 @@ __version__ = _PKG_VERSION
 GITHUB_API = "https://api.github.com/repos/{repo}/releases/latest"
 UA = f"bigfish-updater/{__version__}"
 
+#: 默认更新源。
+#:
+#: 「能不能检查更新」不该取决于用户有没有手改 JSON —— 以前 `update.repo`
+#: 默认是空串，于是点「检查」只会得到一句「未配置更新仓库」。
+#: fork 的人可以在 config.json 里填自己的仓库覆盖它。
+DEFAULT_REPO = "q825818504/bigfish-wechat"
+
+#: 检查结果短缓存（秒）。手动点「检查」时走缓存，免得 GitHub 限流
+#: （未认证 60 次/小时，一次误点连点几下就没了）。
+CHECK_TTL = 300
+
+
+def normalize_repo(s: str) -> str:
+    """把用户可能填的各种形式收拾成 `owner/repo`。
+
+        https://github.com/a/b       → a/b
+        https://github.com/a/b.git   → a/b
+        a/b.git                      → a/b
+        a/b/                         → a/b
+    """
+    v = (s or "").strip()
+    if not v:
+        return ""
+    for pre in ("https://github.com/", "http://github.com/",
+                "github.com/", "git@github.com:"):
+        if v.lower().startswith(pre):
+            v = v[len(pre):]
+            break
+    v = v.strip("/")
+    if v.endswith(".git"):
+        v = v[:-4]
+    # 只保留前两段（后面可能是 /releases 之类）
+    parts = [p for p in v.split("/") if p]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return v
+
 
 # ══════════════════════════════════════════════════════════════════
 #  版本比较
@@ -121,10 +158,14 @@ def check_latest(repo: str, current: str, cache_dir: str = "") -> dict:
          "assets": [{"name":..., "url":..., "size":..., "sha256":...}],
          "url": "Release 页面"}
     """
+    repo = normalize_repo(repo) or DEFAULT_REPO
     etag_file = os.path.join(cache_dir, "release.etag") if cache_dir else ""
     data = _get_json(GITHUB_API.format(repo=repo), etag_file=etag_file)
     if data is None:
-        return {"has_update": False, "latest": current, "cached": True}
+        # 304 = 服务器说"和上次一样"。这时拿不到最新号，只能说没新版，
+        # 但把 repo 带回去，界面能显示"查的是哪个仓库"。
+        return {"has_update": False, "latest": current, "cached": True,
+                "current": current, "repo": repo}
 
     tag = data.get("tag_name") or data.get("name") or ""
     assets = []
@@ -140,10 +181,12 @@ def check_latest(repo: str, current: str, cache_dir: str = "") -> dict:
         "has_update": is_newer(tag, current),
         "latest": tag.lstrip("vV"),
         "current": current,
+        "repo": repo,
         "notes": (data.get("body") or "")[:2000],
         "assets": assets,
         "url": data.get("html_url", ""),
         "published": data.get("published_at", ""),
+        "name": data.get("name") or tag,
     }
 
 
@@ -282,19 +325,19 @@ class Updater:
 
     def __init__(self, repo: str, current: str, cache_dir: str,
                  enabled: bool = True):
-        self.repo = repo
+        self.repo = normalize_repo(repo) or DEFAULT_REPO
         self.current = current
         self.cache_dir = cache_dir
         self.enabled = enabled
         os.makedirs(cache_dir, exist_ok=True)
 
     def check(self) -> dict:
-        if not self.enabled or not self.repo:
+        if not self.enabled:
             return {"has_update": False, "disabled": True}
         try:
             return check_latest(self.repo, self.current, self.cache_dir)
         except Exception as exc:
-            return {"has_update": False, "error": str(exc)}
+            return {"has_update": False, "error": str(exc), "repo": self.repo}
 
     def pick_asset(self, info: dict) -> dict | None:
         """从 Release 里挑出要下载的文件。
