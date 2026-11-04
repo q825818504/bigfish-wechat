@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from bigfish.paths import app_root, res_root  # noqa: E402
 
@@ -91,6 +91,8 @@ class Context:
     memory_ids: List[int] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     scope_id: str = ""
+    #: 记忆降级状态："" 正常 / "recent" 用了本地最近原文 / "empty" 记忆不可用
+    degraded: str = ""
 
     def render_system(self) -> str:
         """渲染成 system prompt：人格 + 情绪底色。"""
@@ -140,8 +142,8 @@ def find_node() -> Optional[str]:
     return None
 
 
-def load_context(query: str = "", data_root: str = "",
-                 scope: str = "", timeout: float = 25.0) -> Context:
+def _load_context_bridge(query: str = "", data_root: str = "",
+                         scope: str = "", timeout: float = 25.0) -> Context:
     """调用 bridge.mjs 取上下文。
 
     任何失败都返回带 warnings 的空 Context，不抛异常——
@@ -209,6 +211,55 @@ def load_context(query: str = "", data_root: str = "",
         ctx.memory_text = mem.get("text") or ""
         ctx.memory_ids = list(mem.get("ids") or [])
 
+    return ctx
+
+
+def _local_memory(query: str) -> Tuple[str, str]:
+    """L2：桥接拿不到记忆时，用本地 Python 记忆库兜底。
+
+    返回 (memory_text_json, level)。level: "" / "recent" / "empty"。
+    """
+    try:
+        from bigfish import memory as M, vault as V
+
+        db = V.memory_db_path()
+        if not (db and os.path.isfile(db)):
+            return "", "empty"
+        bank = ""
+        try:
+            bank = M._default_bank(db) or ""
+        except Exception:
+            bank = ""
+        items, _level = M.search_with_fallback(
+            db, bank or "dafeiyu", query or "", limit=8, max_chars=2400)
+        if not items:
+            # 桥接挂了、本地也没捞到 → 这一轮只能空记忆
+            return "", "empty"
+        text = json.dumps(
+            [{"role": it.get("role"), "text": it.get("text")} for it in items],
+            ensure_ascii=False)
+        # 只要走到这里就是"本地兜底"，不管本地是精确命中还是最近原文
+        return text, "recent"
+    except Exception:
+        return "", "empty"
+
+
+def load_context(query: str = "", data_root: str = "",
+                 scope: str = "", timeout: float = 25.0) -> Context:
+    """取上下文；桥接失败时自动降级到本地记忆。
+
+    degraded: "" 正常 / "recent" 用了本地最近原文 / "empty" 记忆不可用
+    """
+    ctx = _load_context_bridge(query=query, data_root=data_root,
+                               scope=scope, timeout=timeout)
+    # 桥接成功且有记忆，或桥接没报错（只是没命中）→ 不降级
+    if ctx.memory_text or not ctx.warnings:
+        return ctx
+    text, level = _local_memory(query)
+    if text:
+        ctx.memory_text = text
+        ctx.warnings.append("桥接无记忆，已用本地原文兜底")
+    ctx.degraded = level
     return ctx
 
 

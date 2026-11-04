@@ -1160,6 +1160,14 @@ class EngineWorker(QThread):
 
             # ---- 组装上下文 ----
             ctx = load_context(query=body or "")
+            # 桥接挂了不能等于她失忆：降级状态要让用户看见，否则
+            # "她怎么不记得了"会被当成记忆坏了，实际是 Node 没起来。
+            if getattr(ctx, "degraded", ""):
+                self._log(
+                    "[记] 记忆降级："
+                    + ("用本地最近原文兜底" if ctx.degraded == "recent"
+                       else "记忆不可用（这一轮只有人格与对话）"),
+                    "" if ctx.degraded == "recent" else "err")
 
             # system 段按**身份序**排：内建段（灵魂 860 / 心情 900）与
             # 插件段（生活 870 / 目标 880 / 关系 920 / 守卫 9990）一起排序。
@@ -1342,10 +1350,19 @@ class EngineWorker(QThread):
                               "\n".join(f"{w}: {t}" for w, t in hist))
 
             t0 = time.time()
+            # 快照只记「哪一段占多少字」，不重算内容；插件段有就带上
             try:
-                reply = call_model(self.mcfg,
-                                   "\n".join(sys_parts).strip(),
-                                   "\n\n".join(user_parts))
+                _trace_sections = [(int(o), "", len(t)) for o, t in _sections]
+            except Exception:
+                _trace_sections = []
+            try:
+                reply = call_model(
+                    self.mcfg,
+                    "\n".join(sys_parts).strip(),
+                    "\n\n".join(user_parts),
+                    trace_meta={"chat": msg.chat_id, "owner": _owner,
+                                "sections": _trace_sections},
+                )
             except ModelError as exc:
                 self._log(f"[生成失败] {exc}", "err")
                 self.failed.emit(str(exc))
@@ -3512,6 +3529,47 @@ class Backend(QObject):
             return json.dumps({"ok": False, "error": str(exc)},
                               ensure_ascii=False)
 
+    @Slot(result=str)
+    def prompt_trace_list(self) -> str:
+        """最近几轮「她看到了什么」的摘要（给设置页用）。"""
+        try:
+            from bigfish import prompt_trace as T
+
+            return json.dumps({"ok": True, "items": T.recent(20),
+                               "stats": T.stats()}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(result=str)
+    def model_health(self) -> str:
+        """最近一次模型调用是否失败（给设置页显示"她为什么没回"）。"""
+        try:
+            from bigfish import replier as R
+
+            return json.dumps({"ok": True, "last": R.last_error()},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def prompt_trace_open(self, path: str) -> str:
+        """打开一份快照；传空串打开目录。"""
+        try:
+            from bigfish import prompt_trace as T
+
+            p = path or T.trace_dir()
+            if not os.path.exists(p):
+                return json.dumps({"ok": False, "error": "文件不在了"},
+                                  ensure_ascii=False)
+            if sys.platform == "win32":
+                os.startfile(p)  # noqa: S606
+            return json.dumps({"ok": True, "path": p}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
     @Slot(str, result=str)
     def sticker_test_send(self, code: str) -> str:
         """把一张表情发到「文件传输助手」，验证通道通不通。
@@ -4402,6 +4460,94 @@ def _run_selftest_inner() -> int:
 
         return f"{len(parts)} 条 / {total:.1f}s｜" + "｜".join(parts)
     item("说法", t_say)
+
+    # ── 0.6.0：重试 / 快照 / 降级（纯单元，不需要网络）──
+    # 这三条都是"出问题时才起作用"的机制：平时不显眼，坏了就是
+    # "她有时候不回""她突然失忆"。必须在打包版里验一次。
+    def t_retry():
+        from bigfish import replier as R
+
+        orig_call, orig_backoff = R._call_once, R.RETRY_BACKOFF
+        calls = {"n": 0}
+
+        def fake(cfg, system, user):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise R.ModelError("boom", status_code=500,
+                                   retryable=True, kind="http")
+            return "在呢"
+
+        R._call_once = fake              # type: ignore[assignment]
+        R.RETRY_BACKOFF = (0.0, 0.0, 0.0)  # type: ignore[assignment]
+        try:
+            cfg = R.ModelConfig()
+            cfg.channel = "selftest"
+            cfg.base_url = "http://127.0.0.1:1/v1"
+            cfg.status = lambda: (True, "")   # type: ignore[method-assign]
+            out = R.call_model(cfg, "s", "u")
+            assert out == "在呢" and calls["n"] == 2, \
+                f"重试没生效：{out!r} / 调了 {calls['n']} 次"
+        finally:
+            R._call_once, R.RETRY_BACKOFF = orig_call, orig_backoff  # type: ignore
+        return "500 重试一次后成功"
+    item("模型重试", t_retry)
+
+    def t_trace():
+        import shutil
+        import tempfile
+
+        from bigfish import prompt_trace as T
+
+        tmp = tempfile.mkdtemp(prefix="selftest-trace-")
+        orig_root, orig_cfg = T._data_root, T._config
+        T._data_root = lambda: tmp        # type: ignore[assignment]
+        T._config = lambda: {"enabled": True, "keep": 10}  # type: ignore
+        try:
+            class _C:
+                channel = "selftest"
+                eff_protocol = "openai"
+                eff_model = "m"
+                eff_base_url = "http://127.0.0.1:1"
+                temperature = 1.0
+                max_tokens = 100
+                api_key = "sk-SECRET"
+
+            p = T.record(cfg=_C(), system="s", user="u", response="r",
+                         elapsed_ms=1, meta={"chat": "selftest"})
+            assert p, "没写快照"
+            end = time.time() + 3
+            while time.time() < end and not os.path.isfile(p):
+                time.sleep(0.05)
+            assert os.path.isfile(p), "快照没落盘"
+            with open(p, "r", encoding="utf-8") as f:
+                raw = f.read()
+            assert "sk-SECRET" not in raw, "快照里出现了 api_key"
+        finally:
+            T._data_root, T._config = orig_root, orig_cfg  # type: ignore
+            shutil.rmtree(tmp, ignore_errors=True)
+        return "写入正常，未泄漏 api_key"
+    item("请求快照", t_trace)
+
+    def t_degrade():
+        import shutil
+        import tempfile
+
+        from bigfish import memory as M
+
+        tmp = tempfile.mkdtemp(prefix="selftest-degrade-")
+        try:
+            items, level = M.search_with_fallback(
+                os.path.join(tmp, "none.sqlite3"), "b", "x")
+            assert level == "empty" and items == [], f"缺库没降级：{level}"
+            db = os.path.join(tmp, "m.sqlite3")
+            ok, err = M.ensure_schema(db)
+            assert ok, err
+            _items, level2 = M.search_with_fallback(db, "b", "x")
+            assert level2 == "ok", f"正常库被判降级：{level2}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        return "缺库→empty，正常库→ok"
+    item("记忆降级", t_degrade)
 
     # 自环防护：这个模块坏了的表现是"她会自己跟自己聊"，启动不报错、
     # 界面正常、只有聊天时才出事 —— 必须在自检里验一次。

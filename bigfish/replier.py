@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
 from bigfish.bridge_client import Context, load_context
@@ -224,7 +224,52 @@ class ModelConfig:
 
 
 class ModelError(RuntimeError):
-    pass
+    """一次模型调用失败。
+
+    `retryable` 决定 `call_model` 要不要重试 —— 只有「换个时间可能成功」的
+    错误才值得重试：网络抖动、限流、网关 5xx、响应解析失败，以及推理模型
+    把预算吃在 reasoning 上导致正文为空。
+
+    key 错 / 模型名错 / 余额不足这类 4xx 重试多少次都一样，直接抛。
+    """
+
+    def __init__(self, message: str, *, status_code: int = 0,
+                 retryable: bool = False, kind: str = "generic") -> None:
+        super().__init__(message)
+        self.status_code = int(status_code or 0)
+        self.retryable = bool(retryable)
+        self.kind = kind
+
+
+#: 值得重试的 HTTP 状态：限流 / 网关错误 / 服务端临时不可用
+RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+#: 默认尝试次数（含第一次）
+DEFAULT_ATTEMPTS = 3
+#: 退避基数：1s → 2s → 4s（封顶）
+RETRY_BACKOFF = (1.0, 2.0, 4.0)
+
+#: 最近一次失败（给界面显示"她为什么没回"）。空 = 最近一次成功。
+_LAST_ERROR: Dict[str, Any] = {}
+
+
+def last_error() -> Dict[str, Any]:
+    """最近一次模型调用失败。空 dict 表示最近一次是成功的。"""
+    return dict(_LAST_ERROR)
+
+
+def _note_error(exc: "ModelError") -> None:
+    _LAST_ERROR.clear()
+    _LAST_ERROR.update({
+        "at": int(time.time()),
+        "time": time.strftime("%m-%d %H:%M", time.localtime()),
+        "kind": exc.kind,
+        "status": exc.status_code,
+        "message": str(exc)[:200],
+    })
+
+
+def _clear_error() -> None:
+    _LAST_ERROR.clear()
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -338,12 +383,8 @@ _PARSERS = {
 }
 
 
-def call_model(cfg: ModelConfig, system: str, user: str) -> str:
-    """调一次模型，返回纯文本回复。"""
-    ok, why = cfg.status()
-    if not ok:
-        raise ModelError(f"模型没配好：{why}")
-
+def _call_once(cfg: ModelConfig, system: str, user: str) -> str:
+    """发一次请求。失败抛带 retryable 标记的 ModelError。"""
     proto = cfg.eff_protocol
     if proto == "anthropic":
         body = _body_anthropic(cfg, system, user)
@@ -360,31 +401,103 @@ def call_model(cfg: ModelConfig, system: str, user: str) -> str:
             raw = r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace") if exc.fp else ""
-        raise ModelError(_http_hint(exc.code, detail, cfg)) from exc
+        raise ModelError(
+            _http_hint(exc.code, detail, cfg),
+            status_code=exc.code,
+            retryable=exc.code in RETRY_STATUS,
+            kind="http",
+        ) from exc
     except urllib.error.URLError as exc:
-        raise ModelError(_net_hint(exc, cfg)) from exc
+        raise ModelError(_net_hint(exc, cfg), retryable=True, kind="network") from exc
     except TimeoutError as exc:
-        raise ModelError(f"超时 {cfg.timeout:.0f}s：{cfg.eff_base_url}") from exc
+        raise ModelError(f"超时 {cfg.timeout:.0f}s：{cfg.eff_base_url}",
+                         retryable=True, kind="network") from exc
 
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ModelError(f"响应不是 JSON：{raw[:300]}") from exc
+        # 网关偶尔返回 HTML 502 页面 —— 这是"这次不行"，不是"永远不行"
+        raise ModelError(f"响应不是 JSON：{raw[:300]}", retryable=True,
+                         kind="parse") from exc
 
     try:
         content, reasoning = _PARSERS[proto](payload)
     except ModelError:
         raise
     except (KeyError, IndexError, TypeError, AttributeError) as exc:
-        raise ModelError(f"响应结构不认识（{proto}）：{raw[:300]}") from exc
+        raise ModelError(f"响应结构不认识（{proto}）：{raw[:300]}",
+                         retryable=True, kind="parse") from exc
 
     if content:
         return content
     if reasoning:
+        # 推理模型把 token 预算吃在 thinking 上。重试时 call_model 会加大预算。
         raise ModelError(
             f"模型只输出了推理、正文为空（max_tokens={cfg.max_tokens} 太小？）"
-            f" reasoning 前 100 字: {reasoning[:100]}")
+            f" reasoning 前 100 字: {reasoning[:100]}",
+            retryable=True, kind="empty_content")
     return ""
+
+
+def _trace(cfg: ModelConfig, system: str, user: str, response: str,
+           elapsed_ms: float, meta: Optional[Dict[str, Any]],
+           error: Optional[ModelError] = None) -> None:
+    """把这一轮请求写进 data/prompts（旁路，失败绝不影响聊天）。"""
+    if not meta:
+        return
+    try:
+        from bigfish import prompt_trace
+
+        prompt_trace.record(cfg=cfg, system=system, user=user,
+                            response=response, elapsed_ms=elapsed_ms,
+                            meta=meta, error=error)
+    except Exception:
+        pass
+
+
+def call_model(cfg: ModelConfig, system: str, user: str, *,
+               attempts: int = 0,
+               trace_meta: Optional[Dict[str, Any]] = None) -> str:
+    """调模型，返回纯文本回复；可重试的错误自动重试。
+
+    attempts=0 表示用默认 3 次（含第一次）。trace_meta 非空时写一份请求快照，
+    见 `bigfish/prompt_trace.py`。
+    """
+    ok, why = cfg.status()
+    if not ok:
+        raise ModelError(f"模型没配好：{why}", kind="config")
+
+    n = max(1, int(attempts or DEFAULT_ATTEMPTS))
+    started = time.time()
+    last: Optional[ModelError] = None
+    cur = cfg
+
+    for i in range(n):
+        try:
+            text = _call_once(cur, system, user)
+        except ModelError as exc:
+            last = exc
+            if not exc.retryable or i == n - 1:
+                break
+            # 推理吃光预算：加 max_tokens 再试，而不是原样重试
+            if exc.kind == "empty_content":
+                bumped = int(cur.max_tokens * 1.5)
+                if bumped > cur.max_tokens:
+                    cur = replace(cur, max_tokens=bumped)
+            time.sleep(RETRY_BACKOFF[min(i, len(RETRY_BACKOFF) - 1)])
+            continue
+        else:
+            _clear_error()
+            _trace(cfg, system, user, text, (time.time() - started) * 1000,
+                   trace_meta)
+            return text
+
+    elapsed_ms = (time.time() - started) * 1000
+    _trace(cfg, system, user, "", elapsed_ms, trace_meta, error=last)
+    if last:
+        _note_error(last)
+        raise last
+    raise ModelError("模型调用失败", kind="unknown")
 
 
 def _net_hint(exc: Exception, cfg: ModelConfig) -> str:

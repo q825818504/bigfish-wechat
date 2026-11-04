@@ -1604,8 +1604,16 @@ def _mmr(cands: List[Dict[str, Any]], vectors: List[Optional[Sequence[float]]],
     return [cands[i] for i in picked]
 
 
-def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
-                  max_chars: int = 2400) -> List[Dict[str, Any]]:
+class MemoryUnavailable(RuntimeError):
+    """记忆库打不开 / 结构坏了。**这是降级信号**，不是「没命中」。
+
+    调用方拿到它应该走 L2（最近原文）或 L3（空记忆 + 界面标记），
+    而不是把它当成"她确实想不起来"。
+    """
+
+
+def _search_chunks_impl(path: str, bank: str, query: str, *, limit: int = 8,
+                        max_chars: int = 2400) -> List[Dict[str, Any]]:
     """原文检索：FTS5(bm25) 排序 → MMR 去冗余 → 按分数填满预算。
 
     返回 [{chunk, message, role, text, time, score}]。
@@ -1615,20 +1623,22 @@ def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
       2. 用 bm25() 排序而不是插入顺序；
       3. 去冗余而不是硬截断；
       4. 只读打开，不拷库。
+
+    ⚠ 库打不开时抛 `MemoryUnavailable`（给降级用）；"没命中"仍然返回 []。
     """
     if not path or not os.path.isfile(path):
-        return []
+        raise MemoryUnavailable(f"记忆库不存在：{path or '(空路径)'}")
     expr = fts_query(query)
     if not expr:
         return []
     conn = None
     try:
         conn = connect(path, read_only=True)
-    except Exception:
+    except Exception as exc:
         try:
             conn = connect(path)
         except Exception:
-            return []
+            raise MemoryUnavailable(f"记忆库打不开：{exc}") from exc
     try:
         rows = conn.execute(
             "SELECT s.rowid AS chunk, bm25(search_index) AS rank "
@@ -1695,11 +1705,85 @@ def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
         except Exception:
             pass
         return out[:limit]
-    except Exception:
-        return []
+    except MemoryUnavailable:
+        raise
+    except Exception as exc:
+        raise MemoryUnavailable(f"检索失败：{exc}") from exc
     finally:
         if conn is not None:
             conn.close()
+
+
+def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
+                  max_chars: int = 2400) -> List[Dict[str, Any]]:
+    """兼容入口：任何失败都返回 []。
+
+    老调用点（界面自检、CLI）用它，不需要处理异常；
+    需要"区分降级和没命中"的地方用 `search_with_fallback`。
+    """
+    try:
+        return _search_chunks_impl(path, bank, query, limit=limit,
+                                   max_chars=max_chars)
+    except Exception:
+        return []
+
+
+def recent_chunks(path: str, bank: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """L2 兜底：不查 FTS，直接取最近 N 条原文。
+
+    场景：FTS 索引坏了 / 查询词一个都没命中时，她至少还知道最近聊过什么。
+    返回结构与 `search_chunks` 一致，score 按时间递减（最新 1.0）。
+    """
+    if not path or not os.path.isfile(path):
+        raise MemoryUnavailable(f"记忆库不存在：{path or '(空路径)'}")
+    conn = None
+    try:
+        conn = connect(path, read_only=True)
+        rows = conn.execute(
+            "SELECT c.id AS chunk, c.text, c.message, m.role, "
+            "COALESCE(m.source_time, m.recorded_at) AS t "
+            "FROM chunks c JOIN messages m ON m.id = c.message "
+            "WHERE m.bank = ? ORDER BY t DESC LIMIT ?",
+            (bank, max(1, int(limit)))).fetchall()
+        out = []
+        n = len(rows) or 1
+        for i, r in enumerate(rows):
+            out.append({
+                "chunk": int(r["chunk"]), "message": int(r["message"]),
+                "role": r["role"], "text": r["text"],
+                "time": int(r["t"] or 0),
+                "score": round(max(0.0, 1.0 - i / n), 4),
+            })
+        return out
+    except MemoryUnavailable:
+        raise
+    except Exception as exc:
+        raise MemoryUnavailable(f"读取最近原文失败：{exc}") from exc
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def search_with_fallback(path: str, bank: str, query: str, *,
+                         limit: int = 8, max_chars: int = 2400
+                         ) -> Tuple[List[Dict[str, Any]], str]:
+    """带降级的检索：返回 (items, level)。
+
+    level:
+      · "ok"      正常（含"确实没命中"——那不是降级）
+      · "recent"  检索失败，退回最近 N 条原文
+      · "empty"   记忆库打不开，只能空记忆
+    """
+    try:
+        items = _search_chunks_impl(path, bank, query, limit=limit,
+                                    max_chars=max_chars)
+        return items, "ok"
+    except Exception:
+        pass
+    try:
+        return recent_chunks(path, bank, limit=max(5, min(limit, 20))), "recent"
+    except Exception:
+        return [], "empty"
 
 
 def _bump_chunk_hits(conn: sqlite3.Connection, chunk_ids: Sequence[int]) -> None:

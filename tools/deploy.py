@@ -54,18 +54,71 @@ def kill_running() -> int:
     return 1
 
 
+def data_root() -> Path:
+    """真正的数据目录。
+
+    数据根不一定在 `dist/BigFish/data` —— `settings.json` 的 `dataRoot`
+    可以把它指到任何地方（例如 `D:\\大肥鱼`）。备份与指纹校验都得以它为准，
+    否则会出现"备份了一个空目录，真实记忆没被保护"的假安全感。
+    """
+    for p in (DIST / "settings.json", ROOT / "settings.json"):
+        try:
+            if p.is_file():
+                d = json.loads(p.read_text(encoding="utf-8"))
+                root = str(d.get("dataRoot") or "").strip()
+                if root:
+                    return Path(root)
+        except Exception:
+            pass
+    return DIST / "data"
+
+
+def fingerprint(root: Path) -> dict:
+    """数据指纹：文件数 + 总字节 + 关键文件 (mtime,size)。
+
+    打包只该换程序，不该动数据。前后对不上就说明有东西越界了。
+    """
+    out = {"root": str(root), "files": 0, "bytes": 0, "key": {}}
+    if not root.is_dir():
+        return out
+    for dirpath, _dirs, files in os.walk(root):
+        for n in files:
+            p = Path(dirpath) / n
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out["files"] += 1
+            out["bytes"] += st.st_size
+    for name in ("memory.sqlite3", "memory.sqlite3-wal", "state.json"):
+        for p in root.rglob(name):
+            try:
+                st = p.stat()
+                out["key"][str(p.relative_to(root))] = (int(st.st_mtime), st.st_size)
+            except OSError:
+                pass
+    return out
+
+
 def backup_data() -> None:
-    src = DIST / "data"
-    if not src.is_dir():
+    """把真实数据目录备份到 data-backup/（只读复制，不移动）。"""
+    root = data_root()
+    if not root.is_dir():
+        log(f"数据目录不存在，跳过备份：{root}")
         return
     if BACKUP.exists():
         shutil.rmtree(BACKUP, ignore_errors=True)
-    shutil.copytree(src, BACKUP / "data")
+    try:
+        shutil.copytree(root, BACKUP / "data")
+    except Exception as exc:
+        # 备份失败要让人看见：后面还要覆盖程序，不能让用户以为有备份
+        log(f"⚠ 数据备份失败：{exc}")
+        raise
     cfg = DIST / "config.json"
     if cfg.is_file():
         BACKUP.mkdir(parents=True, exist_ok=True)
         shutil.copy2(cfg, BACKUP / "config.json")
-    log(f"已备份数据 → {BACKUP.relative_to(ROOT)}")
+    log(f"已备份数据 → {BACKUP.relative_to(ROOT)}（源：{root}）")
 
 
 def build() -> None:
@@ -191,11 +244,23 @@ def main() -> int:
     if killed:
         log("进程已结束")
 
+    root = data_root()
+    fp_before = fingerprint(root)
     backup_data()
     build()
     stage()
     deploy()
-    ok = verify()
+    # 打包/覆盖这一段不该碰数据；在跑自检之前比对，避免把"程序运行"算进来
+    fp_after = fingerprint(root)
+    data_ok = fp_before == fp_after
+    if data_ok:
+        log(f"数据未变：{root}（{fp_after['files']} 文件 / {fp_after['bytes']} 字节）")
+    else:
+        log(f"⚠ 数据发生变化：{root}（打包过程不该动它，请检查）")
+        log(f"   打包前 {fp_before['files']} 文件 / {fp_before['bytes']} 字节")
+        log(f"   打包后 {fp_after['files']} 文件 / {fp_after['bytes']} 字节")
+
+    ok = verify() and data_ok
 
     shutil.rmtree(BUILD_OUT, ignore_errors=True)
     print()

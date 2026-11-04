@@ -1099,6 +1099,7 @@
                 <button class="btn btn-sm" id="btnTestModel">测试连接</button>
                 <span id="testResult" class="test-result">真发一次请求验证。填完先点这个。</span>
               </div>
+              <p id="modelHealth" style="font-size:12px;opacity:.75;margin:6px 0 0"></p>
             </div>
           </div>
         </div>
@@ -1174,6 +1175,17 @@
               <p id="updateNotes"></p>
             </div>
             <button class="btn btn-sm" id="btnDoUpdate">下载并安装</button>
+          </div>
+          <div class="switch-row">
+            <div class="switch-copy">
+              <strong>她这轮看到了什么</strong>
+              <p id="traceNote">每轮请求的快照：人格 / 记忆 / 对话 / 耗时。她答得不对时，先看这里分清是提示词还是模型的问题。</p>
+              <select id="tracePick" style="margin-top:6px;max-width:440px"></select>
+            </div>
+            <div style="display:flex;gap:8px">
+              <button class="btn btn-sm" id="btnTraceView">查看</button>
+              <button class="btn btn-sm" id="btnTraceDir">目录</button>
+            </div>
           </div>
         </div>
       </section>

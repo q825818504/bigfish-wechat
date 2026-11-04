@@ -1,5 +1,47 @@
 # 更新日志
 
+## 0.6.0 — 2026-11-04（未发布，按 D-58 攒版本）
+
+这一版不增加功能，补三件「出事时能定位」的事。
+起因：0.5.0 支持 19 家渠道后，出问题分不清是「渠道变了」还是「提示词变了」，
+而模型一次 429 就等于这一轮没回复。
+
+### 模型调用重试
+
+- 429 / 5xx / 网络抖动 / 响应不是 JSON → 自动重试 3 次，退避 1s/2s/4s
+- 4xx（key 错、模型名错、余额不足）**不重试**，直接报错 —— 重试也没用
+- 推理模型把 token 吃在 reasoning 上导致正文为空 → 自动放大 `max_tokens` 再试一次
+- 只改 `replier.call_model`，所有调用点（对话 / 画像 / 断句）自动受益
+
+### 请求快照
+
+- 每轮写 `data/prompts/<时间>-<序号>-<会话>.json`：
+  system / user / 各段字数 / 响应 / 耗时 / 错误
+- 默认保留 200 份，按文件名滚动（不按 mtime —— Windows 的 mtime 精度只有 100ms）
+- `config.json` 的 `trace.enabled=false` 可完全关闭
+- **绝不写 api_key**；只记 base_url
+- 失败也留一份（`error.kind/status/message`），不用复现就能看现场
+
+### 记忆降级
+
+- 桥接（Node）超时/找不到 → 自动用本地 Python 记忆库兜底（`degraded=recent`）
+- 本地库也打不开 → 空记忆 + 日志提示（`degraded=empty`），不再静默失忆
+- `memory.search_with_fallback` 区分「没命中」与「库坏了」——
+  前者是正常结果，后者才该降级
+- 桌面端日志会写明降级原因，不再让人以为「她记性变差了」
+
+### 打包
+
+- `tools/deploy.py` 的备份改按 `settings.json` 的 `dataRoot` 找真实数据
+  （以前只看 `dist/BigFish/data`，数据根改到别处时会备份到空目录）
+- 打包前后对比数据指纹（文件数/字节/关键文件 mtime），变了就报警：
+  **只换程序，不碰数据**
+
+### 测试
+
+- 新增 `selftest_retry`（15）、`selftest_trace`（21）、`selftest_degrade`（19）
+- `--selftest` 增加三项，不需要微信 / 网络 / 管理员
+
 ## 0.5.0 — 2026-11-04
 
 这一版解决**别人用不了**的问题：模型接入原来只认本机 Magpie 网关，

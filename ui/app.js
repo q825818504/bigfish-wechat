@@ -2559,6 +2559,8 @@ async function loadSettings() {
     tag.className = 'tag ' + (llm.ready ? 'ok' : 'warn');
 
     setTestResult('', '真发一次请求验证。填完先点这个。');
+    refreshModelHealth();
+    refreshTraceList();
   } catch (e) { toast('读取设置失败'); }
 }
 
@@ -2705,6 +2707,76 @@ async function checkUpdate(manual = false) {
 }
 
 $('#btnCheckUpdate')?.addEventListener('click', () => checkUpdate(true));
+
+/** 刷新「她这轮看到了什么」：列表 + 可写性 + 模型健康。 */
+async function refreshTraceList() {
+  const sel = $('#tracePick');
+  const note = $('#traceNote');
+  if (!sel || !S.bridge || !S.bridge.prompt_trace_list) return;
+  try {
+    const d = JSON.parse(await S.bridge.prompt_trace_list());
+    const st = d.stats || {};
+    const items = d.items || [];
+    sel.innerHTML = '';
+    items.forEach((it) => {
+      const o = document.createElement('option');
+      o.value = it.path;
+      const err = it.error ? `｜失败:${it.error}` : '';
+      o.textContent = `${it.time}｜${it.chat || '-'}｜${it.elapsed_ms}ms｜` +
+        `${it.user_chars}字${err}`;
+      sel.appendChild(o);
+    });
+    if (!items.length) {
+      const o = document.createElement('option');
+      o.value = '';
+      o.textContent = '（还没有快照）';
+      sel.appendChild(o);
+    }
+    if (note) {
+      if (st.writable === false) {
+        note.textContent = '快照目录写不进去：' + (st.write_error || '') +
+          '。把 BigFish.exe 加进杀软白名单，或用管理员运行。';
+      } else if (st.enabled === false) {
+        note.textContent = '快照已关闭（config.json 的 trace.enabled=false）。';
+      } else {
+        note.textContent = `最近 ${items.length} 份，共 ${st.count || 0} 份 / ` +
+          `${Math.round((st.bytes || 0) / 1024)} KB，保留最近 ${st.keep || 200} 份。`;
+      }
+    }
+  } catch (e) { /* 设置页不该因为快照失败而报错 */ }
+}
+
+/** 模型最近一次调用是否失败 —— 回答「她为什么没回」。 */
+async function refreshModelHealth() {
+  const el = $('#modelHealth');
+  if (!el || !S.bridge || !S.bridge.model_health) return;
+  try {
+    const d = JSON.parse(await S.bridge.model_health());
+    const last = d.last || {};
+    if (last.message) {
+      el.textContent = `上次调用失败（${last.time}）：${last.message}`;
+      el.style.color = '#c66';
+    } else {
+      el.textContent = '最近一次模型调用正常。';
+      el.style.color = '';
+    }
+  } catch (e) { el.textContent = ''; }
+}
+
+async function openTrace(path) {
+  if (!S.bridge || !S.bridge.prompt_trace_open) return toast('当前版本不支持');
+  try {
+    const r = JSON.parse(await S.bridge.prompt_trace_open(path || ''));
+    if (!r.ok) return toast('打不开：' + (r.error || '未知'));
+    toast(path ? '已用默认程序打开快照' : '已打开快照目录');
+  } catch (e) { toast('打开失败：' + e); }
+}
+$('#btnTraceView')?.addEventListener('click', () => {
+  const p = $('#tracePick')?.value || '';
+  if (!p) return toast('还没有快照');
+  openTrace(p);
+});
+$('#btnTraceDir')?.addEventListener('click', () => openTrace(''));
 
 /** 真正执行下载替换。顶栏图标和卡片按钮都走这里。 */
 async function doUpdate() {

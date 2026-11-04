@@ -480,7 +480,8 @@ class BigFishApp:
         system, user = self.build_prompt(conv, last, body)
         t0 = time.time()
         try:
-            reply = call_model(self.model_cfg, system, user)
+            reply = call_model(self.model_cfg, system, user,
+                               trace_meta={"chat": batch.chat_id})
         except ModelError as exc:
             self.stats["fail"] += 1
             self.log(f"[!] 生成失败: {exc}")

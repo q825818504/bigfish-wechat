@@ -374,6 +374,27 @@ def t_watcher():
 item("监听器", t_watcher)
 
 # ════════════════════════════════════════════════════════════════
+section("10. 新增能力（纯单元，不需要微信/网络）")
+
+
+def _run_unit(script: str) -> str:
+    """跑一个独立的单元自检脚本，看退出码。"""
+    import subprocess
+    path = os.path.join(ROOT, "tools", script)
+    r = subprocess.run([sys.executable, path], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       timeout=180)
+    out = (r.stdout or "") + (r.stderr or "")
+    assert r.returncode == 0, out[-800:]
+    lines = [ln.strip() for ln in out.splitlines() if "通过" in ln]
+    return lines[-1] if lines else "通过"
+
+
+item("模型重试", lambda: _run_unit("selftest_retry.py"))
+item("请求快照", lambda: _run_unit("selftest_trace.py"))
+item("记忆降级", lambda: _run_unit("selftest_degrade.py"))
+
+# ════════════════════════════════════════════════════════════════
 section("结果汇总")
 nok = sum(1 for r in results if r[1] == "OK")
 nfail = sum(1 for r in results if r[1] == "FAIL")
