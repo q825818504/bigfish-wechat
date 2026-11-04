@@ -95,6 +95,25 @@ DeepSeek 无 Key 正确报 401。
 - 端到端真调：本机 Magpie 走新的 OpenAI 路径，2.5s 返回「收到」
 - 打包版 `--selftest`：`Magpie 网关（本机） · workbuddy-ai/deepseek-v4.1-flash`
 
+### 发布（2026-11-04 22:15）
+
+```
+提交  746e34a  v0.5.0：模型接入 + 检查更新
+      fd26750  检查更新：限流说人话 + 本地缓存降级
+      b847887  发布工具：make_release 支持 --force
+标签  v0.5.0
+包    BigFish-0.5.0-portable.zip  202.2 MB
+      sha256 dd156f084b6f60a354806a3c37df0ce4fc0673e5d4521ba29e3174026c895534
+```
+
+发布过程中踩了两个坑（见 D-65）：
+
+1. **第一次打包 SHA 和上次一模一样** —— `build_portable.py` 从
+   `dist/BigFish` 打包，而那份还是旧的。必须先 `deploy.py`。
+   **改过代码后 SHA 不变 = 没打进去**，这是最快的识别方式。
+2. **`make_release.py` 跳过已存在的附件** —— 改完重发会静默保留旧包。
+   加 `--force` 先删再传。
+
 ### 教训
 
 **"兼容 OpenAI 接口"这句话不能用。** 它没说清兼容到哪一层：地址？认证？
