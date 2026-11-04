@@ -447,6 +447,17 @@ register(
     default=False,
     sticker=stamp,
     config={
+        "position": {
+            "type": "select",
+            "label": "表情位置",
+            "note": "auto：短回应且情绪明显时先发表情，否则跟在文字后。",
+            "default": "auto",
+            "options": [
+                {"value": "auto", "label": "自动（推荐）"},
+                {"value": "before", "label": "总是先发表情"},
+                {"value": "after", "label": "总是跟在文字后"},
+            ],
+        },
         "rate": {
             "type": "number",
             "label": "多频繁",

@@ -399,3 +399,98 @@ Qt 找不到匹配的槽，调用静默失败。犯过两次
 | `check_slots.py` | 静态查 @Slot 签名 |
 | `check_method_calls.py` | 静态查方法调用参数个数 |
 
+
+---
+
+# 2026-11-04 · v0.4.0 说法层
+
+## 起点
+
+用户的原话：**「默认的思考、对话有点奇怪，不像真实人类」**，具体两条：
+
+1. 一次发一大段，而不是「知道了」→「那明天去长坂坡吧」→「先看樱花再看枣树」
+2. 对方连发三句时，第一句到就开跑，第二句还没发出来就被插话
+
+参考了 MaiBot 与 AstrBot：前者有 `response_splitter` + `debounce`，
+后者有 `SegmentationPolicy` + `ConversationFlow`。两边都没有发送确认。
+
+## 做了什么
+
+### 1. `bigfish/say.py`（610 行）
+
+| 函数 | 职责 |
+|---|---|
+| `split_reply` | 分条：marker → 句末标点 → 逗号（>15 字）→ 硬切 50 |
+| `plan_pacing` | 节奏：0.8 + 0.09×n^0.8，cap 3.5，抖动 ±20%，总 12s |
+| `send_parts` | 逐条发送 + 三级确认（L1/L2/L3） |
+| `split_reply_with_llm` | 可选兜底（默认关） |
+
+保护：URL / @ / 代码 / 颜文字 / 数字单位 / **成对引号与括号**。
+
+### 2. `bigfish/listen.py`（247 行）
+
+`MessageBatcher`：同人 2s / 换人 0.8s / @ 1s / 纯图 4s，上限 8s、8 条。
+纯状态机（`feed` / `tick`），时间由调用方给，测试直接跳时间。
+
+### 3. 插件化
+
+`bigfish/plugins/say.py`（176 行），座位 **890 · 说法**，
+`plugins/__init__.py` 的 `PLUGIN_SEATS` 加 890。
+面板自动出现（`inventory()` 驱动），8 个参数写 `plugins.json`。
+
+**两个入口都读同一份配置**：
+- 命令行 `app.py`：`_refresh_say_config()` 每批读一次
+- 桌面端 `desktop.py`：`_say_plan()` 每轮读一次
+
+### 4. 表情位置
+
+原来固定「文字 → 表情」。改成按回应类型：
+
+- 回应 ≤12 字 **且** 情绪强度 ≥60 → **先发表情**
+- 其余 → 跟在文字后
+
+判据抄 AstrBot 的 INSTRUCTION：「轻松、即时且图片足够表达时，可以只发一张原图；
+需要解释时先说清文字。」
+
+## 修的 bug（都是这轮暴露出来的）
+
+| # | 现象 | 根因 |
+|---|---|---|
+| 1 | 启动即崩 | `_OWNER_STATE` 有类没实例化 |
+| 2 | 切号后主人候选还是旧号 | `owner_candidates` 用无参 `WeChatReader()` |
+| 3 | 关掉微信窗口卡 94 秒 | `wake()` 缓存 `_woken`，不检查窗口 |
+| 4 | 回复失败却"记得自己回过" | `hist.append` 在发送之前 |
+| 5 | 用户消息没进记忆 | `record_exchange` 只在发送成功后调 |
+| 6 | `{{split}}` 进记忆库 | 存的是原文，没清标记 |
+| 7 | 群里第一条必崩 | `handle()` 改 `gate` 缺 `nonlocal` |
+| 8 | `_M.TIER_GUEST` 未定义 | 笔误，应为 `M.` |
+| 9 | 打不开会话偶发失败 | `open_chat` 一次失败就抛 |
+
+2、3 是**切号与窗口**这条链上的老问题，因为这次真机测试才暴露。
+
+## 测试
+
+| 测试 | 结果 |
+|---|---|
+| `selftest_say` | 65/65 |
+| `selftest_listen` | 28/28 |
+| `selftest_app_wiring` | 15/15 |
+| `selftest_plugin_say` | 27/27 |
+| `selftest_plugins` | 90/90 |
+| `selftest_memory` | 224/224 |
+| `selftest_engine` / `selftest_ui` | 全通过 |
+| exe `--selftest` | 15/16（UIA 需管理员） |
+
+## 工程
+
+- `tools/deploy.py`：强杀 → 备份 → 打包 → 覆盖 → 自检。**只换程序，不碰 data/config**。
+- `packaging/bigfish.spec` 补三个 hiddenimports
+- exe 自检加「说法」项
+
+## 教训
+
+1. **换目录 = 换实例**。数据根是 `<exe 目录>/data`，我每次打包到新文件夹，
+   用户打开就是空数据 —— 看起来像"不保存"。以后统一部署到 `dist/BigFish`。
+2. **`--selftest` 不跑引擎启动流程**，所以抓不到"一启动就崩"。
+   现在打包前会跑 `pyflakes`，把未定义名挡在前面。
+3. **强杀进程前先备份数据**：SQLite WAL 会自动恢复，但备份是零成本的保险。

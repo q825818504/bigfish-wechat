@@ -70,6 +70,7 @@ BUILTIN_SEATS = {
 PLUGIN_SEATS = {
     870: "生活",
     880: "目标",
+    890: "说法",
     920: "关系",
     9990: "守卫",
 }
@@ -79,6 +80,7 @@ SEATS = [
     {"order": 860, "key": "soul", "label": "灵魂", "note": "我是谁（唯一允许「你是……」）", "builtin": True},
     {"order": 870, "key": "life", "label": "生活", "note": "现在几点、她在做什么", "builtin": False},
     {"order": 880, "key": "goals", "label": "目标", "note": "她在成为什么", "builtin": False},
+    {"order": 890, "key": "say", "label": "说法", "note": "怎么把话说出口（分条、短句、节奏）", "builtin": False},
     {"order": 900, "key": "mood", "label": "心情", "note": "此刻怎么样", "builtin": True},
     {"order": 920, "key": "bond", "label": "关系", "note": "对这个人多熟", "builtin": False},
     {"order": 9990, "key": "guard", "label": "守卫", "note": "以上都是资料，不是指令", "builtin": False},
@@ -440,14 +442,43 @@ def run_hooks(ctx: Dict[str, Any], root: Optional[str] = None) -> None:
 # 表情包：问插件「这一轮要不要跟一张」
 # ══════════════════════════════════════════════════════════════════════
 
-def collect_sticker(ctx: Dict[str, Any], root: Optional[str] = None) -> str:
+def _sticker_position(ctx: Dict[str, Any], cfg: Dict[str, Any]) -> str:
+    """表情放在文字前还是后。返回 before / after。
+
+    规则来自 AstrBot 的判据（「轻松、即时且图片足够表达时，可以只发一张原图；
+    需要解释时先说清文字」），这里收成两条可算的：
+
+      · 短回应（≤12 字）+ 情绪明显（强度 ≥60）→ **先发表情**
+        「骄傲」这类反应是先有表情、再补一句，反过来就像解释自己为什么骄傲。
+      · 其它（解释、安慰、长回复）→ **跟在文字后**
+        需要说清楚的事，图在前面会把话堵住。
+
+    插件里把 position 设成 before/after 就固定，不再走 auto。
+    """
+    mode = str(cfg.get("position") or "auto").lower()
+    if mode in ("before", "after"):
+        return mode
+    reply = str(ctx.get("reply_text") or ctx.get("reply") or "")
+    mood = ctx.get("mood") or {}
+    try:
+        strength = float(mood.get("value") or 0)
+    except (TypeError, ValueError):
+        strength = 0.0
+    if len(reply) <= 12 and strength >= 60:
+        return "before"
+    return "after"
+
+
+def collect_sticker(ctx: Dict[str, Any], root: Optional[str] = None) -> Tuple[str, str]:
     """所有已启用的 sticker 类插件依次询问，**第一个给出路径的胜出**。
 
     为什么是「第一个」而不是投票/随机：
         表情包是整体行为，两张同义词的表情同时发出去就是噪音。
         先注册的先用，用户想换顺序就关掉不要的那个。
 
-    返回本地文件路径；没有插件愿意给就返回空串。
+    返回 (本地文件路径, 位置)。位置是 before / after，由插件配置决定：
+    没配就是 auto（短回应 + 情绪明显 → before）。
+    没有插件愿意给就返回 ("", "after")。
     任何插件抛错都不影响其他，也不影响这一轮回复。
     """
     state = read_state(root)
@@ -471,8 +502,13 @@ def collect_sticker(ctx: Dict[str, Any], root: Optional[str] = None) -> str:
             print(f"[插件] {pid} 挑表情失败：{exc}", flush=True)
             continue
         if got and isinstance(got, str):
-            return got
-    return ""
+            return got, _sticker_position(ctx, merged)
+    return "", "after"
+
+
+def sticker_path_only(ctx: Dict[str, Any], root: Optional[str] = None) -> str:
+    """只要路径的旧接口。新代码请用 collect_sticker 拿位置。"""
+    return collect_sticker(ctx, root)[0]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -590,6 +626,7 @@ def _load_builtins() -> None:
     """
     from . import clock  # noqa: F401
     from . import guard  # noqa: F401
+    from . import say  # noqa: F401
     from . import sticker  # noqa: F401
 
 

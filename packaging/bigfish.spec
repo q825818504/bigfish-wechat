@@ -88,6 +88,12 @@ hiddenimports = [
     "bigfish.plugins",
     "bigfish.plugins.guard",
     "bigfish.plugins.clock",
+    # 说法层：say / listen 只在 handle 与 _say_plan 里 import，
+    # plugins.say 只在 _load_builtins() 的函数体里 import ——
+    # 三个都属于「漏了不会启动失败，只在真聊天时才炸」的类型。
+    "bigfish.say",
+    "bigfish.listen",
+    "bigfish.plugins.say",
     "wechatauto",
     "wechatauto.db",
     "wechatauto.uia_driver",

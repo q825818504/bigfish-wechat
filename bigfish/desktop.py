@@ -335,6 +335,11 @@ class _OwnerState:
     owner_id = ""
 
 
+#: 模块级单例。引擎启动时写 owner_id，_open_block 只读。
+#: 漏了这一行 = 引擎一启动就 NameError（2026-11-04 修）。
+_OWNER_STATE = _OwnerState()
+
+
 def _habits_block(owner: str, tier: str, *, limit: int = 6) -> str:
     """取够格的行为习惯渲染成注入段。
 
@@ -385,10 +390,13 @@ class EngineWorker(QThread):
     stats = Signal(int, int)        # (recv, reply)
     failed = Signal(str)
 
-    def __init__(self, watching: list[str], dry: bool = False):
+    def __init__(self, watching: list[str], dry: bool = False, account: str = ""):
         super().__init__()
         self.watching = list(watching)
         self.dry = dry
+        #: 要打开哪个微信号。空串时回退到配置里记住的那个；
+        #: 两者都没有就拒绝启动 —— 绝不交给 _pick_account() 按 mtime 猜。
+        self.account = str(account or "").strip()
         self._stop = False
         self.recv_count = 0
         self.reply_count = 0
@@ -488,6 +496,20 @@ class EngineWorker(QThread):
             self._log(f"[表情] 读心情失败：{exc}", "err")
             return {}
 
+    def _sticker_pos_hint(self, reply: str, mood) -> str:
+        """只算位置，不挑图（挑图会调模型，太慢）。"""
+        try:
+            from bigfish import plugins as _P
+
+            _P.ensure_loaded()
+            if not _P.is_enabled("sticker"):
+                return "after"
+            return _P._sticker_position(
+                {"reply_text": reply, "mood": mood or {}},
+                _P.config_of("sticker"))
+        except Exception:
+            return "after"
+
     def _pick_sticker(self, msg, body: str, reply: str,
                       mood=None) -> str:
         """决定这一轮要不要跟一张表情包，返回文件路径（空串 = 不发）。
@@ -510,7 +532,7 @@ class EngineWorker(QThread):
 
         _plugins.ensure_loaded()
         if not _plugins.is_enabled("sticker"):
-            return ""
+            return "", "after"
         cfg = _plugins.config_of("sticker")
 
         # ---- 冷却 ----
@@ -518,7 +540,7 @@ class EngineWorker(QThread):
         span = self._sticker_sent.setdefault(msg.chat_id, [])
         span[:] = [t for t in span if now - t < float(cfg.get("cooldown", 180))]
         if span:
-            return ""
+            return "", "after"
 
         # ---- 概率 ----
         try:
@@ -527,18 +549,18 @@ class EngineWorker(QThread):
             rate = 0.15
         rate = max(0.0, min(1.0, rate))
         if rate <= 0:
-            return ""
+            return "", "after"
         import random
 
         if random.random() > rate:
-            return ""
+            return "", "after"
 
         # ---- 插件选择 ----
-        path = ""
+        path, position = "", "after"
         try:
             from bigfish.plugins import collect_sticker
 
-            path = collect_sticker({
+            picked = collect_sticker({
                 "chat_name": getattr(msg, "chat_name", ""),
                 "chat_id": getattr(msg, "chat_id", ""),
                 "user_text": body or "",
@@ -548,13 +570,17 @@ class EngineWorker(QThread):
                 # 心情要传进去 —— 不传的话挑表情只看对话文本，
                 # 她可能刚被哄得很开心却挑一张「无语」。
                 "mood": mood or {},
-            }) or ""
+            })
+            if isinstance(picked, tuple):
+                path, position = picked[0] or "", (picked[1] if len(picked) > 1 else "after")
+            else:
+                path = picked or ""
         except Exception as exc:
             self._log(f"[表情] 插件异常：{exc}", "err")
-            return ""
+            return "", "after"
 
         if not path:
-            return ""
+            return "", "after"
 
         # ---- 文件检查 ----
         from bigfish.wechat_sender import check_media
@@ -562,8 +588,34 @@ class EngineWorker(QThread):
         ok, why = check_media(path)
         if not ok:
             self._log(f"[表情] 跳过：{why}", "err")
-            return ""
-        return path
+            return "", "after"
+        return path, position
+
+    def _say_plan(self, reply: str):
+        """按「说法」插件的参数切条 + 算节奏。插件坏了就整段发。
+
+        每轮现读插件配置：面板里改完，下一条就生效，不用重启。
+        """
+        try:
+            from bigfish import plugins as _P
+            from bigfish.say import PacePolicy, SplitPolicy, plan_pacing, split_reply
+
+            _P.ensure_loaded()
+            on = _P.is_enabled("say")
+            cfg = _P.config_of("say") if on else {}
+            policy = SplitPolicy(
+                max_parts=int(cfg.get("max_parts", 4)),
+                part_max_chars=int(cfg.get("part_max_chars", 50)),
+                protect_quotes=bool(cfg.get("quote_protect", True)))
+            parts = split_reply(reply, policy) or [reply]
+            gaps = plan_pacing(parts, PacePolicy(
+                seed="desktop",
+                per_char=float(cfg.get("per_char", 0.09)),
+                cap=float(cfg.get("cap", 3.5)),
+                total_cap=float(cfg.get("total_cap", 12.0))))
+            return parts, gaps
+        except Exception:
+            return [reply], [0.0]
 
     def _send_sticker(self, msg, path: str, remember_sent) -> None:
         """发出去，并把结果记进日志/统计。失败不抛，只记。"""
@@ -696,7 +748,7 @@ class EngineWorker(QThread):
                     db, "dafeiyu", f"wechat:{chat_id}",
                     lambda system, user: call_model(self.mcfg, system, user),
                     owner=owner or getattr(self, "owner_id", ""),
-                    tier=tier or _M.TIER_GUEST,
+                    tier=tier or M.TIER_GUEST,
                     batch=40, self_names=mine,
                     origin=origin, group_owner=group_owner)
                 if r.get("ok") and (r.get("added") or r.get("reason")):
@@ -741,7 +793,16 @@ class EngineWorker(QThread):
         self._log(f"模型：{self.mcfg.model}")
 
         self._log("打开微信数据库 ...")
-        self.reader = WeChatReader().open()
+        acc = self.account or str(
+            (load_json_config().get("auto_reply") or {}).get("account") or "")
+        if not acc:
+            raise RuntimeError(
+                "没有指定微信账号 —— 请在「会话」页先选号。"
+                "无参打开会按数据库修改时间自动挑，可能读到别的号。")
+        self.reader = WeChatReader(account=acc).open()
+        actual = getattr(self.reader._db, "account", "") or ""
+        if actual and actual != acc:
+            raise RuntimeError(f"账号不匹配：要 {acc}，实际打开 {actual}")
         info = self.reader.self_info()
         self._log(f"账号：{info.get('nick_name')}", "in")
 
@@ -903,6 +964,7 @@ class EngineWorker(QThread):
                 del recently_sent[:-ECHO_MAX]
 
         def handle(msg) -> None:
+            nonlocal gate          # 群聊触发器在 run 里建，这里只改引用
             if self._stop:
                 return
 
@@ -975,6 +1037,21 @@ class EngineWorker(QThread):
             hist.append((who, body))
             if len(hist) > 16:
                 del hist[:-16]
+
+            # 用户说过的话**不依赖这一轮回没回成功**。
+            # 以前只在发送成功后调 record_exchange，于是「她没接上」的那句
+            # 在记忆页里根本不存在 —— 用户质问「你怎么没回我」时，
+            # 她查不到任何依据，只能编。
+            try:
+                from bigfish import vault as _v_user
+
+                _lid = getattr(msg, "local_id", None)
+                _v_user.capture_message(
+                    f"wechat:{msg.chat_id}",
+                    f"wx-u-{_lid}" if _lid else f"wx-u-{int(time.time() * 1000)}",
+                    "user", body, _source_ms(msg))
+            except Exception:
+                pass
 
             self._log(f"[收] {msg.chat_name}：{msg.preview(50)}", "in")
             self.chat_event.emit(msg.chat_name, msg.preview(60), "in")
@@ -1185,8 +1262,13 @@ class EngineWorker(QThread):
                 f"## 这一轮\n\n{scene}\n"
                 f"以{self.soul.name}的身份回一条消息。\n\n"
                 "要求：\n"
-                "- 像真人发微信，短，口语，不用 Markdown，不列清单\n"
+                "- 像真人发微信：短，口语，不用 Markdown，不列清单\n"
+                "- 每句尽量 15 字以内，一条只说一件事\n"
                 "- 不要复述对方说过的话，直接回应\n"
+                "- **不要解释自己**：不说「我往上翻了翻」「我记忆没乱」「我以为是」"
+                  "这类话，也不要提「记忆」「上下文」「我的回复」「我的逻辑」\n"
+                "- 对方说「你怎么没回我」时，一句就够：「啊？我没看到」或「回错人了」，"
+                  "不要展开解释\n"
                 "- 需要更多信息就一句话追问")
             user_parts.append("## 最近的对话\n\n" +
                               "\n".join(f"{w}: {t}" for w, t in hist))
@@ -1210,66 +1292,93 @@ class EngineWorker(QThread):
                 reply = reply[:max_chars] + "…"
 
             self._log(f"[想] {dt:.1f}s  {len(reply)}字", "think")
-            hist.append((self.soul.address or "我", reply))
 
             if self.dry:
+                # 预演没有发送环节，直接进历史
+                hist.append((self.soul.address or "我", reply))
                 self._log(f"[预演] {reply}", "think")
                 return
 
-            send_text = reply
-            if is_group and msg.sender_name:
-                # 群里回复时带上 @，不然没人知道在跟谁说话
-                send_text = f"@{msg.sender_name} {reply}"
+            parts, gaps = self._say_plan(reply)
+            if is_group and msg.sender_name and parts:
+                # 群里回复时带上 @，只加第一条 —— 每条都 @ 很吵
+                parts[0] = f"@{msg.sender_name} {parts[0]}"
 
             if self.sender is None:
                 self._log(f"[未发送] UIA 未就绪，生成内容：{reply[:50]}",
                           "think")
                 return
 
-            # ⭐ 表情包：文本发完之后，问一次贴纸插件要不要跟一张。
-            #   放这里是刻意的 —— 顺序必须是「先说话，再发表情」，
-            #   反过来的话对方先看到一个没头没尾的表情。
-            sticker_path = ""
-            # 挑表情要参考心情。这里用**当前落盘的那份**，而不是本轮
-            # 生成回复时用的上下文 —— 后者是这一轮开始时的快照，
-            # 而心情判断是上一轮结束后写的，两者差一轮。
-            # 用最新的更准：她刚才被哄开心了，这一轮就该挑开心的表情。
+            # ⭐ 表情位置：先只算位置，不挑图。
+            #   挑图会调一次模型（可能几秒到几十秒），放在发文字之前
+            #   会把第一句话拖住 —— 实测出现过第一句等了 50 秒。
+            #   所以：前置才提前挑；后置等文字发完再挑（那时慢也没人察觉）。
             _sticker_mood = self._current_mood()
-            try:
-                sticker_path = self._pick_sticker(
-                    msg, body, reply, mood=_sticker_mood)
-            except Exception as exc:
-                self._log(f"[表情] 挑选失败：{exc}", "err")
+            sticker_pos = self._sticker_pos_hint(reply, _sticker_mood)
+            sticker_path = ""
+            if sticker_pos == "before":
+                try:
+                    sticker_path, _pos = self._pick_sticker(
+                        msg, body, reply, mood=_sticker_mood)
+                except Exception as exc:
+                    self._log(f"[表情] 挑选失败：{exc}", "err")
+                if sticker_path:
+                    self._send_sticker(msg, sticker_path, remember_sent)
+                    sticker_path = ""
 
+            sent_any = False
             try:
-                r = self.sender.send(msg.chat_name, send_text)
-                if r.ok:
-                    self.reply_count += 1
+                for _i, _part in enumerate(parts):
+                    if _i > 0:
+                        # 条间停顿：像在打字，不是一口气刷屏
+                        time.sleep(gaps[_i] if _i < len(gaps) else 0.8)
+                    r = self.sender.send(msg.chat_name, _part)
+                    if not r.ok:
+                        self._log(f"[发] ✗ {r.detail}", "err")
+                        break
+                    sent_any = True
                     # 记下来，等这条消息被监听器读回来时能认出来
-                    remember_sent(send_text)
+                    remember_sent(_part)
+                if sent_any:
+                    # ⚠ 只有真的发出去了才写进对话历史。
+                    #   以前这行在发送之前，于是「打开会话失败」那轮也被记成
+                    #   「我说过」，下一轮 prompt 里带着一句她从没发出去的话 ——
+                    #   用户看到的"幻觉"就是这么来的。
+                    hist.append((self.soul.address or "我", reply))
+                    self.reply_count += 1
                     remember_sent(reply)
                     last_reply_at.setdefault(msg.chat_id, []).append(time.time())
                     self.stats.emit(self.recv_count, self.reply_count)
                     self._log(f"[发] {reply[:60]}", "out")
                     self.chat_event.emit(msg.chat_name, reply[:60], "out")
 
-                    # ⭐ 发完文字，再发表情包。
+                    # ⭐ 发完文字，再挑表情包。
                     #   失败只记日志，不影响这一轮 —— 对方已经从文字里
                     #   读到内容了，表情是附加品，丢了不算聊崩。
-                    if sticker_path:
-                        self._send_sticker(msg, sticker_path, remember_sent)
+                    if sticker_pos == "after":
+                        try:
+                            sticker_path, _pos = self._pick_sticker(
+                                msg, body, reply, mood=_sticker_mood)
+                        except Exception as exc:
+                            self._log(f"[表情] 挑选失败：{exc}", "err")
+                        if sticker_path:
+                            self._send_sticker(msg, sticker_path, remember_sent)
 
                     # ⭐ 把这一问一答写进记忆库。
                     #   以前完全没有这一步 —— 聊一晚上记忆里一条都没有，
                     #   她永远想不起微信里说过什么。这是设计缺口，不是 bug。
                     #   放在"发送成功之后"：没发出去的话不算对话发生过。
+                    # 记忆里存的是「她真正说出口的话」：分条标记不该留在正文里
+                    import re as _re
+                    _clean_reply = _re.sub(r"\s+", " ",
+                                           reply.replace("{{split}}", " ")).strip()
                     try:
                         from bigfish import vault as _vault
                         n = _vault.record_exchange(
                             chat_id=msg.chat_id,
                             chat_name=msg.chat_name,
                             user_text=body,
-                            reply_text=reply,
+                            reply_text=_clean_reply,
                             user_local_id=getattr(msg, "local_id", None),
                             source_time=_source_ms(msg),
                         )
@@ -2523,9 +2632,10 @@ class Backend(QObject):
             #    这是"点选"的核心：用户认得的是名字，不是 wxid。
             chats: list = []
             try:
-                from bigfish.wechat import WeChatReader
-
-                r = WeChatReader().open()
+                # 必须用「会话」页选中的那个号。
+                # 旧写法是无参 WeChatReader() —— 按 mtime 自动挑，
+                # 切号后这里会列另一个号的会话，看起来像缓存没刷。
+                r = self._reader_or_open()
                 for s in r.sessions(limit=80):
                     uid = s.get("username") or ""
                     # 只列真实的人：公众号(gh_)、服务号、系统账号都不是人，
@@ -3526,7 +3636,13 @@ class Backend(QObject):
                 "[提示] 当前不是管理员权限，引擎以「只看不发」模式运行。"
                 "以管理员身份启动才能真正回复。", "err")
 
-        w = EngineWorker(self.watching, dry=dry)
+        acc = ""
+        if self._reader is not None:
+            acc = getattr(self._reader._db, "account", "") or ""
+        if not acc:
+            acc = str((load_json_config().get("auto_reply") or {})
+                      .get("account") or "")
+        w = EngineWorker(self.watching, dry=dry, account=acc)
         w.log.connect(self._on_log)
         w.chat_event.connect(self._on_chat)
         w.stats.connect(self._on_stats)
@@ -3641,7 +3757,16 @@ def run_live_send() -> int:
     # 数据库
     print("\n[1] 打开数据库")
     from bigfish.wechat import WeChatReader
-    r = WeChatReader().open()
+    acc = str((load_json_config().get("auto_reply") or {})
+              .get("account") or "")
+    if not acc:
+        print("    [!] 没有选号（config.json 的 auto_reply.account 为空）")
+        return 1
+    r = WeChatReader(account=acc).open()
+    actual = getattr(r._db, "account", "") or ""
+    if actual and actual != acc:
+        print(f"    [!] 账号不匹配：要 {acc}，实际打开 {actual}")
+        return 1
     info = r.self_info()
     print(f"    账号: {info.get('nick_name')}")
 
@@ -3675,7 +3800,7 @@ def run_live_send() -> int:
     for i in range(10):
         time.sleep(1.0)
         try:
-            r2 = WeChatReader().open()
+            r2 = WeChatReader(account=acc).open()
             for m in r2.messages("filehelper", limit=3):
                 if stamp in m.content:
                     found = True
@@ -3909,6 +4034,35 @@ def _run_selftest_inner() -> int:
                 f"（{'、'.join(on) or '无'}）；本轮注入 {len(secs)} 段"
                 f"（{', '.join(str(o) for o in orders) or '—'}）")
     item("插件", t_plugins)
+
+    # 说法：分条 + 节奏（打包版里也要能跑）
+    def t_say():
+        from bigfish import plugins as _P
+        from bigfish.say import PacePolicy, SplitPolicy, plan_pacing, split_reply
+
+        _P.ensure_loaded()
+        cfg = _P.config_of("say") if _P.is_enabled("say") else {}
+        policy = SplitPolicy(
+            max_parts=int(cfg.get("max_parts", 4)),
+            part_max_chars=int(cfg.get("part_max_chars", 50)),
+            protect_quotes=bool(cfg.get("quote_protect", True)))
+
+        text = "知道了，明天就去长坂坡游玩，先去看樱花，再去看枣树"
+        parts = split_reply(text, policy)
+        assert len(parts) >= 2, f"没分条：{parts}"
+        assert all(len(p) <= policy.part_max_chars for p in parts), f"有超长条：{parts}"
+
+        gaps = plan_pacing(parts, PacePolicy(
+            seed="selftest", per_char=float(cfg.get("per_char", 0.09))))
+        total = sum(gaps)
+        assert 0.5 <= total <= 12.01, f"总时长异常：{total}"
+
+        # 引号保护：别人引用的原话不该被逗号切开
+        quoted = split_reply("他说「明天去长坂坡，后天回来」我答应了", policy)
+        assert len(quoted) == 1, f"引号被切开了：{quoted}"
+
+        return f"{len(parts)} 条 / {total:.1f}s｜" + "｜".join(parts)
+    item("说法", t_say)
 
     # 2. 心情
     def t_mood():

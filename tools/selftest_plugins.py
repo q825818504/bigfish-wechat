@@ -158,12 +158,14 @@ def main() -> int:
     now = datetime(2026, 11, 2, 23, 40)
     secs = P.prompt_sections({"now": now})
     orders = [s[0] for s in secs]
-    check("两段都注入", len(secs) == 2, str(orders))
-    check("按 order 升序（870 在前，9990 在后）", orders == sorted(orders), str(orders))
-    check("clock 段在 870", secs[0][0] == 870)
+    titles = [s[1] for s in secs]
+    # 不假设「一共几个插件」——新增插件不该让这条测试红。
+    check("clock 与 guard 都注入", "时间感知" in titles and "末尾守卫" in titles, str(titles))
+    check("按 order 升序", orders == sorted(orders), str(orders))
+    check("clock 段在 870", secs[titles.index("时间感知")][0] == 870)
     check("guard 段在 9990", secs[-1][0] == 9990)
 
-    clock_text = secs[0][2]
+    clock_text = secs[titles.index("时间感知")][2]
     check("clock 注入了时间", "23:40" in clock_text, clock_text[:60])
     check("clock 注入了星期", "周一" in clock_text, clock_text[:60])
     check("clock 深夜有语气提示", "深夜" in clock_text, clock_text[:60])
@@ -176,8 +178,9 @@ def main() -> int:
 
     P.set_enabled("clock", False)
     secs2 = P.prompt_sections({"now": now})
-    check("停用 clock 后只剩 guard", len(secs2) == 1 and secs2[0][0] == 9990,
-          str([s[0] for s in secs2]))
+    titles2 = [s[1] for s in secs2]
+    check("停用 clock 后它不注入", "时间感知" not in titles2, str(titles2))
+    check("guard 仍在 9990 且在最末", secs2[-1][0] == 9990, str([s[0] for s in secs2]))
     P.set_enabled("clock", True)
 
     # ══════════════════════════════════════════════════════════════

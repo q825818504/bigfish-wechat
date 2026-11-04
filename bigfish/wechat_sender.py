@@ -63,6 +63,54 @@ def is_admin() -> bool:
         return False
 
 
+def _wechat_hwnd() -> int:
+    """微信主窗口句柄。找不到返回 0。"""
+    try:
+        u = ctypes.windll.user32
+        u.FindWindowW.restype = ctypes.c_void_p
+        hwnd = (u.FindWindowW("Qt51514QWindowIcon", None)
+                or u.FindWindowW(None, "微信"))
+        return int(hwnd or 0)
+    except Exception:
+        return 0
+
+
+def wechat_window_visible() -> bool:
+    """微信主窗口是否真的在屏幕上（不是隐藏/最小化）。"""
+    hwnd = _wechat_hwnd()
+    if not hwnd:
+        return False
+    try:
+        u = ctypes.windll.user32
+        if not u.IsWindowVisible(hwnd):
+            return False
+        if u.IsIconic(hwnd):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def force_show_wechat(wait: float = 0.5) -> bool:
+    """把微信窗口从托盘/最小化里拉出来并置前。成功返回 True。
+
+    为什么不用驱动自己的 ensure_window(wake=True)：它在窗口不可见时会
+    **阻塞等待**（实测一次 94 秒），期间这一轮回复就卡死了。
+    这里只做「能拉就拉，拉不起来立刻返回」，让调用方快速失败。
+    """
+    hwnd = _wechat_hwnd()
+    if not hwnd:
+        return False
+    try:
+        u = ctypes.windll.user32
+        u.ShowWindow(hwnd, 9)          # SW_RESTORE：最小化/隐藏都能恢复
+        u.SetForegroundWindow(hwnd)
+        time.sleep(wait)
+        return wechat_window_visible()
+    except Exception:
+        return False
+
+
 def desktop_available() -> bool:
     """桌面是否解锁（锁屏时 UIA 操作会失败）。"""
     try:
@@ -161,9 +209,25 @@ class UiaSender:
         return self._uia is not None
 
     def wake(self, force: bool = False) -> bool:
-        """准备 UIA：检查环境 → 构造驱动 → 物化控件树。"""
+        """准备 UIA：确认窗口在 → 构造驱动 → 物化控件树。
+
+        ⚠ 缓存只在**窗口仍然可见**时才算数。之前只看 self._woken，
+          于是用户关掉微信窗口后，这里直接返回 True，UIA 拿着一个
+          不存在的窗口去操作，卡 90 多秒才回来。
+        """
         if self._woken and not force:
-            return True
+            if wechat_window_visible():
+                return True
+            self._woken = False        # 窗口没了，缓存作废
+
+        # 先把窗口拉出来（不阻塞），拉不出来就快速失败
+        if not wechat_window_visible():
+            force_show_wechat()
+        if not wechat_window_visible():
+            raise SendError(
+                "微信窗口不可见（已关闭或缩到托盘）。"
+                "已尝试把它叫出来但没成功 —— 本条未发送。",
+                kind="window")
 
         if not is_admin():
             raise SendError(
@@ -250,11 +314,19 @@ class UiaSender:
                 kind="desktop")
 
         self.wake()
+        if not wechat_window_visible():
+            raise SendError(
+                "微信窗口在发送前又不见了 —— 本条未发送。",
+                kind="window")
 
         now = self.current_chat()
         if now != who:
+            # 会话列表可能还没刷新（刚切号 / 刚启动 / 微信刚唤醒）。
+            # 一次失败就放弃会让这一轮彻底没回复，所以重试一次再报错。
             if not self.open_chat(who):
-                raise SendError(f"打不开会话: {who!r}", kind="open")
+                time.sleep(0.6)
+                if not self.open_chat(who):
+                    raise SendError(f"打不开会话: {who!r}", kind="open")
             time.sleep(0.35)
             now = self.current_chat()
             if now != who:
@@ -361,11 +433,19 @@ class UiaSender:
                 kind="desktop")
 
         self.wake()
+        if not wechat_window_visible():
+            raise SendError(
+                "微信窗口在发送前又不见了 —— 本条未发送。",
+                kind="window")
 
         now = self.current_chat()
         if now != who:
+            # 会话列表可能还没刷新（刚切号 / 刚启动 / 微信刚唤醒）。
+            # 一次失败就放弃会让这一轮彻底没回复，所以重试一次再报错。
             if not self.open_chat(who):
-                raise SendError(f"打不开会话: {who!r}", kind="open")
+                time.sleep(0.6)
+                if not self.open_chat(who):
+                    raise SendError(f"打不开会话: {who!r}", kind="open")
             time.sleep(0.35)
             now = self.current_chat()
             if now != who:
