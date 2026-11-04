@@ -59,6 +59,12 @@
 - **当前版本只认 `bigfish.__version__`**，删掉 `update.current` 字段
 - 界面同时显示当前版本和最新版本（只报「发现新版」用户没法判断该不该装）
 - 顶栏图标只跳转不下载（两百兆的误触成本太高）
+- **限流说人话**：GitHub 未认证 API 每小时 60 次，撞上之后原来只报
+  `HTTP 403`，看不出是限流还是仓库没权限。现在报
+  「GitHub 查询次数用完了（每小时 60 次），约 N 分钟后恢复」
+- **本地缓存降级**：上次成功的结果存 `last.json`，5 分钟内直接复用
+  （连点「检查」打不光限额）；限流或断网时回退显示上次结果，
+  并标一句「上次查到的，本次没查到：<原因>」，不假装是新查的
 
 ### 昵称跟着微信走
 
@@ -101,13 +107,13 @@
 | 套件 | 结果 |
 |---|---|
 | `selftest_providers` | 96/96（预设、地址归一化、三协议请求体/认证/解析、模型列表解析、老配置迁移、错误翻译） |
-| `selftest_updater` | 43/43（版本比较、仓库名归一化、check_latest 四个分支、pick_asset） |
+| `selftest_updater` | 55/55（版本比较、仓库名归一化、check_latest 四个分支、缓存降级、限流提示、pick_asset） |
 | `selftest_loopguard` | 35/35（含事故复现） |
 | `selftest_say` / `selftest_listen` / `selftest_app_wiring` | 65 / 28 / 15 |
 | `selftest_plugin_say` / `selftest_plugins` / `selftest_memory` | 27 / 90 / 224 |
 | `probe_providers` | 联网体检 15 家预设地址，假 Key 全部被正确拒绝（401/400） |
 
-合计 **623 通过**。
+合计 **635 通过**。
 
 ## 0.4.1 — 2026-11-04（未单独发布，随 0.5.0 一起发）
 

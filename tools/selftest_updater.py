@@ -228,6 +228,73 @@ def test_read_config() -> None:
           U.read_update_config(os.path.join(tmp, "nope.json")) == {})
 
 
+def test_cache_and_stale() -> None:
+    section("缓存与降级")
+    import json
+    import tempfile
+    import time
+
+    tmp = tempfile.mkdtemp()
+    last_path = os.path.join(tmp, "last.json")
+
+    # 造一份"上次查到的"
+    last = {
+        "has_update": True, "latest": "0.6.0", "current": "0.5.0",
+        "repo": U.DEFAULT_REPO, "published": "2026-11-10T10:00:00Z",
+        "assets": [{"name": "x.zip", "url": "u", "size": 1, "sha256": ""}],
+        "_at": time.time() - U.CHECK_TTL - 10,
+    }
+    with open(last_path, "w", encoding="utf-8") as f:
+        json.dump(last, f)
+
+    orig = U._get_json
+    try:
+        # 限额用完 → 回退上次结果，并标记 stale
+        U._get_json = _stub(RuntimeError(
+            "GitHub 查询次数用完了（每小时 60 次），约 21 分钟后恢复。"))
+        info = U.check_latest(U.DEFAULT_REPO, "0.5.0", tmp)
+        check("查询失败时回退上次结果", info.get("latest") == "0.6.0",
+              str(info.get("latest")))
+        check("标记 stale", info.get("stale") is True)
+        check("带上失败原因", "60 次" in str(info.get("stale_reason")),
+              str(info.get("stale_reason")))
+        check("附件也保留", bool(info.get("assets")))
+
+        # 缓存新鲜 → 根本不发请求
+        last["_at"] = time.time()
+        with open(last_path, "w", encoding="utf-8") as f:
+            json.dump(last, f)
+        calls = []
+        U._get_json = _stub({"tag_name": "v9.9.9"}, calls)
+        info = U.check_latest(U.DEFAULT_REPO, "0.5.0", tmp)
+        check("新鲜缓存不发请求", calls == [], f"calls={calls}")
+        check("走缓存时标 cached", info.get("cached") is True)
+        check("缓存里是上次的号", info.get("latest") == "0.6.0",
+              str(info.get("latest")))
+
+        # 没有缓存 + 查询失败 → 必须抛，不能假装没事
+        tmp2 = tempfile.mkdtemp()
+        U._get_json = _stub(RuntimeError("网络不可达"))
+        try:
+            U.check_latest(U.DEFAULT_REPO, "0.5.0", tmp2)
+            check("无缓存时失败要抛出", False, "没抛")
+        except RuntimeError as exc:
+            check("无缓存时失败要抛出", "网络" in str(exc), str(exc))
+    finally:
+        U._get_json = orig
+
+
+def test_rate_limit_msg() -> None:
+    section("限流提示（不打网络）")
+    import inspect
+
+    src = inspect.getsource(U._get_json)
+    check("403 单独处理", "exc.code == 403" in src)
+    check("识别 X-RateLimit-Remaining", "X-RateLimit-Remaining" in src)
+    check("提示里说清 60 次", "每小时 60 次" in src)
+    check("提示里给恢复时间", "分钟后恢复" in src)
+
+
 # ══════════════════════════════════════════════════════════════════
 def main() -> int:
     print("检查更新回归测试（bigfish/updater.py）")
@@ -236,6 +303,8 @@ def main() -> int:
     test_check_latest()
     test_updater()
     test_read_config()
+    test_cache_and_stale()
+    test_rate_limit_msg()
 
     print(f"\n{'=' * 46}")
     total = PASS + FAIL

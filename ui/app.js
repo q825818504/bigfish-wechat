@@ -2658,9 +2658,13 @@ function renderUpdate(d) {
   $('#updateTitle').textContent =
     `新版本 ${d.latest}（当前 ${d.current}${when ? '，' + when : ''}）`;
   const notes = (d.notes || '').trim();
-  $('#updateNotes').textContent = notes
+  let hint = notes
     ? notes.split('\n').slice(0, 3).join(' ').slice(0, 160)
     : '点右边下载。装完需要手动关一下程序。';
+  // 走的是上次缓存 / 查不到时的旧结果，得说清楚，别让人以为是刚查到的
+  if (d.stale) hint = `（上次查到的结果，本次没查到：${d.stale_reason || '网络不通'}）` + hint;
+  else if (d.cached) hint = '（本轮走缓存）' + hint;
+  $('#updateNotes').textContent = hint;
 }
 
 async function checkUpdate(manual = false) {

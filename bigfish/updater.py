@@ -145,9 +145,58 @@ def _get_json(url: str, timeout: float = 15.0,
             return None
         if exc.code == 404:
             raise RuntimeError(f"仓库或 Release 不存在: {url}") from exc
+        if exc.code == 403:
+            # GitHub 未认证 API 是 60 次/小时。撞上之后原始报错只有
+            # "HTTP 403"，用户完全看不出是限流还是仓库没权限。
+            remaining = (exc.headers.get("X-RateLimit-Remaining") or "")
+            reset = (exc.headers.get("X-RateLimit-Reset") or "")
+            if remaining.strip() == "0" and reset.strip().isdigit():
+                mins = max(1, int((int(reset) - time.time()) / 60) + 1)
+                raise RuntimeError(
+                    f"GitHub 查询次数用完了（每小时 60 次），"
+                    f"约 {mins} 分钟后恢复。") from exc
+            raise RuntimeError(
+                "HTTP 403：GitHub 拒绝了这次查询（限流，或者仓库是私有的）"
+            ) from exc
         raise RuntimeError(f"HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"网络不可达: {exc.reason}") from exc
+
+
+def _last_file(cache_dir: str) -> str:
+    return os.path.join(cache_dir, "last.json") if cache_dir else ""
+
+
+def _save_last(cache_dir: str, info: dict) -> None:
+    """把上一次成功的结果存下来。
+
+    用途只有一个：限流或断网时还能显示"上次查到的最新版是哪个"，
+    而不是甩一句「HTTP 403」让用户以为程序坏了。
+    """
+    p = _last_file(cache_dir)
+    if not p:
+        return
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        payload = dict(info)
+        payload["_at"] = time.time()
+        payload.pop("notes", None)      # 说明太长，没必要缓存
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def _load_last(cache_dir: str) -> dict:
+    p = _last_file(cache_dir)
+    if not p or not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
 
 
 def check_latest(repo: str, current: str, cache_dir: str = "") -> dict:
@@ -159,11 +208,36 @@ def check_latest(repo: str, current: str, cache_dir: str = "") -> dict:
          "url": "Release 页面"}
     """
     repo = normalize_repo(repo) or DEFAULT_REPO
+
+    # ① 刚查过就用上次的结果 —— 用户连点「检查」不该把限额打光
+    last = _load_last(cache_dir)
+    if last and (time.time() - float(last.get("_at") or 0)) < CHECK_TTL:
+        cached = dict(last)
+        cached.pop("_at", None)
+        cached.update({"cached": True, "repo": repo, "current": current})
+        return cached
+
     etag_file = os.path.join(cache_dir, "release.etag") if cache_dir else ""
-    data = _get_json(GITHUB_API.format(repo=repo), etag_file=etag_file)
+    try:
+        data = _get_json(GITHUB_API.format(repo=repo), etag_file=etag_file)
+    except RuntimeError as exc:
+        # ② 限流/断网：有上次的结果就先顶一下，并说清楚是旧的
+        if last:
+            stale = dict(last)
+            stale.pop("_at", None)
+            stale.update({"stale": True, "stale_reason": str(exc),
+                          "repo": repo, "current": current})
+            return stale
+        raise
+
     if data is None:
         # 304 = 服务器说"和上次一样"。这时拿不到最新号，只能说没新版，
         # 但把 repo 带回去，界面能显示"查的是哪个仓库"。
+        if last:
+            cached = dict(last)
+            cached.pop("_at", None)
+            cached.update({"cached": True, "repo": repo, "current": current})
+            return cached
         return {"has_update": False, "latest": current, "cached": True,
                 "current": current, "repo": repo}
 
@@ -177,7 +251,7 @@ def check_latest(repo: str, current: str, cache_dir: str = "") -> dict:
             "sha256": (a.get("digest") or "").replace("sha256:", ""),
         })
 
-    return {
+    result = {
         "has_update": is_newer(tag, current),
         "latest": tag.lstrip("vV"),
         "current": current,
@@ -188,6 +262,8 @@ def check_latest(repo: str, current: str, cache_dir: str = "") -> dict:
         "published": data.get("published_at", ""),
         "name": data.get("name") or tag,
     }
+    _save_last(cache_dir, result)
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════
