@@ -16,15 +16,27 @@
   "auto_reply": {
     "_comment": "chats 是要监听的会话。私聊写联系人昵称，群聊写群名。",
     "chats": ["文件传输助手"],
-    "_comment_allow_self": "只对文件传输助手生效（自测通道）。私聊和群聊里自己发的消息一律不处理。",
-    "allow_self": true,
-    "interval": 1.2,
-    "max_reply_chars": 300,
-    "quiet_hours": [],
+    "interval": 1.2
+  },
 
-    "_comment_group": "群聊默认只在被 @ 或叫名字时才回。group_allow_all 里的群无条件回。",
-    "group_reply": true,
-    "group_allow_all": []
+  "_comment_scopes": "行为开关走三层：chat → account → global → 代码默认值。布尔字段缺省=继承，false=显式关闭；列表/数字缺省=继承，给 [] 或 0 就是显式覆盖。键必须用平台 id（wxid_xxx / 123@chatroom / filehelper），昵称只做只读别名。说明见 docs/作用域配置.md。",
+  "scopes": {
+    "global": {
+      "_comment": "所有会话的默认值。",
+      "group_reply": true,
+      "group_allow_all": [],
+      "max_reply_chars": 300,
+      "quiet_hours": []
+    },
+    "account": {
+      "_comment": "按 Bot 账号覆盖，键是 Bot 自己的 wxid。多开时才需要。"
+    },
+    "chat": {
+      "_comment": "按会话覆盖。allow_self 只有放在这里才有意义 —— 它对所有会话开着就等于自环。",
+      "filehelper": {
+        "allow_self": true
+      }
+    }
   },
 
   "update": {

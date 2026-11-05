@@ -32,7 +32,7 @@
 抽成独立状态机，四层闸门，任何一层单独失手都不会成环：
 
     L0 静音       熔断后该会话在一段时间内完全不处理
-    L1 白名单     allow_self 只对 filehelper 生效（自测通道）
+    L1 白名单     allow_self 按会话判断（自测通道）；旧接口只对 filehelper
     L2 乐观记账   发送前先记账，失败回滚 —— 消灭竞态窗口
     L3 轮级熔断   连续 N 轮自动回复、中间没有对方消息 → 静音
 
@@ -59,7 +59,9 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
+from bigfish.ledger import Ledger
 
 #: 允许「回应自己发的消息」的会话 —— 只有自测通道。
 #: 加会话要三思：这一条就是这次事故的开关。
@@ -102,9 +104,21 @@ class LoopGuard:
     """自环防护状态机。纯 Python，不碰 IO，可注入时钟。"""
 
     #: 允许回应自己消息吗（还要求会话在 self_chat_ids 里）
+    #:
+    #: ⚠ 这是**旧接口**。它只能表达"所有会话一个值"，而事故恰恰出在这里。
+    #:   新代码请传 `allow_self_for`（按会话问一句），由 `bigfish/scopes.py`
+    #:   从三层配置里算出来。两者都给时 `allow_self_for` 优先。
     allow_self: bool = False
-    #: 哪些会话允许（自测通道）
+    #: 哪些会话允许（自测通道）—— 只在用旧接口 `allow_self` 时生效
     self_chat_ids: frozenset = SELF_CHAT_IDS
+    #: 按会话判断"能不能回应自己的消息"。返回 True 才放行。
+    #:
+    #: 生产环境的接法：
+    #:     LoopGuard(allow_self_for=lambda chat: scopes.get(
+    #:         cfg, "allow_self", chat_id=chat, resolver=reader.resolve))
+    #:
+    #: 它抛异常时按**不允许**处理 —— 自环的代价比"自测没反应"大得多。
+    allow_self_for: Optional[Callable[[str], bool]] = None
 
     #: 已发文本的记账窗口
     echo_window: float = 12.0
@@ -121,9 +135,19 @@ class LoopGuard:
     #: 注入时钟，测试用
     clock: object = None
 
-    _sent: List[Tuple[str, float]] = field(default_factory=list, repr=False)
+    #: 共同账本（D-1）。默认自己建一份；引擎可以注入共享的那份，
+    #: 让"拦截"和"发送确认"看同一套记录，而不是各记各的。
+    ledger: Optional[object] = None
+
     _streak: Dict[str, int] = field(default_factory=dict, repr=False)
     _mute: Dict[str, float] = field(default_factory=dict, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.ledger is None:
+            self.ledger = Ledger(window=float(self.echo_window),
+                                 max_per_chat=int(self.echo_max),
+                                 prefix_chars=int(self.echo_prefix),
+                                 clock=self.clock)
 
     # ------------------------------------------------------------------
     def _now(self) -> float:
@@ -132,53 +156,30 @@ class LoopGuard:
     # ------------------------------------------------------------------
     # 记账
     # ------------------------------------------------------------------
-    def note_sent(self, text: str) -> None:
-        """记一条「我刚发出去的话」。
+    def note_sent(self, text: str, chat: str = "") -> object:
+        """记一条「我刚发出去的话」。返回收据（可交给 rollback_sent）。
 
         ⚠ 必须在 `sender.send()` **之前**调用。见模块开头的第 2 条。
+
+        账本按会话记（以前是全局一份，跨会话会互相干扰）。
+        不传 chat 时退化成"不分会话"，老调用方行为不变。
         """
-        t = (text or "").strip()
-        if not t:
-            return
-        self._sent.append((t, self._now()))
-        if len(self._sent) > self.echo_max:
-            del self._sent[:-self.echo_max]
+        return self.ledger.note_sent(chat, text)
 
-    def rollback_sent(self, text: str) -> None:
+    def rollback_sent(self, text: str, chat: str = "") -> bool:
         """撤销一条记账（发送失败时）。留着会误杀对方的原样复述。"""
-        key = normalize(text)
-        if not key:
-            return
-        for i in range(len(self._sent) - 1, -1, -1):
-            if normalize(self._sent[i][0]) == key:
-                del self._sent[i]
-                return
+        return self.ledger.rollback_text(chat, text)
 
-    def _prune(self, now: float) -> None:
-        cutoff = now - self.echo_window
-        while self._sent and self._sent[0][1] < cutoff:
-            self._sent.pop(0)
-
-    def is_echo(self, text: str) -> bool:
+    def is_echo(self, text: str, chat: str = "") -> bool:
         """这段文字是不是我们刚发出去的那条。
 
-        ⚠ 单独调它没有意义 —— `admit()` 里只在 msg.is_self 为真时才用它。
-          对方原样复述她的话是聊天，不是回环。
+        ⚠ 单独调它没有意义 —— 它是判据之后的兜底：判据说"对方说的"，
+          而账本说"但我刚发过这句"，才拦。
+
+        匹配规则在 `bigfish/ledger.py`：相等，或长度差 ≤10% 且前 12 字相同。
+        不再用"互相前缀"——那会把对方逐字复述她的话也判成回环（D-20）。
         """
-        self._prune(self._now())
-        t = normalize(text)
-        if not t:
-            return False
-        for sent_text, _ in self._sent:
-            n = normalize(sent_text)
-            if not n:
-                continue
-            if t == n:
-                return True
-            k = min(len(n), len(t))
-            if k >= self.echo_prefix and (t.startswith(n) or n.startswith(t)):
-                return True
-        return False
+        return self.ledger.seen(chat, text)
 
     # ------------------------------------------------------------------
     # 闸门
@@ -188,6 +189,24 @@ class LoopGuard:
         until = self._mute.get(str(chat or ""), 0.0)
         left = until - self._now()
         return left if left > 0 else 0.0
+
+    def _self_allowed(self, chat: str) -> bool:
+        """这个会话允不允许回应自己发的消息。
+
+        两种接法，`allow_self_for` 优先：
+
+          · 新：按会话问配置（scopes 三层继承），能表达"只有这个会话开"；
+          · 旧：`allow_self` + 硬编码 `self_chat_ids`，只能全局。
+
+        回调失败按**不允许**处理。理由：漏放行一次就是自环，
+        而误拦一次的代价只是"自测通道没反应"，看得见、改得快。
+        """
+        if self.allow_self_for is not None:
+            try:
+                return bool(self.allow_self_for(chat))
+            except Exception:
+                return False
+        return bool(self.allow_self) and chat in self.self_chat_ids
 
     def admit(self, msg) -> Verdict:
         """这条消息要不要处理。
@@ -210,7 +229,7 @@ class LoopGuard:
             return Verdict(True)
 
         # L1 白名单
-        if not (self.allow_self and chat in self.self_chat_ids):
+        if not self._self_allowed(chat):
             return Verdict(False, "self", "自己发的，跳过")
 
         # L2 内容比对
@@ -251,7 +270,8 @@ class LoopGuard:
         """当前状态，进日志/自检用。"""
         return {
             "allow_self": self.allow_self,
-            "sent": len(self._sent),
+            "sent": len(self.ledger),
+            "entries": self.ledger.snapshot()[-5:],
             "streak": dict(self._streak),
             "muted": {k: round(self.muted_for(k), 1) for k in list(self._mute)},
         }

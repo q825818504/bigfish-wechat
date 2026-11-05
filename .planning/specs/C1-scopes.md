@@ -1,7 +1,7 @@
 # C-1 配置作用域（三层继承）
 
 > 规格定稿：2026-11-04
-> 状态：待实施
+> 状态：**已实施**（2026-11-05，后端 + 接线；UI ⚙ 弹层待做）
 > 上游：P0-1 拆解结论 —— 自环事故 = A 身份误判 + D 无共同账本；C 配置漂移是让 bug 存活的土壤。
 > 施工顺序：**C → A → D → B**（B 不阻塞自环，放最后）
 
@@ -199,3 +199,113 @@ def explain(config, *, bot_id=None, chat_id=None) -> str:
 | 昵称解析需要微信在运行 | 解析失败视为未命中，不抛异常，UI 标提示 |
 | 弹层改了但 UI 没刷新 | 保存后重新 `resolve` 一次并回填 |
 | 旧配置里 `chats` 混着昵称和 id | 保持原样；只读别名层兼容，不强制统一 |
+
+---
+
+## 十一、实施记录（2026-11-05）
+
+### 落地的文件
+
+| 文件 | 改动 |
+| --- | --- |
+| `bigfish/scopes.py`（新） | 三层回退 + 三态 + 昵称别名 + 旧路径兼容 + 诊断 + 写接口。纯 stdlib，不依赖任何 bigfish 子模块。约 430 行。 |
+| `tools/selftest_scopes.py`（新） | 95 条断言，覆盖规格第八节全部 10 条分支 —— 另加 5 条实施时发现的边界。 |
+| `bigfish/loopguard.py` | L1 从"全局布尔 + 硬编码白名单"改为 `allow_self_for(chat)` 回调；旧 `allow_self` 保留做兼容，回调优先。回调抛异常按**不放行**（fail-closed）。 |
+| `bigfish/app.py` | `AppConfig` 删除五个扁平字段（读错就 AttributeError，不留会漂移的镜像）；新增 `scope()`；`_accept` / `in_quiet_hours` / 群闸门 / 字数上限全部按会话取。 |
+| `bigfish/desktop.py` | 引擎与 UI 读写改走 `scopes`；顺手修掉"群闸门 enable 只在构造时设置一次"的旧 bug。 |
+| `config.example.json` | 改成 `scopes` 三段结构，`auto_reply` 只留 `chats` / `interval`。 |
+| `docs/作用域配置.md`（新） | 面向用户的说明。 |
+
+### 实施时改掉的两个原设计
+
+**① `allow_self` 的旧值不映射到 global（重大）**
+
+规格原本写"旧路径 → `scopes.global`"。照做的话，线上那份
+`auto_reply.allow_self: true` 会让**每个会话**重新拿到 true ——
+等于把 11-04 的事故开关重新打开。
+
+改成 `legacy_self`：旧的全局 true **只落到 `filehelper` 一个会话**。
+这既保住了事故修复，也让老配置零改动继续跑。
+
+副作用（好的一面）：**一个字的配置都不用改，私聊就已经安全了。**
+
+**② `AppConfig` 上那五个字段被删掉，而不是留作"全局镜像"**
+
+镜像会漂移：谁哪天顺手读一次 `cfg.quiet_hours`，读到的是加载那一刻的值，
+和真正生效的值可能早就不是一回事 —— 正是 D-61 的形状。
+
+删掉之后读错就是 `AttributeError`，当场看得见。
+
+### 顺手修掉的旧问题
+
+- `tools/selftest_app_wiring.py`：假 `call_model` 不接受 `trace_meta`，
+  导致这个测试**在我改之前就是红的**（等于 app.py 没有接线覆盖）。已修，15/15。
+- 群闸门 `enable` 只在构造时设置一次，改配置不重开程序不生效。已改为每条消息重设。
+
+### 验证
+
+```
+selftest_scopes        95/95
+selftest_loopguard     44/44   （+9，新增 allow_self_for 一节）
+selftest_app_wiring    15/15   （修复后首次转绿）
+selftest_say           65/65
+selftest_listen        28/28
+selftest_plugin_say    27/27
+selftest_plugins       90/90
+selftest_memory / vault / sticker / engine / providers / updater 全绿
+```
+
+**变异测试**（故意改坏实现，确认断言真的咬得住）：
+
+| 变异 | 抓到的失败 |
+| --- | --- |
+| `null` 当 `false` | 2 |
+| 用 `or` 取值（吞 `[]` / `0`） | 14 |
+| 会话键不区分 id 优先 | 1 |
+| 旧 `allow_self` 泄漏到所有会话 | 13 |
+| `legacy_self` 不看自测会话白名单 | 6 |
+
+**线上配置只读核对**（未改动任何文件）：
+
+```
+filehelper -> True      # 旧的自测通道仍然有效
+私聊       -> False     # 事故开关不再泄漏
+群         -> False
+```
+
+### 尚未做（下一步）
+
+- UI：会话列表每行 ⚙ 弹层 + 每字段标注来源（规格第六节）
+- `say.*` / `listen.*` / `llm.*` 的下沉（本次范围外）
+- A：身份判据本体（现在 C 给它留好了位置）
+
+---
+
+## 十二、界面实施记录（2026-11-05）
+
+规格第六节要求的弹层已落地：
+
+| 要求 | 落点 |
+| --- | --- |
+| 会话列表每行 ⚙ | `ui/app.js` `renderChats()` |
+| ⚙ 不误触监听开关 | `ev.stopPropagation()` |
+| 每字段标来源 | `.scope-src` ← 后端 `layer_label` / `inherit_label` |
+| 布尔三态 | `.seg-group` 三段按钮 |
+| 值字段 | 输入框 + 「继承」撤销按钮 |
+| 诊断 | 弹层底部 `#scopeHint` |
+| 只改内存、显式保存 | `SCOPE.draft` / `SCOPE.orig` + 脏标记 |
+
+后端：`Backend.get_chat_scope` / `save_chat_scope`。
+
+### 与规格的偏离
+
+1. **值字段的输入框不用禁用**。规格写的是"未覆盖时控件显示继承来的值（灰字）"，
+   实现时先按"禁用"做了，结果继承中的字段根本没法改成自己设的值 ——
+   整条路是死的。现在改为永远可编辑，靠「继承」按钮撤销覆盖。
+2. **新增 `inherit_value` / `inherit_label`**：光有"当前生效层"不够，
+   用户点「继承」时界面要说的是"将继承自哪"，那是另一个值。
+
+### 验证
+
+`tools/selftest_scope_ui.py` 37 条（后端接口，打桩配置读写）
+`tools/check_scope_ui.py` 24 条（真 Qt 驱动弹层，逐状态断言）

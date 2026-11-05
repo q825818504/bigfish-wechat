@@ -255,6 +255,59 @@ def main():
         ok, err = S.update_sticker(probe, root, mood_dim="")
         chk("清空维度", ok and S.get_sticker(probe, root)["moodDim"] == "")
 
+        section("缩略图：网格不该解码原图")
+        # 导入时已经顺手做过一张；剩下几张还没做
+        codes_all = [x["code"] for x in S.list_stickers(root)]
+        thumbs = [x for x in S.list_stickers(root) if x.get("thumb")]
+        chk("导入时生成了缩略图", bool(thumbs), codes_all)
+        if thumbs:
+            tp = thumbs[0]["thumb"]
+            chk("缩略图路径在 _thumbs 下",
+                S.THUMB_DIR in tp, tp)
+            chk("缩略图是 WebP（体积只有 PNG 的 1/20）",
+                tp.lower().endswith(".webp"), tp)
+            chk("缩略图文件存在", os.path.isfile(tp), tp)
+            from PIL import Image as _Im
+            with _Im.open(tp) as im:
+                chk("缩略图不超过 THUMB_PX",
+                    max(im.size) <= S.THUMB_PX, im.size)
+                chk("缩略图是静态单帧（不循环播放）",
+                    getattr(im, "n_frames", 1) == 1)
+                orig_kb = os.path.getsize(thumbs[0]["path"]) / 1024
+                thumb_kb = os.path.getsize(tp) / 1024
+                chk("缩略图比原图小一个数量级",
+                    thumb_kb * 4 < orig_kb, (orig_kb, thumb_kb))
+
+        # 没缩略图的那些：ensure_thumb 要能补出来，而且**不会**被当成孤儿
+        missing = [x["code"] for x in S.list_stickers(root) if not x.get("thumb")]
+        made = S.ensure_thumbs(missing, root)
+        chk("补出来的数量对得上", made == len(missing), (made, len(missing)))
+        chk("补完就没有缺的了",
+            not [x for x in S.list_stickers(root) if not x.get("thumb")])
+
+        before_n = len(S.list_stickers(root))
+        now_thumbs = [x["thumb"] for x in S.list_stickers(root) if x.get("thumb")]
+        chk("_thumbs 里的图没被补录进 index",
+            len(S.list_stickers(root)) == before_n and bool(now_thumbs),
+            before_n)
+
+        # ⚠ 回归点：以前 list_stickers 会把 _thumbs 里的 .png 当孤儿，
+        #   每刷新一次多一批。这里连刷三次，条目数必须不变。
+        for _ in range(3):
+            S.list_stickers(root)
+        chk("连刷三次库条目不膨胀",
+            len(S.list_stickers(root)) == before_n,
+            len(S.list_stickers(root)))
+
+        # 删图要顺手删缩略图，否则缓存变孤儿
+        if codes_all:
+            victim_code = codes_all[-1]
+            tp2 = S.thumb_path(victim_code, root)
+            if not os.path.isfile(tp2):
+                S.ensure_thumb(victim_code, root)
+            S.delete_sticker(victim_code, root)
+            chk("删图顺手删缩略图", not os.path.isfile(tp2), tp2)
+
         section("插件：心情怎么压成给模型看的话")
         from bigfish.plugins.sticker import _mood_line
 

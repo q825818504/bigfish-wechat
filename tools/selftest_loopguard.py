@@ -134,6 +134,53 @@ def test_self_gate() -> None:
     check("对方消息：放行", v.allow, f"{v}")
 
 
+def test_self_gate_for() -> None:
+    section("L1 按会话判断（allow_self_for，接 scopes 用）")
+    clock = Clock()
+
+    # 只有自测会话开着，其他全关 —— 这正是 C-1 想要表达的东西
+    open_chats = {"filehelper"}
+    g = guard_with(clock, allow_self_for=lambda chat: chat in open_chats)
+
+    check("回调说关 → 自己发的被拒",
+          not g.admit(Msg("wxid_dad", "我发的", True)).allow)
+    check("回调说开 → 放行",
+          g.admit(Msg("filehelper", "我发的", True)).allow)
+    check("对方消息永远放行",
+          g.admit(Msg("wxid_dad", "老爸说的", False)).allow)
+
+    # 回调优先于旧的 allow_self 布尔
+    g2 = guard_with(clock, allow_self=True, allow_self_for=lambda chat: False)
+    check("allow_self_for 优先于旧 allow_self",
+          not g2.admit(Msg("filehelper", "我发的", True)).allow)
+
+    # 回调抛异常 → 按不允许（宁可自测没反应，也不放行成环）
+    def boom(_chat):
+        raise RuntimeError("配置读不出来")
+
+    g3 = guard_with(clock, allow_self_for=boom)
+    v = g3.admit(Msg("filehelper", "我发的", True))
+    check("回调抛异常时按不放行处理（fail-closed）",
+          not v.allow and v.reason == "self", f"{v}")
+
+    # 真正接 scopes：三层配置算出来的结果直接喂进来
+    from bigfish import scopes
+
+    cfg_live = {"auto_reply": {"allow_self": True}}          # 线上那份旧配置
+    g4 = guard_with(clock, allow_self_for=lambda chat: scopes.get(
+        cfg_live, "allow_self", chat_id=chat))
+    check("接 scopes 后：旧配置下私聊被拒（事故开关不泄漏）",
+          not g4.admit(Msg("wxid_dad", "我发的", True)).allow)
+    check("接 scopes 后：自测通道仍可用",
+          g4.admit(Msg("filehelper", "我发的", True)).allow)
+
+    scopes.set_chat_value(cfg_live, "wxid_dad", "allow_self", True)
+    check("接 scopes 后：显式开会话才开",
+          g4.admit(Msg("wxid_dad", "我发的", True)).allow)
+    check("接 scopes 后：开会话不影响自测通道",
+          g4.admit(Msg("filehelper", "我发的", True)).allow)
+
+
 def test_echo() -> None:
     section("L2 乐观记账")
     clock = Clock()
@@ -162,10 +209,34 @@ def test_echo() -> None:
     v = g4.admit(Msg("filehelper", "那还是叫大肥鱼吧", True))
     check("短于 12 字的前缀不判 echo", v.allow, f"{v}")
 
+    # 匹配规则 2026-11-05 收紧（D-1）：从"互相前缀"改成
+    # "相等，或长度差 ≤10% 且前 12 字相同"。
+    #
+    # 旧规则会把"她说了半句、对方接着说完"也判成回环 —— 那是 D-20 的坑。
+    # 读回来不可能凭空多出七个字，多出来就是另一条消息。
     g5 = guard_with(clock, allow_self=True)
-    g5.note_sent("今天下午我们一起去长坂坡看樱花吧")
-    v = g5.admit(Msg("filehelper", "今天下午我们一起去长坂坡看樱花吧然后吃烧烤", True))
-    check("长文本前缀命中 → echo", not v.allow and v.reason == "echo", f"{v}")
+    sent = "今天下午我们一起去长坂坡看樱花吧"
+    g5.note_sent(sent)
+    v = g5.admit(Msg("filehelper", sent, True))
+    check("原样读回 → echo", not v.allow and v.reason == "echo", f"{v}")
+
+    g5b = guard_with(clock, allow_self=True)
+    g5b.note_sent(sent)
+    v = g5b.admit(Msg("filehelper", "今天下午我们一起去长坂坡看樱花吧", True))
+    check("只差一个空格也认（归一化后相等）", not v.allow, f"{v}")
+
+    g5c = guard_with(clock, allow_self=True)
+    g5c.note_sent(sent)
+    v = g5c.admit(Msg("filehelper", sent + "然后吃烧烤", True))
+    check("凭空多出七个字 → 不认 echo（那是另一条消息，不是读回）",
+          v.allow, f"{v}")
+
+    g5d = guard_with(clock, allow_self=True)
+    long_text = "今天下午我们一起去长坂坡看樱花顺便带点吃的回来晚上煮面" * 2
+    g5d.note_sent(long_text)
+    v = g5d.admit(Msg("filehelper", long_text[:-1], True))
+    check("长句只差一两个字 → 认 echo（容纳末尾改写）",
+          not v.allow and v.reason == "echo", f"{v}")
 
     # 窗口过期
     g6 = guard_with(clock, allow_self=True, echo_window=12.0)
@@ -272,6 +343,7 @@ def main() -> int:
     print("自环防护回归测试（bigfish/loopguard.py）")
     test_normalize()
     test_self_gate()
+    test_self_gate_for()
     test_echo()
     test_trip()
     test_incident_replay()

@@ -120,6 +120,26 @@ def is_admin() -> bool:
         return False
 
 
+_ADMIN_CACHE: list = []
+
+
+def _is_admin_cached(bridge=None) -> bool:
+    """is_admin 的缓存版。
+
+    `IsUserAnAdmin` 本身不贵，但它要进一次 shell32 ——
+    get_status 每 2 秒调一趟，加上旁边的微信进程探测，
+    这些"每轮都算"的小东西叠起来就是"点按钮慢半拍"。
+    结果缓存在 bridge 实例上，进程级兜底。
+    """
+    if bridge is not None and getattr(bridge, "_admin_flag", None) is not None:
+        return bridge._admin_flag
+    if not _ADMIN_CACHE:
+        _ADMIN_CACHE.append(is_admin())
+    if bridge is not None:
+        bridge._admin_flag = _ADMIN_CACHE[0]
+    return _ADMIN_CACHE[0]
+
+
 def ts_to_local(ts) -> str:
     """把时间戳转成本地时间字符串。
 
@@ -893,15 +913,37 @@ class EngineWorker(QThread):
         actual = getattr(self.reader._db, "account", "") or ""
         if actual and actual != acc:
             raise RuntimeError(f"账号不匹配：要 {acc}，实际打开 {actual}")
+        # 身份闸（A-1）：拿不到自己的 wxid 就不启动。
+        # 那种状态下所有归属判断都失效，任何自环防护都从源头失效。
+        from bigfish import identity as _id_gate
+        _id_gate.require_me(_id_gate.self_id_of(self.reader), where="desktop")
         info = self.reader.self_info()
         self._log(f"账号：{info.get('nick_name')}", "in")
 
-        cfg = load_json_config().get("auto_reply") or {}
+        _root_cfg = load_json_config()
+        cfg = _root_cfg.get("auto_reply") or {}
         interval = float(cfg.get("interval", 1.2))
-        allow_self = bool(cfg.get("allow_self", False))
-        max_chars = int(cfg.get("max_reply_chars", 300))
-        quiet = [int(h) for h in (cfg.get("quiet_hours") or [])]
-        allow_all = [str(x) for x in (cfg.get("group_allow_all") or [])]
+
+        # ── 作用域（C-1）──
+        #
+        # 五个行为字段按 会话 → 账号 → 全局 回退，旧配置照旧能读
+        # （scopes 的 legacy 映射）。线上那份 `allow_self: true` 不会再
+        # 泄漏到私聊：它只落到 filehelper 一个会话。
+        #
+        # 每轮重读：这里只是把"怎么算"定下来，真正的值在每条消息到达时算。
+        from bigfish import scopes as _scopes
+        _bot_id = str(getattr(self.reader, "wxid", "") or "") or str(
+            cfg.get("account") or "")
+        try:
+            # 昵称 → id；套一层缓存，避免每条消息都查几遍微信库
+            _resolver = _scopes.memo_resolver(self.reader.resolve)
+        except Exception:
+            _resolver = None
+
+        def scope_of(key, chat_id=""):
+            return _scopes.get(_root_cfg, key, bot_id=_bot_id or None,
+                               chat_id=str(chat_id or "") or None,
+                               resolver=_resolver)
 
         # ── 谁是主人 ──
         #
@@ -992,7 +1034,12 @@ class EngineWorker(QThread):
         #   L3 熔断     连续 4 轮自动回复且中间无对方消息 → 静音 120s
         #
         # 对方发来的消息 is_self 恒为 False，永远不会被这四层误伤。
-        guard = LoopGuard(allow_self=bool(allow_self))
+        # 共同账本（D-1）：拦截、发送确认、否决判据都看这一份
+        from bigfish import sending as _sending
+        from bigfish.ledger import Ledger
+        _ledger = Ledger()
+        guard = LoopGuard(allow_self_for=lambda chat: bool(
+            scope_of("allow_self", chat)), ledger=_ledger)
         remember_sent = guard.note_sent        # 旧名字，表情包路径还在用
         forget_sent = guard.rollback_sent
 
@@ -1012,6 +1059,24 @@ class EngineWorker(QThread):
         BURST_WINDOW = 30.0
         BURST_MAX = 6
 
+        def _trace_identity(msg, who, is_group, me, decision=None, *,
+                            force=False) -> None:
+            """把"拿不准"的判定写进证据链（旁路，失败静默）。"""
+            try:
+                from bigfish import identity as _ident, identity_trace
+
+                identity_trace.record(
+                    who,
+                    # 同上：Decision 的真值是 proceed，proceed=False 不等于没给
+                    decision if decision is not None
+                    else _ident.admit(who, is_group=is_group),
+                    chat_id=msg.chat_id, is_group=is_group,
+                    sender=msg.sender_name, me=me,
+                    text=getattr(msg, "raw_content", "") or msg.text,
+                    force=force)
+            except Exception:
+                pass
+
         def handle(msg) -> None:
             nonlocal gate          # 群聊触发器在 run 里建，这里只改引用
             if self._stop:
@@ -1022,6 +1087,50 @@ class EngineWorker(QThread):
                 return
 
             now_ts = time.time()
+
+            # ── 归属判定（A-1）：这条到底是谁说的 ──
+            #
+            # 11-04 之前这里只有 LoopGuard 的 L1，而 L1 读的是 `msg.is_self`，
+            # 那个 bool 表达不了"我其实不知道"。sender 解析不出时它是 False，
+            # 于是"拿不准"被当成"对方说的"，直接进入回复。
+            #
+            # 现在三态：私聊拿不准就放弃（保守）；群里拿不准要等闸门判定
+            # "叫没叫她"（宽松但有门槛，在下面 group 分支里处理）。
+            from bigfish import identity as _identity
+
+            _me = _identity.self_id_of(self.reader)
+            _who = _identity.decide(
+                msg.sender_name, _me,
+                text=getattr(msg, "raw_content", "") or msg.text,
+                chat_id=msg.chat_id,
+                is_group=str(msg.chat_id).endswith("@chatroom"))
+            _is_group_msg = str(msg.chat_id).endswith("@chatroom")
+
+            # 账本能否决判据（D-1）：判据说"对方"，但我一秒前正好发过这句。
+            # 这是 11-04 那晚唯一缺的一环。
+            if _who.who == _identity.WHO_PEER:
+                _hit = _ledger.lookup(msg.chat_id,
+                                      getattr(msg, "raw_content", "") or msg.text)
+                if _hit is not None:
+                    _ago = max(0.0, time.time() - _hit.at)
+                    self._log(f"[否决] {msg.chat_name}：判据说对方说的，"
+                              f"但账本里 {_ago:.0f} 秒前发过同一句，按自己处理", "")
+                    _vetoed = _identity.Verdict(
+                        _identity.WHO_SELF, "ledger_veto",
+                        _who.evidence + (("ledger", _hit.text[:24]),),
+                        f"账本里 {_ago:.0f} 秒前发过这句")
+                    _trace_identity(
+                        msg, _vetoed, _is_group_msg, _me, force=True,
+                        decision=_identity.Decision(
+                            False, "ledger_veto",
+                            f"账本里 {_ago:.0f} 秒前发过同一句"))
+                    return
+
+            if _who.who == _identity.WHO_UNKNOWN and not _is_group_msg:
+                self._log(f"[跳过] {msg.chat_name}：拿不准是谁发的"
+                          f"（{_who.rule}），不回", "")
+                _trace_identity(msg, _who, False, _me)
+                return
 
             # ── 闸门 L0~L2：静音 / 白名单 / 记账比对 ──
             # 全在 LoopGuard 里，一行调用。返回值带原因码，直接进日志。
@@ -1047,7 +1156,10 @@ class EngineWorker(QThread):
                           f"暂停接这条", "err")
                 return
 
-            if time.localtime().tm_hour in quiet:
+            from bigfish.app import _quiet_now
+
+            if _quiet_now(scope_of("quiet_hours", msg.chat_id),
+                          time.localtime()):
                 self._log(f"[安静时段] 跳过 {msg.chat_name}", "err")
                 return
 
@@ -1063,21 +1175,38 @@ class EngineWorker(QThread):
             if is_group:
                 from bigfish.group_gate import GroupGate
 
+                # 群聊两个字段也按会话取；enable 以前只在构造时设置一次，
+                # 改了配置不重开程序不生效 —— 顺手修掉。
+                _allow_all = tuple(scope_of("group_allow_all", msg.chat_id) or ())
+                _enable = bool(scope_of("group_reply", msg.chat_id))
                 if gate is None:
                     gate = GroupGate(self.reader._db,
                                      self.reader._db.wxid,
-                                     enable=bool(cfg.get("group_reply", True)),
-                                     allow_all=msg.chat_name in allow_all
-                                     or msg.chat_id in allow_all)
+                                     enable=_enable,
+                                     allow_all=msg.chat_name in _allow_all
+                                     or msg.chat_id in _allow_all)
                 else:
-                    gate.allow_all = (msg.chat_name in allow_all
-                                      or msg.chat_id in allow_all)
+                    gate.enable = _enable
+                    gate.allow_all = (msg.chat_name in _allow_all
+                                      or msg.chat_id in _allow_all)
                 t = gate.check(msg.chat_id, msg.text, True)
                 if not t.respond:
                     self._log(f"[不接] {msg.chat_name} / "
                               f"{msg.sender_name}: {msg.preview(36)}"
                               f"（{t.reason}）", "")
                     return
+                # 群里拿不准时，只有真的叫她（@ / 叫名字）才当对方处理。
+                # 免检群（group-allow-all）不算 —— 那不是"有人叫她"。
+                if (_who.who == _identity.WHO_UNKNOWN
+                        and not _identity.woken_from_reason(t.reason)):
+                    self._log(f"[跳过] {msg.chat_name}：拿不准是谁发的，"
+                              f"也没叫她（{t.reason}）", "")
+                    _trace_identity(msg, _who, True, _me)
+                    return
+                if _who.who == _identity.WHO_UNKNOWN:
+                    self._log(f"[拿不准] {msg.chat_name}：但被叫到了，"
+                              f"按对方处理（{_who.rule}）", "")
+                    _trace_identity(msg, _who, True, _me)
                 body = t.clean_text
                 self._log(f"[触发] {msg.chat_name} / "
                           f"{msg.sender_name}: {t.reason}", "in")
@@ -1373,8 +1502,9 @@ class EngineWorker(QThread):
             if not reply:
                 self._log("[生成失败] 空回复", "err")
                 return
-            if len(reply) > max_chars:
-                reply = reply[:max_chars] + "…"
+            _max_chars = int(scope_of("max_reply_chars", msg.chat_id) or 0)
+            if _max_chars > 0 and len(reply) > _max_chars:
+                reply = reply[:_max_chars] + "…"
 
             self._log(f"[想] {dt:.1f}s  {len(reply)}字", "think")
 
@@ -1425,13 +1555,27 @@ class EngineWorker(QThread):
                     #   1.2 秒一轮，单个窗口很窄，但聊一晚上必然撞上；
                     #   撞上一次就进入自问自答（线上真发生了）。
                     #   顺序反过来就没有窗口：库里出现的那一刻，账早就记好了。
-                    remember_sent(_part)
-                    r = self.sender.send(msg.chat_name, _part)
-                    if not r.ok:
-                        # 没发出去，这笔账必须撤 —— 留着会让对方
-                        # 原样说一句同样的话时被误判成回环。
-                        forget_sent(_part)
-                        self._log(f"[发] ✗ {r.detail}", "err")
+                    remember_sent(_part, msg.chat_id)
+                    try:
+                        _r = self.sender.send(msg.chat_name, _part)
+                        _verdict = _sending.classify(result=_r)
+                    except Exception as _exc:          # noqa: BLE001
+                        _verdict = _sending.classify(error=_exc)
+
+                    if not _verdict.sent:
+                        if _verdict.failed:
+                            # 确定没发出去，这笔账必须撤 —— 留着会让对方
+                            # 原样说一句同样的话时被误判成回环。
+                            forget_sent(_part, msg.chat_id)
+                        # 未知：账本**保留**（它可能已经发出去了，读回来要认得出），
+                        # 而且绝不重发 —— 那会让对方收到两遍。
+                        self._log(
+                            f"[发] {'✗' if _verdict.failed else '?'} "
+                            f"{_verdict.detail}", "err")
+                        if _verdict.unknown:
+                            self._log(
+                                "消息结果未知 —— 可能已经发出去了，所以不会重发。"
+                                "如果对方说没收到，是这一条。", "err")
                         break
                     sent_any = True
                 if sent_any:
@@ -1441,7 +1585,10 @@ class EngineWorker(QThread):
                     #   用户看到的"幻觉"就是这么来的。
                     hist.append((self.soul.address or "我", reply))
                     self.reply_count += 1
-                    remember_sent(reply)
+                    # 整段回复也记一笔（分条时每条已经记过；这里记的是拼起来的样子，
+                    # 因为读回来可能被合并成一条）。必须带会话 ——
+                    # 不带就会变成"全局账"，别的会话里出现同样文字会被误否决。
+                    remember_sent(reply, msg.chat_id)
                     last_reply_at.setdefault(msg.chat_id, []).append(time.time())
 
                     # 闸门 L3：轮级熔断。一轮自动回复 = 一次。
@@ -1795,6 +1942,8 @@ class Backend(QObject):
             "watching": len(self.watching),
             "account": self.account,
             "diagnose": diag,
+            # 提权与否启动时就定了，每 2 秒重算纯属浪费
+            "admin": _is_admin_cached(self),
             "recent": getattr(self, "_recent", []),
             "logs": self._pending_logs(),
         }, ensure_ascii=False)
@@ -1847,17 +1996,12 @@ class Backend(QObject):
             return ""
 
     def _diagnose_items(self) -> list[dict]:
-        import ctypes
-
         items = []
 
-        admin = False
-        try:
-            admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            pass
-        items.append({"key": "admin", "status": "ok" if admin else "err",
-                      "value": "已提权" if admin else "需要管理员"})
+        # 提权与否进程级常量，缓存住（见 _is_admin_cached 的说明）
+        items.append({"key": "admin",
+                      "status": "ok" if _is_admin_cached(self) else "err",
+                      "value": "已提权" if _is_admin_cached(self) else "需要管理员"})
 
         desk = False
         try:
@@ -1869,11 +2013,24 @@ class Backend(QObject):
                       "value": "可用" if desk else "锁屏中"})
 
         # 微信进程
+        #
+        # ⚠ 这一段以前**每 2 秒**跑一次。_find_weixin_pids 里要
+        #   EnumWindows + NtQuerySystemInformation + tasklist 三路合一，
+        #   实测 150~175 ms —— 全在 GUI 线程上。界面每隔两秒就卡一下
+        #   （表现为点任何按钮的响应慢半拍），查了很久才发现是这里。
+        #   现在缓存 30 秒：诊断信息本来就是给人看"是不是没连上"，
+        #   晚 30 秒完全无所谓；代价是启动微信后最多等一下才显示。
         wpids = []
         try:
-            from wechatauto.db import WeChatDB
-            probe = WeChatDB.__new__(WeChatDB)
-            wpids = probe._find_weixin_pids()
+            now = time.time()
+            cached = getattr(self, "_wechat_pids_cache", None)
+            if cached and now - cached[0] < 30:
+                wpids = cached[1]
+            else:
+                from wechatauto.db import WeChatDB
+                probe = WeChatDB.__new__(WeChatDB)
+                wpids = probe._find_weixin_pids()
+                self._wechat_pids_cache = (now, wpids)
         except Exception:
             pass
         items.append({"key": "wechat",
@@ -1965,6 +2122,137 @@ class Backend(QObject):
                                "account": acc}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    # ── 会话级配置（C-1 作用域） ──
+    #
+    # 为什么不复用 get_config / save_config：那一对读写的是**全局**设置
+    # （scopes.global），这里读写的是**某一个会话**的覆盖层。
+    # 混在一对方法里，早晚会出现"我以为改的是这个会话，其实改了全局"。
+
+    def _scope_context(self):
+        """(配置, bot_id, 解析器)。
+
+        解析器只在有已选账号时可用 —— 微信没开时昵称键解析不出来，
+        那是"未命中"，不是错误。
+        """
+        from bigfish import scopes as _scopes
+
+        cfg = load_json_config()
+        bot = str((cfg.get("auto_reply") or {}).get("account") or "") or self.account
+        resolver = None
+        if self._reader is not None:
+            try:
+                resolver = _scopes.memo_resolver(self._reader.resolve)
+            except Exception:
+                resolver = None
+        return cfg, bot, resolver
+
+    def _scope_rows(self, cfg, bot, resolver, chat_id):
+        from bigfish import scopes as _scopes
+
+        row = _scopes.resolve(cfg, bot_id=bot or None, chat_id=chat_id,
+                              resolver=resolver)
+        # 「如果把这一项从会话层删掉，它会从哪来」——
+        # 界面在用户点「继承」后要显示这个，而不是当前生效层。
+        inherited = _scopes.resolve(cfg, bot_id=bot or None, chat_id=None,
+                                    resolver=resolver)
+        out = []
+        for key, spec in _scopes.FIELDS.items():
+            value, layer = row[key]
+            if isinstance(value, tuple):
+                value = list(value)
+            inherit_value = inherited[key][0]
+            if isinstance(inherit_value, tuple):
+                inherit_value = list(inherit_value)
+            out.append({
+                "key": key,
+                "label": spec.get("label", key),
+                "kind": spec.get("kind", ""),
+                "note": spec.get("note", ""),
+                "placeholder": spec.get("placeholder", ""),
+                "value": value,
+                "layer": layer,
+                "layer_label": _scopes.LAYER_LABELS.get(layer, layer),
+                # 清掉会话覆盖之后的值与来源
+                "inherit_value": inherit_value,
+                "inherit_label": _scopes.LAYER_LABELS.get(
+                    inherited[key][1], inherited[key][1]),
+                # 只有落在会话层才算"我设过"；其余都是继承来的
+                "overridden": layer == _scopes.LAYER_CHAT,
+            })
+        return out
+
+    @Slot(str, result=str)
+    def get_chat_scope(self, chat_id: str) -> str:
+        """读某个会话的三层生效值 + 每一项的来源层。
+
+        界面靠 `layer` / `overridden` 标「本会话」还是「继承自全局」。
+        """
+        cid = str(chat_id or "").strip()
+        if not cid:
+            return json.dumps({"ok": False, "error": "缺少会话 id"},
+                              ensure_ascii=False)
+        try:
+            cfg, bot, resolver = self._scope_context()
+            from bigfish import scopes as _scopes
+            return json.dumps({
+                "ok": True,
+                "chat_id": cid,
+                "fields": self._scope_rows(cfg, bot, resolver, cid),
+                "problems": [list(p) for p in _scopes.diagnose(
+                    cfg, bot_id=bot or None, chat_id=cid, resolver=resolver)],
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, str, result=str)
+    def save_chat_scope(self, chat_id: str, payload: str) -> str:
+        """写会话层覆盖。
+
+        `payload` 形如 `{"allow_self": false, "quiet_hours": null}`：
+        **值给 null 表示"恢复继承"**（把这一项从会话层删掉），
+        删空了的会话块会一起清掉，不在配置里留空壳。
+        """
+        cid = str(chat_id or "").strip()
+        if not cid:
+            return json.dumps({"ok": False, "error": "缺少会话 id"},
+                              ensure_ascii=False)
+        try:
+            changes = json.loads(payload or "{}")
+            if not isinstance(changes, dict):
+                return json.dumps({"ok": False, "error": "payload 必须是对象"},
+                                  ensure_ascii=False)
+            from bigfish import scopes as _scopes
+
+            cfg = load_json_config()
+            applied, cleared = [], []
+            for key, value in changes.items():
+                if key not in _scopes.FIELDS:
+                    continue
+                if value is None:
+                    if _scopes.clear_chat_value(cfg, cid, key):
+                        cleared.append(key)
+                else:
+                    _scopes.set_chat_value(cfg, cid, key, value)
+                    applied.append(key)
+            save_json_config(cfg)
+
+            _cfg, bot, resolver = self._scope_context()
+            return json.dumps({
+                "ok": True,
+                "chat_id": cid,
+                "applied": applied,
+                "cleared": cleared,
+                "fields": self._scope_rows(_cfg, bot, resolver, cid),
+            }, ensure_ascii=False)
+        except ValueError as exc:
+            # set_chat_value 对昵称键 / 未注册字段抛 ValueError，原样带出去
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     @Slot(str, str, result=str)
     def rename_account(self, account: str, display: str) -> str:
@@ -3369,15 +3657,35 @@ class Backend(QObject):
     # 库层的活（转 GIF、编号、描述）全在 bigfish/stickers.py，
     # 这里只做「给界面用」的适配。
 
-    @Slot(result=str)
-    def sticker_list(self) -> str:
-        """表情库全量。界面一次拿全，不用点两次。"""
+    @Slot(bool, result=str)
+    def sticker_list(self, slim: bool = False) -> str:
+        """表情库全量。界面一次拿全，翻页在前端做。
+
+        `slim=True` 时省掉几个**只有详情弹窗才用**的重字段：
+        `detail`（平均 220 KB）、`tags`、`path`（前端拼得出来）。
+        翻页只显示缩略图 + 一句话，用不着这些；双击看详情时再走
+        `sticker_get` 单独取那一条 —— 一页 60 张，一次 1 KB。
+        """
         try:
             from bigfish import plugins as _plugins
             from bigfish import stickers
 
             _plugins.ensure_loaded()
-            items = stickers.list_stickers()
+            items = stickers.list_stickers(with_detail=not slim)
+            if slim:
+                items = [{
+                    "code": it["code"],
+                    "file": it["file"],
+                    "thumb": it["thumb"],
+                    "brief": it["brief"],
+                    "code_": it["code"],
+                    "size": it["size"],
+                    "frames": it["frames"],
+                    "intensity": it["intensity"],
+                    "moodDim": it["moodDim"],
+                    "moodDimLabel": it["moodDimLabel"],
+                    "kind": it["kind"],
+                } for it in items]
             usage = stickers.read_usage("")
             return json.dumps({
                 "ok": True,
@@ -3393,11 +3701,42 @@ class Backend(QObject):
                               ensure_ascii=False)
 
     @Slot(str, result=str)
+    def sticker_get(self, code: str) -> str:
+        """取一张表情的完整信息（详情弹窗用）。
+
+        为什么单独开一个：列表里不带 detail（220 KB），
+        打开详情时只取这一条（约 300 字节）——
+        比"为了弹窗把 2000 条 detail 全塞进列表"便宜三个数量级。
+        """
+        try:
+            from bigfish import stickers
+
+            it = stickers.get_sticker(str(code))
+            if not it:
+                return json.dumps({"ok": False, "error": "没有这张表情"},
+                                  ensure_ascii=False)
+            return json.dumps({"ok": True, "item": it}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
     def sticker_add(self, paths_json: str) -> str:
-        """把一批文件收进库。
+        """把一批文件收进库（带去重）。
 
         界面那边可能是「浏览…」选的，也可能是拖进来的，都走这里。
-        每张都会：转 GIF → 分配代码 → 落盘。
+        每张都会：**查重 → 转 GIF → 分配代码 → 落盘 → 做缩略图**。
+
+        查重规则（见 bigfish/sticker_fp.py）：
+          · 字节完全相同            → 跳过
+          · 配色 + 构图几乎一致      → 跳过（同一张图的另一次导出）
+          · 只是"很像"（同系列）     → 照收，但在报告里列出来
+
+        ⚠ 分批：以前 2000 张一次性循环，这个 @Slot 跑在 GUI 线程上，
+          整个窗口十来分钟不响应（连"取消"都点不了）。
+          现在每 20 张就 processEvents + 回报一次进度，
+          界面能刷新、能显示"导到第几张"。
+          前端那边也应该分批调用，这里是第二道保险。
         """
         try:
             from bigfish import stickers
@@ -3406,15 +3745,65 @@ class Backend(QObject):
             if not isinstance(paths, list):
                 return json.dumps({"ok": False, "error": "参数不对"},
                                   ensure_ascii=False)
-            added, failed = [], []
-            for p in paths:
-                ok, res, item = stickers.import_sticker(str(p))
-                if ok:
-                    added.append(item)
-                else:
-                    failed.append({"file": os.path.basename(str(p)),
-                                   "why": res})
-            return json.dumps({"ok": True, "added": added, "failed": failed},
+
+            # 刻意**不**在这里再切一次片：切片会让 index 每 20 张写一次
+            # （1MB × N 次）。批次的粒度由前端控制，这里整批一次收。
+            rep = stickers.import_batch([str(p) for p in paths])
+            self._pump_events()
+            return json.dumps({"ok": True,
+                               "added": rep["added"],
+                               "skipped": rep["skipped"],
+                               "failed": rep["failed"],
+                               "near": rep.get("near") or []},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    #: 导入时每处理这么多张就让出一次事件循环。
+    #: 太小则 processEvents 自己成了开销，太大则界面看起来像卡死。
+    IMPORT_YIELD_EVERY = 20
+
+    def _pump_events(self) -> None:
+        """处理一轮挂起的界面事件，不阻塞、不递归进重入的弹窗。
+
+        只在长循环的缝隙里调。用 ExcludeUserInputEvents 是为了
+        不把"用户又点了什么"塞进正在跑的循环里 ——
+        那会让导入逻辑和按钮回调交错执行。
+        """
+        try:
+            from PySide6.QtCore import QCoreApplication, QEventLoop
+
+            QCoreApplication.processEvents(
+                QEventLoop.ExcludeUserInputEvents)
+        except Exception:
+            pass
+
+    @Slot(int, result=str)
+    def sticker_fill_thumbs(self, limit: int = 60) -> str:
+        """给库里还缺缩略图的表情补一批，返回补了多少。
+
+        ⚠ 有上限，而且是**每次调用补一批**：导入完成后 2000 张
+          一次性补会卡 40 秒；分 34 次、每次 60 张（约 1.2s），
+          界面在两次之间能正常响应。
+          前端在 loadStickers 之后反复调它，直到返回 0。
+        """
+        try:
+            from bigfish import stickers
+
+            items = stickers.list_stickers(with_detail=False)
+            missing = [it["code"] for it in items if not it.get("thumb")]
+            # 顺带清掉早期版本的 PNG 缩略图。只动 _thumbs/，不碰素材。
+            stickers.sweep_legacy_thumbs()
+            if not missing:
+                return json.dumps({"ok": True, "made": 0,
+                                   "left": 0}, ensure_ascii=False)
+            # 一次最多 60 张 ≈ 1.5s（实测 20ms/张）。
+            # 界面每批之间让出事件循环，用户还能滚动。
+            made = stickers.ensure_thumbs(missing, limit=int(limit or 60))
+            self._pump_events()
+            return json.dumps({"ok": True, "made": made,
+                               "left": max(0, len(missing) - made)},
                               ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)},
@@ -3823,6 +4212,7 @@ class Backend(QObject):
     @Slot(result=str)
     def get_config(self) -> str:
         from bigfish import providers as _P
+        from bigfish import scopes as _scopes
         from bigfish.replier import ModelConfig
 
         c = load_json_config()
@@ -3856,11 +4246,14 @@ class Backend(QObject):
             "protocols": [{"id": p, "label": _P.PROTOCOL_LABEL[p]}
                           for p in _P.PROTOCOLS],
             "interval": ar.get("interval", 1.2),
-            "max_reply_chars": ar.get("max_reply_chars", 300),
-            "quiet_hours": ar.get("quiet_hours", []),
-            "allow_self": ar.get("allow_self", False),
-            "group_reply": ar.get("group_reply", True),
-            "group_allow_all": ar.get("group_allow_all", []),
+            # 读**生效值**（scopes 三层，这里不带会话 → 全局视角）。
+            # 不读原始 ar 字段：用户要知道"现在真正是什么"，
+            # 而不是"文件里写着什么"。两者从 7.x 起就可能不是一回事。
+            "max_reply_chars": _scopes.get(c, "max_reply_chars"),
+            "quiet_hours": list(_scopes.get(c, "quiet_hours") or ()),
+            "allow_self": bool(_scopes.get(c, "allow_self")),
+            "group_reply": bool(_scopes.get(c, "group_reply")),
+            "group_allow_all": list(_scopes.get(c, "group_allow_all") or ()),
         }, ensure_ascii=False)
 
     @Slot(str, result=str)
@@ -3899,13 +4292,33 @@ class Backend(QObject):
 
             ar = c.setdefault("auto_reply", {})
             ar["interval"] = float(d.get("interval", 1.2))
-            ar["max_reply_chars"] = int(d.get("max_reply_chars", 300))
-            ar["quiet_hours"] = list(d.get("quiet_hours") or [])
-            ar["allow_self"] = bool(d.get("allow_self", False))
-            ar["group_reply"] = bool(d.get("group_reply", True))
-            ar["group_allow_all"] = [str(x) for x in
-                                     (d.get("group_allow_all") or [])]
             ar["chats"] = self.watching or ar.get("chats", [])
+
+            # ── 五个行为字段写**新路径**（scopes）──
+            #
+            # 规格 C1 §4.1：读时兼容旧路径，写时只写新路径。
+            # 旧的 auto_reply.* 保留在文件里不动，方便回滚到 0.5.0。
+            #
+            # ⚠ allow_self 是例外：它写**会话层**，不写 global。
+            #   这个开关的语义是「只对文件传输助手生效的自测通道」，
+            #   写成 global 就等于"所有会话都能回应自己" ——
+            #   那正是 11-04 事故的形态。界面上这个勾选框代表的就是
+            #   filehelper 那一个会话，所以写 scopes.chat["filehelper"]。
+            from bigfish import scopes as _scopes
+
+            _scopes.set_global_value(
+                c, "max_reply_chars", int(d.get("max_reply_chars", 300)))
+            _scopes.set_global_value(
+                c, "quiet_hours",
+                [str(x) for x in (d.get("quiet_hours") or [])])
+            _scopes.set_global_value(
+                c, "group_reply", bool(d.get("group_reply", True)))
+            _scopes.set_global_value(
+                c, "group_allow_all",
+                [str(x) for x in (d.get("group_allow_all") or [])])
+            # 显式写 true/false，不留 None：留 None 会被旧的全局 true 重新点亮。
+            _scopes.set_chat_value(
+                c, "filehelper", "allow_self", bool(d.get("allow_self", False)))
 
             save_json_config(c)
             return json.dumps({"ok": True})

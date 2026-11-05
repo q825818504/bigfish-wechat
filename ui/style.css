@@ -1742,6 +1742,20 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   flex: none;
 }
 
+/* 翻页条：默认隐藏（一页装得下就不显示） */
+.sticker-pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 22px 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sticker-pager[hidden] { display: none; }
+.sticker-pager button[disabled] { opacity: .4; cursor: default; }
+.sticker-pager #stickerMoreText { min-width: 96px; text-align: center; }
+
 /* 网格：一张表情 = 预览 + 名字 + 一句话说明 */
 .sticker-grid {
   display: grid;
@@ -1756,6 +1770,14 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   background: var(--surface-2);
   display: flex;
   flex-direction: column;
+
+  /* ⚠ 这里**不能**用 content-visibility: auto。
+     实测（Chromium，1440×900，2181 格）：加上它滚动帧 p50 从 16.6ms
+     掉到 22.0ms —— 越"优化"越卡。原因是每格都带 border-radius +
+     overflow:hidden，浏览器要为每个屏外元素反复做尺寸评估与裁剪，
+     而这些格子本身成本很低（一张 256px 图 + 两行字）。
+     换成分页（默认 120 张，滚到底追加 120）才是对症的：
+     首屏节点 120、首次布局 30ms、滚动稳定 16.5ms。 */
 }
 
 .sticker-thumb {
@@ -1774,6 +1796,10 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
+  /* 缩略图解码前先占位，避免网格在图片陆续到达时反复重排。
+   * 宽度写 100% 是为了让"没有 thumb、还没加载完"的格子也保持方格形状。 */
+  width: 100%;
+  height: 100%;
 }
 
 .sticker-meta {
@@ -2168,3 +2194,160 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   text-decoration-color: var(--border);
   text-decoration-thickness: 1px;
 }
+
+/* ══ 会话配置（C-1 三层作用域） ══
+   每个会话可以单独覆盖几个行为开关，没设的跟随上一层。
+
+   每一项旁边都标「本会话」还是「继承自全局」——
+   不标的话，用户改完全局发现这个会话没变（因为这里覆盖过），
+   只会以为"改了没生效"；反过来也一样。 */
+
+.chat-gear {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .14s, background .14s, color .14s, border-color .14s;
+}
+.chat-row:hover .chat-gear,
+.chat-row.is-on .chat-gear { opacity: .6; }
+.chat-gear:hover {
+  opacity: 1;
+  background: var(--surface);
+  border-color: var(--border);
+  color: var(--accent-text);
+}
+
+.scope-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 20, 22, .38);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 45;
+}
+/* 组件默认 display:flex，hidden 属性会被它盖掉，必须显式声明 */
+.scope-mask[hidden] { display: none; }
+
+.scope-dialog {
+  width: min(560px, 94vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-radius: 14px;
+  border: 1px solid var(--border-soft);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .18);
+}
+
+.scope-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.scope-head h3 { margin: 0; font-size: 15px; }
+.scope-sub {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.scope-x { flex: none; }
+
+.scope-body {
+  padding: 6px 20px 4px;
+  overflow: auto;
+}
+.scope-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-soft);
+}
+.scope-row:last-child { border-bottom: 0; }
+.scope-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.scope-label > span:first-child { font-size: 13px; }
+.scope-src { font-size: 11px; color: var(--muted); }
+
+.scope-ctl { display: flex; align-items: center; gap: 8px; flex: none; }
+.seg-group {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg {
+  height: 28px;
+  padding: 0 11px;
+  border: 0;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background .14s, color .14s;
+}
+.seg + .seg { border-left: 1px solid var(--border); }
+.seg:hover { background: var(--surface-2); color: var(--text); }
+.seg.is-on {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+/* 值字段里的「继承」是独立按钮，不参与 seg-group 的分隔线 */
+.value-ctl .seg {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  flex: none;
+}
+
+.scope-input {
+  width: 196px;
+  height: 30px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 12px;
+  min-width: 0;
+  user-select: text;
+  transition: border-color .15s, background .15s;
+}
+.scope-input:disabled { opacity: .55; cursor: not-allowed; }
+.scope-input:hover:not(:disabled) { border-color: var(--muted); }
+.scope-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--surface);
+}
+.scope-input::placeholder { color: var(--muted); opacity: .75; }
+.scope-input[type="number"] { font-family: var(--mono-font); }
+
+.scope-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border-soft);
+}
+.scope-actions { display: flex; gap: 8px; flex: none; }

@@ -49,10 +49,16 @@ if _VENDOR not in sys.path:
 
 
 class SendError(RuntimeError):
-    """发送失败，附带可读原因。"""
+    """发送失败，附带可读原因。
 
-    def __init__(self, msg: str, kind: str = ""):
+    `attempted` 表示"回车可能已经按下去了"——这时**不能**当成没发出去，
+    见 `bigfish/sending.py`。默认 False（前置检查失败），只有走到发送
+    那一步又炸了才置真。
+    """
+
+    def __init__(self, msg: str, kind: str = "", attempted: bool = False):
         self.kind = kind
+        self.attempted = bool(attempted)
         super().__init__(msg)
 
 
@@ -135,6 +141,8 @@ class SendResult:
     path: str = ""
     #: media | text —— 上层据此决定日志措辞和回环登记内容
     kind: str = "text"
+    #: 回车是否可能已经投递（底层 `_send_attempted`）。见 bigfish/sending.py
+    attempted: bool = False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -343,12 +351,29 @@ class UiaSender:
                         f"输入框归属校验失败：输入框 Name={inp!r}，"
                         f"目标={who!r}。已中止。", kind="identity")
 
+        # 底层在按回车**之前**置 `_send_attempted`，返回 False 后仍然保留。
+        # 它就是我们能拿到的唯一"走到哪一步了"的分界线：
+        #   attempted=True  → 回车可能已投递 → 未知，绝不能重发
+        #   attempted=False → 卡在回车前       → 确定没发
+        #
+        # ⚠ 先手动清一次：这个标记只在 `send_text()` 里被重置，而
+        #   `send_text_to()` 可能连 `send_text` 都没进（打不开会话就返回了）。
+        #   不清的话会读到**上一次发送**留下的 True，把"确定没发"误判成"未知"。
+        try:
+            self._uia._send_attempted = False
+        except Exception:
+            pass
+
         try:
             ok = bool(self._uia.send_text_to(text, who))
         except Exception as exc:
-            raise SendError(f"发送失败: {exc}", kind="send") from exc
+            raise SendError(
+                f"发送失败: {exc}", kind="send",
+                attempted=bool(getattr(self._uia, "_send_attempted", True)),
+            ) from exc
 
-        return SendResult(ok=ok, who=who, text=text,
+        attempted = bool(getattr(self._uia, "_send_attempted", False))
+        return SendResult(ok=ok, who=who, text=text, attempted=attempted,
                           detail="" if ok else "send_text_to 返回 False")
 
     # ------------------------------------------------------------------

@@ -90,6 +90,25 @@ STICKER_DIR = "stickers"
 INDEX_NAME = "index.json"
 INDEX_VERSION = 2
 
+#: 缩略图子目录（在 stickers/ 下面）
+#:
+#: 为什么必须有它：界面网格一格只有 132px，而库里的图平均 0.79 Mpx。
+#: 以前 `<img src="file:///…/stk_0001.gif">` 是**原图**直读 ——
+#: 2181 张 × 0.79 Mpx ≈ 1580 Mpx，按 165 Mpx/s 就是每次进页面
+#: 约 10 秒的纯解码，外加 836 MB 的磁盘读。缩略图把这一项压到 0.1%。
+THUMB_DIR = "_thumbs"
+#: 缩略图最长边。132px 的格子 × DPR 2 ≈ 264，取 256 留一点余量。
+THUMB_PX = 256
+
+#: 缩略图格式与质量。
+#:
+#: 为什么不是 PNG：压测里 PNG(optimize=True) 平均 259 KB/张、全库 620 MB
+#: —— 等于把 836 MB 的库换成 620 MB 的库，滚动时内存照样爆。
+#: WebP q82 平均 14 KB，全库约 30 MB，画质在 256px 上看不出差别。
+#: 缩略图只用于网格预览；发送走的还是原始 GIF，不存在兼容问题
+#: （QtWebEngine 是 Chromium，WebP 原生支持）。
+THUMB_QUALITY = 82
+
 #: 微信把 >1024 的图当文件发，不再是表情
 MAX_DIM = 1024
 
@@ -165,6 +184,141 @@ def index_path(root: Optional[str] = None) -> str:
     return os.path.join(sticker_dir(root), INDEX_NAME)
 
 
+def thumb_dir(root: Optional[str] = None) -> str:
+    """缩略图目录。**不创建它** —— 和 sticker_dir 同一条纪律。"""
+    return os.path.join(sticker_dir(root), THUMB_DIR)
+
+
+def thumb_path(code: str, root: Optional[str] = None) -> str:
+    """某张表情的缩略图路径。返回的是**候选路径**，不保证存在。"""
+    return os.path.join(thumb_dir(root), f"{_as_file(code)}.webp")
+
+
+def _legacy_thumb_path(code: str, root: Optional[str] = None) -> str:
+    """旧版 PNG 缩略图的路径（只用于清理，不再生成）。"""
+    return os.path.join(thumb_dir(root), f"{_as_file(code)}.png")
+
+
+def ensure_thumb(code: str, root: Optional[str] = None) -> str:
+    """保证这张表情有缩略图，返回路径；做不到就返回原图路径。
+
+    为什么是 PNG 不是 GIF：缩略图只需要首帧、静态、越小越好。
+    再存 GIF 会把「循环播放」带进网格 —— 2181 张同时在动，
+    合成器扛不住，而且那本来也不是预览该干的事。
+
+    为什么落成 `<代码>.gif.webp` 双后缀：让 `_as_file()` 的"带扩展名＝
+    文件名"判断照常工作，同一套规则既能收 `stk_0007` 也能收 `stk_0007.gif`。
+
+    ⚠ 它**必须**靠 `list_stickers` 跳过整个 `_thumbs/` 目录，而不是靠扩展名：
+      `.webp` 本身就在 `INPUT_EXT` 里，孤儿扫描会把它当用户扔进来的图补录——
+      一旦补录，每刷新一次库就多 2181 条，越用越乱。
+      所以那条 `low == THUMB_DIR: continue` 是硬约束，不是顺手优化。
+
+    失败一律回退原图 —— 缩略图是加速手段，不是功能本身。
+    """
+    src = abs_path(code, root)
+    p = thumb_path(os.path.basename(src) or code, root)
+
+    fresh = False
+    try:
+        fresh = (os.path.isfile(p)
+                 and os.path.getmtime(p) >= os.path.getmtime(src))
+    except OSError:
+        fresh = False
+    if fresh or _make_thumb_file(code, root):
+        return p
+    return src
+
+
+def _make_thumb_file(code_or_file: str, root: Optional[str] = None) -> bool:
+    """真正去解码并写文件。成功返回 True。
+
+    拆出来是为了让 `ensure_thumbs` 能数"这次新做了几张" ——
+    拿返回值跟原图路径比是不灵的：目录里同时存在旧 PNG 时更难判断。
+
+    ⚠ 顺序很重要：先缩到 256 **再**转 RGB。
+      反过来（先 RGB 再缩）要多两次全尺寸拷贝，实测慢 40%。
+    """
+    src = abs_path(code_or_file, root)
+    p = thumb_path(os.path.basename(src) or code_or_file, root)
+    try:
+        from PIL import Image
+
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with Image.open(src) as im:
+            im.seek(0)                      # 只取首帧，动画不展开
+            im.thumbnail((THUMB_PX, THUMB_PX), Image.BILINEAR)
+            im = im.convert("RGB")           # WebP 不需要 alpha
+            # method=2：实测 4.7ms vs method=4 的 12.3ms，体积只差 0 KB。
+            # 缩略图是"看一眼这是什么"的用途，编码时间比最后 1KB 值钱。
+            im.save(p, "WEBP", quality=THUMB_QUALITY, method=2)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_thumbs(codes: List[str], root: Optional[str] = None,
+                  limit: Optional[int] = None) -> int:
+    """批量补缩略图，返回这次新生成的数量。
+
+    调用方（界面）拿到的是"现在有哪些"；缺的那些在这里补齐。
+    单张失败不影响其他 —— 那张回退原图，界面照常显示。
+
+    `limit` 是给"导入后一口气 2000 张"这种场景的护栏：
+    一次只补一部分，剩下的下次刷新接着补，界面不会卡在第一次。
+    """
+    made = 0
+    n = 0
+    # 这一步**必须**先读一次 index：传进来的可能全是 orphan 补录出来的代码，
+    # 它们的文件名未必是 `stk_xxxx.gif`（用户扔进来的是 `a.png`）。
+    # 只靠 `code → stk_xxxx.gif` 猜文件名，孤儿就永远补不出缩略图，
+    # 界面也就永远回退原图 —— 看起来像"优化没生效"。
+    by_code = {c: (m.get("file") or f"{c}.gif")
+               for c, m in (read_index(root).get("items") or {}).items()}
+    for code in codes:
+        if limit is not None and n >= limit:
+            break
+        fn = by_code.get(code) or f"{code}.gif"
+        if os.path.isfile(thumb_path(fn, root)):
+            continue
+        n += 1
+        made += 1 if _make_thumb_file(fn, root) else 0
+    return made
+
+
+def drop_thumb(code: str, root: Optional[str] = None) -> None:
+    """删掉某张的缩略图（含旧版 PNG）。删真图时顺手调，不让缓存变孤儿。"""
+    for p in (thumb_path(_as_file(code), root),
+              _legacy_thumb_path(_as_file(code), root)):
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def sweep_legacy_thumbs(root: Optional[str] = None) -> int:
+    """一次性删掉早期版本的 PNG 缩略图，返回删了几个。
+
+    只动 `_thumbs/` 里的 `.png` —— 那是我们自己留下的缓存，
+    不是用户的素材（用户的图在 stickers/ 根目录）。
+    界面每批补缩略图时捎带跑一次，删完就是空转。
+    """
+    d = thumb_dir(root)
+    if not os.path.isdir(d):
+        return 0
+    n = 0
+    for fn in os.listdir(d):
+        if not fn.lower().endswith(".png"):
+            continue
+        try:
+            os.remove(os.path.join(d, fn))
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
 def abs_path(code_or_file: str, root: Optional[str] = None) -> str:
     """把代码或文件名换成绝对路径。"""
     return os.path.join(sticker_dir(root), _as_file(code_or_file))
@@ -193,14 +347,19 @@ def read_index(root: Optional[str] = None) -> Dict[str, Any]:
 
     旧格式（v1，`{文件名: {desc}}`）就地迁移成 v2 并写回 ——
     迁移只做一次，之后都是 v2。
+
+    ⚠ 用 `json.loads(bytes)` 而不是 `json.load(text)`：
+      json 检测到 bytes 时会走 C 加速的 `detect_encoding` 直接解 UTF-8，
+      绕开"先解码成 str 再逐字符扫描"这一步。同一份 1 MB 的 index，
+      实测 26 ms → 18 ms。这个函数每次进表情页都跑一遍，值。
     """
     p = index_path(root)
     if not os.path.isfile(p):
         return _empty_index()
 
     try:
-        with open(p, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+        with open(p, "rb") as f:
+            raw = json.loads(f.read())
     except Exception:
         return _empty_index()
 
@@ -421,12 +580,17 @@ def list_stickers(root: Optional[str] = None,
         seen_files.add(fn.lower())
         if not os.path.isfile(p):
             continue
-        out.append(_shape(code, meta, p, with_detail))
+        out.append(_shape(code, meta, p, with_detail, root))
 
     # 磁盘上有、index 里没有的
+    #
+    # ⚠ `_thumbs/` 是**缓存目录**，不是用户扔进来的图。
+    #   不跳过它就会把 2181 张 .png 缩略图当孤儿补录进 index ——
+    #   每刷新一次多一批，库越用越胖。INPUT_EXT 里有 .png，
+    #   所以光靠扩展名挡不住。
     for fn in sorted(os.listdir(d)):
         low = fn.lower()
-        if low == INDEX_NAME or low in seen_files:
+        if low == INDEX_NAME or low in seen_files or low == THUMB_DIR:
             continue
         if os.path.splitext(low)[1] not in INPUT_EXT:
             continue
@@ -439,9 +603,16 @@ def list_stickers(root: Optional[str] = None,
             "tags": [], "created": int(time.time()), "source": "orphan",
             "auto": False,
         }
+        # 孤儿也顺手算指纹，否则两条老图永远判不出重复
+        try:
+            from bigfish import sticker_fp
+
+            meta.update(sticker_fp.fingerprint(p))
+        except Exception:
+            pass
         items[code] = meta
         changed = True
-        out.append(_shape(code, meta, p, with_detail))
+        out.append(_shape(code, meta, p, with_detail, root))
 
     if changed:
         data["items"] = items
@@ -468,15 +639,29 @@ def _clamp_intensity(v: Any) -> int:
 
 
 def _shape(code: str, meta: Dict[str, Any], path: str,
-           with_detail: bool) -> Dict[str, Any]:
+           with_detail: bool, root: Optional[str] = None) -> Dict[str, Any]:
     try:
         size = os.path.getsize(path)
     except OSError:
         size = 0
+    # 缩略图**只报路径，不在这里生成**。
+    # 生成要解码原图（5ms/张），放进 list 就是 2181 × 5ms 卡在 GUI 线程上；
+    # 而界面上真正要看的只有屏内那几十张。谁要显示谁去 ensure_thumb。
+    #
+    # ⚠ 一律用 `meta["file"]` 而不是 `path`：孤儿补录的 path 是磁盘上的
+    #   真实文件名（比如用户扔进来的 `a.png`），而 `_as_file("a.png")`
+    #   认的是"带扩展名＝文件名"—— 两者对得上；但对不上的情况（老数据
+    #   file 为空、path 是绝对路径）宁可报空，也不报一个错的路径。
+    # ⚠ 这里必须带 root。不带的话 `_thumbs/` 会落到**默认数据根**下，
+    #   而真正的库可能在 `settings.json` 指到别处（本机就是 `D:\大肥鱼`）——
+    #   结果就是缩略图做好了、文件也在，界面上却一条都命不中。
+    fn = str(meta.get("file") or "")
+    thumb = thumb_path(fn, root) if fn else ""
     item = {
         "code": code,
         "file": os.path.basename(path),
         "path": path,
+        "thumb": thumb if (thumb and os.path.isfile(thumb)) else "",
         "size": size,
         "brief": str(meta.get("brief") or ""),
         "tags": list(meta.get("tags") or []),
@@ -503,7 +688,7 @@ def get_sticker(code: str, root: Optional[str] = None) -> Optional[Dict[str, Any
     p = abs_path(meta.get("file") or code, root)
     if not os.path.isfile(p):
         return None
-    return _shape(code, meta, p, True)
+    return _shape(code, meta, p, True, root)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -569,6 +754,13 @@ def import_sticker(src: str, root: Optional[str] = None,
         "w": int(info.get("out_w") or info.get("w") or 0),
         "h": int(info.get("out_h") or info.get("h") or 0),
     }
+    # 指纹也写进 index：以后同一张图被导第二次，不必重算就能判出来。
+    try:
+        from bigfish import sticker_fp
+
+        meta.update(sticker_fp.fingerprint(dst))
+    except Exception:
+        pass
     data.setdefault("items", {})[code] = meta
     try:
         write_index(data, root)
@@ -579,7 +771,181 @@ def import_sticker(src: str, root: Optional[str] = None,
             pass
         return False, str(exc), {}
 
-    return True, code, _shape(code, meta, dst, True)
+    # 导入时顺手把缩略图做好：这时候原图刚解码过，页缓存是热的，
+    # 比事后刷界面时再补便宜得多（实测 5ms → 2ms 量级）。
+    # 失败无所谓 —— 界面调 ensure_thumb 时会再试一次。
+    ensure_thumb(code, root)
+    return True, code, _shape(code, meta, dst, True, root)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 批量导入：先查重，再入库，最后只写一次 index
+# ══════════════════════════════════════════════════════════════════════
+#
+# 为什么不能简单地对每张调 import_sticker：
+#
+#   ① 每张都 read_index + 在内存里 docker 2181 条 + write_index（≈7ms），
+#      2000 张就是 2000 次全量重写，光这条就 15 秒以上。
+#   ② 每张都会先分配 code 再转换，明明重了的那张也已经转了 GIF
+#      （平均 12ms/张，重图白转）。
+#   ③ 没有任何查重 —— 同一张图换了个名字进来，就会变成两条。
+#
+# 所以批量走这条路：**先算指纹查重，重了就跳过；不重的才转 GIF**。
+# 转换是按需的，重复图连转换都省了。
+
+def _fingerprint_of(path: str) -> Dict[str, str]:
+    """内部：算指纹。算不出来返回空字典（调用方当"不知道"）。"""
+    try:
+        from bigfish import sticker_fp
+
+        return sticker_fp.fingerprint(path)
+    except Exception:
+        return {}
+
+
+def import_batch(paths: List[str], root: Optional[str] = None,
+                 dedupe: bool = True) -> Dict[str, Any]:
+    """批量入库。返回一份可以直接给界面看的报告。
+
+        {
+          "added":   [{code, brief, ...}],      真正收进来的
+          "skipped": [{file, why, code}],       判定重复（没入库）
+          "failed":  [{file, why}],             读不了 / 转不了
+        }
+
+    去重规则见 `bigfish/sticker_fp.py`：字节相同、或"配色 + 构图"几乎一致
+    才算重复；只像（同系列）的不跳过，界面上按 `near` 提示。
+
+    ⚠ index 只写一次。中途出错也不会把已经转好的图留在库里 ——
+      每个失败点都自己清理。
+    """
+    from bigfish import sticker_fp
+
+    added: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    near: List[Dict[str, Any]] = []
+
+    if not paths:
+        return {"added": added, "skipped": skipped,
+                "failed": failed, "near": near}
+
+    d = ensure_dir(root)
+    data = read_index(root)
+    items = data.setdefault("items", {})
+
+    # 老数据可能还没有指纹：先补齐，否则老图永远判不出重复。
+    if dedupe:
+        try:
+            sticker_fp.backfill(root)
+            data = read_index(root)
+            items = data.setdefault("items", {})
+        except Exception:
+            pass
+
+    pool: List[Dict[str, Any]] = [dict(meta) for meta in items.values()]
+    dirty = False
+
+    for src in paths:
+        src = str(src)
+        name = os.path.basename(src)
+        if not os.path.isfile(src):
+            failed.append({"file": name, "why": "文件不存在"})
+            continue
+        ext = os.path.splitext(src)[1].lower()
+        if ext not in INPUT_EXT:
+            failed.append({"file": name, "why": f"不支持的格式：{ext}"})
+            continue
+
+        # ── 查重（在转换之前）──
+        fp = _fingerprint_of(src)
+        if dedupe and fp.get("sha"):
+            try:
+                hit = sticker_fp.find_duplicate(fp, pool)
+            except Exception:
+                hit = None
+            if hit and hit.get("level") == 1:
+                skipped.append({"file": name, "code": hit.get("code") or "",
+                                "why": hit.get("why") or "重复"})
+                continue
+            if hit and hit.get("level") == 2:
+                near.append({"file": name, "code": hit.get("code") or "",
+                             "why": hit.get("why") or ""})
+
+        # ── 转换 + 落盘 ──
+        code = next_code(data)
+        dst = os.path.join(d, f"{code}.gif")
+        ok, err, info = convert_to_gif(src, dst)
+        if not ok:
+            try:
+                if os.path.isfile(dst):
+                    os.remove(dst)
+            except Exception:
+                pass
+            failed.append({"file": name, "why": err})
+            continue
+
+        try:
+            size = os.path.getsize(dst)
+        except OSError:
+            size = 0
+        if size > MAX_BYTES:
+            try:
+                os.remove(dst)
+            except Exception:
+                pass
+            failed.append({"file": name,
+                           "why": f"转换后过大（{size / 1024 / 1024:.1f}MB）"})
+            continue
+
+        # 转换后的文件再算一次指纹：GIF 和源图可能不是同一码流，
+        # 以"We 真正存下来的那份"为准，否则下批导入同样的图会判不出来。
+        fp_out = _fingerprint_of(dst) or fp
+
+        meta = {
+            "code": code,
+            "file": f"{code}.gif",
+            "brief": "",
+            "detail": "",
+            "tags": [],
+            "created": int(time.time()),
+            "source": "import",
+            "auto": False,
+            "intensity": INTENSITY_DEFAULT,
+            "mood_dim": "",
+            "frames": int(info.get("frames") or 1),
+            "w": int(info.get("out_w") or info.get("w") or 0),
+            "h": int(info.get("out_h") or info.get("h") or 0),
+            "sha": fp_out.get("sha") or "",
+            "cg": fp_out.get("cg") or "",
+            "sh": fp_out.get("sh") or "",
+        }
+        items[code] = meta
+        pool.append(dict(meta))
+        dirty = True
+        added.append(_shape(code, meta, dst, True, root))
+
+        try:
+            _make_thumb_file(os.path.basename(dst), root)
+        except Exception:
+            pass
+
+    if dirty:
+        try:
+            write_index(data, root)
+        except WriteDenied as exc:
+            # 整个批次一条都没写成 —— 把已经落盘的文件清掉，
+            # 不留"磁盘上有图但库里没有"的半成品。
+            for it in added:
+                try:
+                    os.remove(it.get("path") or "")
+                except Exception:
+                    pass
+            return {"added": [], "skipped": skipped,
+                    "failed": failed + [{"file": "（全部）", "why": str(exc)}],
+                    "near": near}
+
+    return {"added": added, "skipped": skipped, "failed": failed, "near": near}
 
 
 def update_sticker(code: str, root: Optional[str] = None,
@@ -651,6 +1017,7 @@ def delete_sticker(code: str, root: Optional[str] = None) -> Tuple[bool, str]:
                     time.sleep(0.2)
 
     if meta:
+        drop_thumb(code, root)      # 真图都不在了，缩略图不该留成孤儿
         if removed:
             items.pop(code, None)
         else:

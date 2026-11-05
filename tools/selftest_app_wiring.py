@@ -28,6 +28,24 @@ PASS = 0
 FAIL = 0
 FAILED: list[str] = []
 
+#: 证据链在测试里收集到内存，不写真实数据目录。
+#: 顺带让"否决必须留痕"这条能被断言（spec D-1 第 18 条）。
+TRACES: list[dict] = []
+
+
+def _capture_trace(verdict, decision, **kw):
+    TRACES.append({"verdict": getattr(verdict, "who", ""),
+                   "rule": getattr(verdict, "rule", ""),
+                   "reason": getattr(decision, "reason", ""),
+                   "chat": kw.get("chat_id", "")})
+    return None
+
+
+def _install_trace_capture() -> None:
+    from bigfish import identity_trace
+
+    identity_trace.record = _capture_trace
+
 
 def _pick_marks() -> tuple[str, str]:
     try:
@@ -57,9 +75,12 @@ def section(title: str) -> None:
 
 # ----------------------------------------------------------------------
 class FakeRow:
+    """库里的一行。sender_name 是"自己的 wxid"，和真 reader 一致。"""
+
     def __init__(self, local_id: int, content: str) -> None:
         self.local_id = local_id
         self.content = content
+        self.sender_name = "me"
         self.is_self = True
 
 
@@ -119,7 +140,7 @@ def test_wiring() -> None:
 
     # 固定模型回复：3 段带标记
     reply = "知道了\n{{split}}\n那明天就去长坂坡玩吧\n{{split}}\n咱们先看樱花，再看枣树"
-    APP.call_model = lambda cfg, system, user: reply  # type: ignore[assignment]
+    APP.call_model = lambda cfg, system, user, **kw: reply  # type: ignore[assignment]
 
     app, sender = make_app()
     app.enqueue(incoming("大肥鱼", local_id=1))
@@ -151,7 +172,7 @@ def test_wiring() -> None:
 def test_say_off() -> None:
     section("关掉分条")
 
-    APP.call_model = lambda cfg, system, user: "一整段话，不分条。"  # type: ignore[assignment]
+    APP.call_model = lambda cfg, system, user, **kw: "一整段话，不分条。"  # type: ignore[assignment]
     app, sender = make_app(say=False)
     app.enqueue(incoming("在吗", local_id=1))
     import time as _t
@@ -164,7 +185,7 @@ def test_say_off() -> None:
 def test_listen_off() -> None:
     section("关掉攒批")
 
-    APP.call_model = lambda cfg, system, user: "收到"  # type: ignore[assignment]
+    APP.call_model = lambda cfg, system, user, **kw: "收到"  # type: ignore[assignment]
     app, sender = make_app(listen=False)
     app.enqueue(incoming("一", local_id=1))
     check("第一条立刻处理", len(sender.calls) == 1, f"{sender.calls}")
@@ -175,26 +196,77 @@ def test_listen_off() -> None:
 def test_skip_rules() -> None:
     section("过滤")
 
-    APP.call_model = lambda cfg, system, user: "收到"  # type: ignore[assignment]
+    APP.call_model = lambda cfg, system, user, **kw: "收到"  # type: ignore[assignment]
+
+    # ⚠ 这里断言的是 `_accept` 本身，不是 `batcher.pending()`。
+    #   以前写成"自己的消息不入批"，但 `listen.feed()` 自己就有一道
+    #   `if msg.is_self: return None` —— 那条断言其实一直在测 listen 层，
+    #   `_accept` 里的归属判断从来没被覆盖到（改坏了也不会红）。
     app, sender = make_app()
-    app.enqueue(incoming("", local_id=1))
-    check("空消息不入批", app.batcher.pending() == {}, f"{app.batcher.pending()}")
+    check("空消息被拦下", app._accept(incoming("", local_id=1)) is None)
 
     app2, sender2 = make_app()
-    app2.cfg.allow_self = False
-    self_msg = incoming("我自己说的", local_id=2)
+    self_msg = incoming("我自己说的", local_id=2, sender="me")
     self_msg.is_self = True
-    app2.enqueue(self_msg)
-    check("自己的消息不入批", app2.batcher.pending() == {}, f"{app2.batcher.pending()}")
+    check("自己发的被拦下（allow_self 默认关）",
+          app2._accept(self_msg) is None)
 
     app3, sender3 = make_app()
-    app3.cfg.quiet_hours = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-                            12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
-    app3.enqueue(incoming("安静时段", local_id=3))
-    check("安静时段不入批", app3.batcher.pending() == {}, f"{app3.batcher.pending()}")
+    app3.cfg.raw = {"scopes": {"global": {
+        "quiet_hours": [str(h) for h in range(24)]}}}
+    check("安静时段被拦下",
+          app3._accept(incoming("安静时段", local_id=3)) is None)
+
+    app4, sender4 = make_app()
+    check("对方的正常消息能过",
+          app4._accept(incoming("你在不在", local_id=4)) is not None)
+
+    # A-1：sender 解析不出的私聊，以前会被当成"对方说的"直接回，
+    # 那正是自环的形状。现在拿不准就不回。
+    app5, sender5 = make_app()
+    unknown = incoming("拿不准是谁发的", local_id=5, sender="")
+    check("sender 为空的私聊被拦下（拿不准就不回）",
+          app5._accept(unknown) is None)
+
+
+def test_ledger_veto() -> None:
+    section("账本否决（D-1）")
+
+    APP.call_model = lambda cfg, system, user, **kw: "收到"  # type: ignore[assignment]
+
+    app, sender = make_app()
+    # 模拟"她 1 秒前发过这句"
+    app.ledger.note_sent("wxid_x", "我今天有点累")
+    TRACES.clear()
+    m = incoming("我今天有点累", local_id=9)
+    check("判据说对方，但账本说刚发过 → 不回", app._accept(m) is None)
+
+    check("否决写了证据链（否则吞了真消息没人查得到）",
+          len(TRACES) == 1, str(TRACES))
+    item = TRACES[0] if TRACES else {}
+    check("留痕里写明是账本干的",
+          item.get("reason") == "ledger_veto", str(item))
+    check("留痕里的结论是自己",
+          item.get("verdict") == "self" and item.get("rule") == "ledger_veto",
+          str(item))
+
+    app2, sender2 = make_app()
+    check("账本没记过的照常放行",
+          app2._accept(incoming("你今天怎么样", local_id=10)) is not None)
+
+    # 发一条，账本要自己记上（send_parts 里 note_sent）
+    app3, sender3 = make_app()
+    app3.hit = 0
+    app3.enqueue(incoming("在吗", local_id=11))
+    for batch in app3.batcher.tick(now=app3.batcher._clock() + 99):
+        app3.handle_batch(batch)
+    check("发出去的话进了账本", len(app3.ledger) >= 1, str(len(app3.ledger)))
+    texts = [e["text"] for e in app3.ledger.snapshot()]
+    check("账本里是刚发的那句", any("收到" in t for t in texts), str(texts))
 
 
 def main() -> int:
+    _install_trace_capture()
     print("=" * 66)
     print("接入自检（enqueue → 攒批 → 分条 → 发送）")
     print("=" * 66)
@@ -203,6 +275,7 @@ def main() -> int:
     test_say_off()
     test_listen_off()
     test_skip_rules()
+    test_ledger_veto()
 
     print("\n" + "=" * 66)
     if FAIL:

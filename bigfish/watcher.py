@@ -32,6 +32,7 @@ if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 
 from bigfish.render import render as render_message  # noqa: E402
+from bigfish import identity                        # noqa: E402
 
 WATERMARK_FILE = os.path.join(app_root(), "state", "watermark.json")
 
@@ -50,6 +51,10 @@ class Incoming:
     sender_name: str = ""
     text: str = ""
     is_self: bool = False
+    #: 归属判定：self / peer / unknown（空 = 未判定，旧数据）
+    identity: str = ""
+    #: 哪条规则得出的（见 bigfish/identity.py）
+    identity_rule: str = ""
     raw_content: str = ""
 
     def preview(self, width: int = 60) -> str:
@@ -248,6 +253,13 @@ class MessageWatcher:
                     sender = ""
                 mtype = str(r.get("type") or "")
                 raw = str(r.get("content") or "")
+                # 归属判定收口到 bigfish/identity.py。
+                #
+                # 以前这里是 `is_self=(sender == self._me) if sender else False` ——
+                # sender 解析不出就当成"对方说的"，而"对方说的"意味着要回复。
+                # 现在改成三态：确定自己 / 确定对方 / 拿不准，交给调用方按场景处理。
+                who = identity.decide(sender, self._me, text=raw, chat_id=uid,
+                                      is_group=str(uid).endswith("@chatroom"))
                 found.append(Incoming(
                     chat_id=uid,
                     chat_name=name,
@@ -258,7 +270,9 @@ class MessageWatcher:
                     sender_id=sid,
                     sender_name=sender or "",
                     text=render_message(raw, mtype),
-                    is_self=(sender == self._me) if sender else False,
+                    is_self=who.is_self,
+                    identity=who.who,
+                    identity_rule=who.rule,
                     raw_content=raw,
                 ))
                 if sseq > self._wm.get(uid, 0):

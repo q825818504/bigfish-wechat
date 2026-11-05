@@ -125,9 +125,25 @@ class BigFish:
 
     # ------------------------------------------------------------------
     def handle(self, msg: Incoming) -> None:
-        # allow_self 只对文件传输助手生效（自测通道，不能当生产开关）
-        if msg.is_self and not (self.allow_self and msg.chat_id == "filehelper"):
-            return                      # 自己发的跳过
+        # 归属判定收口到 bigfish/identity.py（与 app/desktop 同一套）。
+        #
+        # run_uia 没有接 scopes，自测通道仍然只对 filehelper 生效 —— 这是
+        # 它作为原型入口的既有语义，不是漏改。三态仍然生效：
+        # 拿不准的私聊直接放弃；群里没有闸门可比对，也按"没叫她"处理。
+        from bigfish import identity
+
+        is_group = msg.chat_id.endswith("@chatroom")
+        verdict = identity.decide(
+            msg.sender_name, identity.self_id_of(self.reader),
+            text=msg.raw_content or msg.text,
+            chat_id=msg.chat_id, is_group=is_group)
+        decision = identity.admit(
+            verdict, is_group=is_group,
+            allow_self=bool(self.allow_self) and msg.chat_id == "filehelper")
+        if not decision.proceed:
+            self.on_log(f"[跳过] {msg.chat_name}: {decision.detail}"
+                        f"（{decision.reason}）")
+            return
         if not (msg.text or "").strip():
             self.on_log(f"[跳过] {msg.chat_name}: 空内容({msg.msg_type})")
             return
@@ -230,6 +246,16 @@ def main() -> int:
     print(f"  账号       : {reader._db.account}")
     me = reader.self_info()
     print(f"  昵称       : {me.get('nick_name')}")
+
+    # ---- 身份闸 ----
+    # 拿不到自己的 wxid 就不启动：那种状态下所有自环防护都失效（见 A-1）。
+    from bigfish import identity
+    try:
+        identity.require_me(identity.self_id_of(reader), where="run_uia.py")
+    except identity.IdentityUnavailable as exc:
+        print()
+        print(f"  [!] {exc.reason}")
+        return 1
 
     # ---- 监听会话 ----
     watcher = MessageWatcher(reader._db, interval=args.interval)

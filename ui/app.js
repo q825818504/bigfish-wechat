@@ -314,6 +314,8 @@ function renderChats() {
         <div class="chat-name">${esc(c.name)}</div>
         <div class="chat-sub">${unread || '—'}</div>
       </div>
+      <button class="chat-gear" data-gear="${esc(c.username)}"
+              title="这个会话的单独设置" aria-label="这个会话的单独设置">⚙</button>
       <span class="chat-toggle"></span>
     </div>`;
   }).join('');
@@ -328,8 +330,243 @@ function renderChats() {
       updateWatchBar();
     });
   });
+
+  /* ⚙ 单独绑定：它长在行里面，但点它**不能**顺手切换监听开关。
+   *
+   * 没有 stopPropagation 的话，点齿轮 = 把会话勾上/取消，用户还没
+   * 看到弹层就先改了一个他没打算改的东西。
+   */
+  $$('#chatList [data-gear]').forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const uid = btn.dataset.gear;
+      const chat = S.chats.find((c) => c.username === uid) || {};
+      openScope(uid, chat.name || uid);
+    });
+  });
   updateWatchBar();
 }
+
+/* ────────── 会话级配置（C-1 三层作用域） ──────────
+ *
+ * 每个会话可以单独覆盖五个行为开关：
+ *   allow_self / group_reply / group_allow_all / max_reply_chars / quiet_hours
+ *
+ * 界面上每一项都标「本会话」还是「继承自全局」——
+ * 不标的话，用户改完全局、发现这个会话没变（因为这里覆盖过），
+ * 就会以为"改了没生效"。反过来也一样。
+ */
+
+/* `orig` 是打开时（或上次保存后）的快照，用来判断"有没有未保存的修改"。
+ * 没有它的话，用户点完「继承」看不出这一项还没落盘。 */
+const SCOPE = { chatId: '', name: '', fields: [], draft: {}, orig: {}, problems: [] };
+
+const clone = (v) => JSON.parse(JSON.stringify(v));
+
+async function openScope(chatId, name) {
+  if (!S.bridge) return toast('还没连上后端');
+  SCOPE.chatId = chatId;
+  SCOPE.name = name;
+  setText('#scopeTitle', '会话配置 · ' + name);
+  setText('#scopeSub', '只对这个会话生效；没设的跟随上一层。');
+  setText('#scopeHint', '读取中…');
+  $('#scopeHint').className = 'hint-line';
+  $('#scopeBody').innerHTML = '';
+  $('#scopeMask').hidden = false;
+  try {
+    const d = JSON.parse(await S.bridge.get_chat_scope(chatId));
+    if (!d.ok) {
+      setText('#scopeHint', d.error || '读取失败');
+      $('#scopeHint').className = 'hint-line is-warn';
+      return;
+    }
+    SCOPE.fields = d.fields || [];
+    SCOPE.problems = d.problems || [];
+    SCOPE.draft = {};
+    for (const f of SCOPE.fields) {
+      SCOPE.draft[f.key] = f.overridden ? f.value : null;
+    }
+    SCOPE.orig = clone(SCOPE.draft);
+    renderScope();
+  } catch (e) {
+    setText('#scopeHint', '读取失败：' + e);
+    $('#scopeHint').className = 'hint-line is-warn';
+  }
+}
+
+function closeScope() {
+  $('#scopeMask').hidden = true;
+  SCOPE.chatId = '';
+}
+
+/* 一项的"现在是谁在生效"。
+ *
+ * 草稿是 null（跟随）时，说**它会从哪来** —— 注意不是"当前生效层"：
+ * 一个本来覆盖过的字段，用户点了「继承」，此时该说的是"将继承自全局"，
+ * 而不是它还带着的"本会话"。
+ */
+function scopeSourceLabel(f) {
+  if (SCOPE.draft[f.key] === null) return f.inherit_label || f.layer_label;
+  return '本会话';
+}
+
+function scopeBoolRow(f) {
+  const v = SCOPE.draft[f.key];
+  const pick = (val, text) => {
+    const on = (val === 'inherit' && v === null)
+      || (val === 'true' && v === true)
+      || (val === 'false' && v === false);
+    return `<button class="seg${on ? ' is-on' : ''}"
+      data-scope="${esc(f.key)}" data-val="${val}">${text}</button>`;
+  };
+  return `<div class="scope-row">
+    <div class="scope-label">
+      <span>${esc(f.label)}</span>
+      <span class="scope-src">${esc(scopeSourceLabel(f))}</span>
+    </div>
+    <div class="scope-ctl seg-group">
+      ${pick('inherit', '继承')}${pick('true', '开')}${pick('false', '关')}
+    </div>
+  </div>`;
+}
+
+/* 值字段（数字 / 列表）。
+ *
+ * ⚠ 输入框**永远可编辑**。曾经的做法是"继承时禁用"，配上一个只能
+ *   切回继承的按钮 —— 结果是一个继承中的字段永远改不成自己设的值，
+ *   整条路是死的。现在改成：直接改就是覆盖，「继承」按钮负责撤销覆盖。
+ */
+function scopeValueRow(f) {
+  const v = SCOPE.draft[f.key];
+  const inherit = v === null;
+  const raw = inherit ? (f.inherit_value ?? f.value) : v;
+  const shown = Array.isArray(raw) ? raw.join(', ') : (raw ?? '');
+  const type = f.kind === 'int' ? 'number' : 'text';
+  // 占位符跟着字段走（后端 FIELDS 里声明），前端不再按类型瞎猜
+  const ph = f.placeholder || (f.kind === 'int' ? '例如 300' : '');
+  return `<div class="scope-row">
+    <div class="scope-label">
+      <span>${esc(f.label)}</span>
+      <span class="scope-src">${esc(scopeSourceLabel(f))}</span>
+    </div>
+    <div class="scope-ctl value-ctl">
+      <input class="input scope-input" data-scope-input="${esc(f.key)}"
+             type="${type}" value="${esc(shown)}"
+             placeholder="${esc(ph)}">
+      <button class="seg${inherit ? '' : ' is-on'}"
+              data-scope="${esc(f.key)}" data-val="inherit"
+              ${inherit ? 'disabled title="当前就跟随上一层"' : 'title="恢复跟随上一层"'}>继承</button>
+    </div>
+  </div>`;
+}
+
+function renderScope() {
+  const body = $('#scopeBody');
+  body.innerHTML = SCOPE.fields.map((f) => (
+    f.kind === 'bool' ? scopeBoolRow(f) : scopeValueRow(f)
+  )).join('');
+
+  // 布尔三态 + 值字段的「继承」按钮
+  //
+  // ⚠ 不管当前是不是 disabled 都要绑上。曾经在这里写了
+  //   `if (b.disabled) return;`，而「继承中」的撤销按钮天生是 disabled，
+  //   于是它的监听器从来没绑过 —— 用户改了值再想撤销，点不动。
+  $$('#scopeBody [data-scope]').forEach((b) => {
+    b.addEventListener('click', () => {
+      if (b.disabled) return;      // 真点了也算：disabled 时浏览器本来就不派发
+      const key = b.dataset.scope;
+      const val = b.dataset.val;
+      const f = SCOPE.fields.find((x) => x.key === key);
+      if (!f) return;
+      if (val === 'inherit') {
+        SCOPE.draft[key] = null;
+      } else if (f.kind === 'bool') {
+        SCOPE.draft[key] = (val === 'true');
+      } else {
+        // 从"继承"切到"自己设"：先用继承来的值打底，别给一个空框
+        const base = f.inherit_value ?? f.value;
+        SCOPE.draft[key] = Array.isArray(base) ? [...base] : base;
+      }
+      renderScope();
+    });
+  });
+
+  // 值输入：改就是覆盖，不用先点按钮
+  $$('#scopeBody [data-scope-input]').forEach((inp) => {
+    inp.addEventListener('input', () => {
+      const key = inp.dataset.scopeInput;
+      const f = SCOPE.fields.find((x) => x.key === key);
+      if (!f) return;
+      if (f.kind === 'int') {
+        const n = parseInt(inp.value, 10);
+        SCOPE.draft[key] = Number.isFinite(n) && n >= 0 ? n : null;
+      } else {
+        SCOPE.draft[key] = inp.value.split(',')
+          .map((s) => s.trim()).filter(Boolean);
+      }
+      // 只更新来源标签与「继承」按钮，不重绘整块（重绘会把光标弄丢）
+      const rowEl = inp.closest('.scope-row');
+      const src = rowEl?.querySelector('.scope-src');
+      if (src) src.textContent = scopeSourceLabel(f);
+      const back = rowEl?.querySelector('[data-val="inherit"]');
+      if (back) {
+        const nowInherit = SCOPE.draft[key] === null;
+        back.classList.toggle('is-on', !nowInherit);
+        back.disabled = nowInherit;
+      }
+    });
+  });
+
+  updateScopeDirty();
+  if (SCOPE.problems.length) {
+    $('#scopeHint').className = 'hint-line is-warn';
+    setText('#scopeHint', SCOPE.problems.map((p) => p[1]).join('；'));
+  }
+}
+
+function scopeDirty() {
+  return JSON.stringify(SCOPE.draft) !== JSON.stringify(SCOPE.orig);
+}
+
+function updateScopeDirty() {
+  const hint = $('#scopeHint');
+  const btn = $('#scopeSave');
+  if (!hint || !btn) return;
+  const dirty = scopeDirty();
+  btn.disabled = !dirty;
+  btn.textContent = dirty ? '保存' : '已保存';
+  if (SCOPE.problems.length) return;   // 诊断信息优先占位
+  hint.className = 'hint-line' + (dirty ? ' is-warn' : '');
+  setText(hint, dirty ? '有未保存的修改' : '');
+}
+
+async function saveScope() {
+  if (!S.bridge || !SCOPE.chatId) return;
+  const btn = $('#scopeSave');
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const d = JSON.parse(await S.bridge.save_chat_scope(
+      SCOPE.chatId, JSON.stringify(SCOPE.draft)));
+    if (!d.ok) {
+      toast(d.error || '保存失败');
+      return;
+    }
+    SCOPE.fields = d.fields || [];
+    SCOPE.draft = {};
+    for (const f of SCOPE.fields) {
+      SCOPE.draft[f.key] = f.overridden ? f.value : null;
+    }
+    SCOPE.orig = clone(SCOPE.draft);
+    renderScope();
+    // 下一条消息就按新值走 —— 不用重启，也不用重开弹层
+    toast('已保存 · 下一条消息就生效');
+  } catch (e) {
+    toast('保存失败：' + e);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '保存'; }
+  }
+}
+
 
 /* 底部：已选多少个 + 保存按钮。
  *
@@ -500,6 +737,27 @@ document.addEventListener('click', (e) => {
 
 $('#cfgGroupReply').addEventListener('change', saveQuick);
 $('#cfgGroupAllowAll').addEventListener('change', saveQuick);
+
+/* 会话配置弹层。
+ *
+ * 点遮罩和按 Esc 都关；「全部恢复继承」只改草稿，仍然要点保存才落盘 ——
+ * 和这个项目其它地方一致（D-35：保存必须显式，系统不替你写文件）。
+ */
+if ($('#scopeClose')) {
+  $('#scopeClose').addEventListener('click', closeScope);
+  $('#scopeSave').addEventListener('click', saveScope);
+  $('#scopeInheritAll').addEventListener('click', () => {
+    for (const f of SCOPE.fields) SCOPE.draft[f.key] = null;
+    renderScope();
+    toast('已全部改为跟随上一层 · 点保存生效');
+  });
+  $('#scopeMask').addEventListener('click', (e) => {
+    if (e.target.id === 'scopeMask') closeScope();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !$('#scopeMask').hidden) closeScope();
+  });
+}
 
 async function saveQuick() {
   if (!S.bridge) return;

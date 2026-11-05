@@ -425,6 +425,50 @@ def test_send() -> None:
 # 主入口
 # ══════════════════════════════════════════════════════════════════════
 
+def test_unknown_envelope() -> None:
+    """B-1：结果未知时的行为 —— 停住、不撤账。"""
+    section("发送信封（未知）")
+
+    from bigfish.ledger import Ledger
+    from bigfish.wechat_sender import SendResult
+
+    class UnknownSender(FakeSender):
+        def send(self, chat, text):
+            self.calls.append((self.clock.now, text))
+            # 回车可能已经按下去了
+            return SendResult(ok=False, who=chat, text=text, attempted=True,
+                              detail="回车可能已经投递")
+
+    clock = FakeClock()
+    reader = FakeReader(clock, latency=0.4)
+    sender = UnknownSender(reader, clock)
+    led = Ledger(clock=clock)
+    out = _run(["第一句", "第二句"], [0.5, 0.0], sender, reader, clock, ledger=led)
+
+    check("状态是 unknown", out.state == S.sending.STATE_UNKNOWN, out.state)
+    check("未知不算 ok", out.ok is False)
+    check("后面的分条没发", len(sender.calls) == 1, str(len(sender.calls)))
+    check("账本保留了那一笔（读回来要认得出）",
+          led.lookup("chat", "第一句") is not None,
+          str([e["text"] for e in led.snapshot()]))
+
+    class FailedSender(FakeSender):
+        def send(self, chat, text):
+            self.calls.append((self.clock.now, text))
+            return SendResult(ok=False, who=chat, text=text, attempted=False,
+                              detail="内容没落进输入框")
+
+    clock2 = FakeClock()
+    reader2 = FakeReader(clock2, latency=0.4)
+    sender2 = FailedSender(reader2, clock2)
+    led2 = Ledger(clock=clock2)
+    out2 = _run(["第一句"], [0.0], sender2, reader2, clock2, ledger=led2)
+
+    check("确定失败的状态", out2.state == S.sending.STATE_FAILED, out2.state)
+    check("确定失败要撤账", led2.lookup("chat", "第一句") is None,
+          str([e["text"] for e in led2.snapshot()]))
+
+
 def main() -> int:
     print("=" * 66)
     print("说法层自检（分条 / 节奏 / 发送确认）")
@@ -434,6 +478,7 @@ def main() -> int:
     test_quote_and_llm()
     test_pace()
     test_send()
+    test_unknown_envelope()
 
     print("\n" + "=" * 66)
     if FAIL:

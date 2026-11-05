@@ -46,6 +46,8 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
+
+from bigfish import sending
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
 # ══════════════════════════════════════════════════════════════════════
@@ -411,6 +413,13 @@ class SendOutcome:
     unconfirmed: List[int] = field(default_factory=list)
     #: 最后一条异步确认的待办：(发送文本, 发送前 local_id 基线)
     pending: Optional[Tuple[str, int]] = None
+    #: 三态：sent / failed / unknown（见 bigfish/sending.py）。
+    #: 「unknown」= 回车可能已经按下去了，所以不重试、不撤账。
+    state: str = ""
+
+    @property
+    def unknown(self) -> bool:
+        return self.state == sending.STATE_UNKNOWN
 
     @property
     def complete(self) -> bool:
@@ -465,6 +474,7 @@ def send_parts(
     poll_interval: float = 0.25,
     strict_confirm: bool = False,
     final_async_confirm: bool = False,
+    ledger: Any = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     log: Optional[Callable[[str], None]] = None,
@@ -475,6 +485,8 @@ def send_parts(
     参数全部注入，便于单测：
       send(chat, text) -> 有 .ok 属性的对象，或 bool
       read_recent(chat, limit) -> 最近消息（需 .is_self / .local_id / .content）
+      ledger -> 共同账本（D-1）。给了就在发送前后记账/撤账/回填，
+                让"我到底发过什么"和拦截看同一份记录。
       clock / sleep -> 假时钟可让测试瞬间跑完
     """
     say = log or (lambda _m: None)
@@ -493,14 +505,31 @@ def send_parts(
         base_msgs = list(read_recent(chat, 1))
         base_id = max((int(_msg_field(m, "local_id", 0) or 0) for m in base_msgs), default=0)
 
-        result = send(chat, part)
-        ok = bool(_msg_field(result, "ok", result))
-        if not ok:
-            detail = str(_msg_field(result, "detail", "") or "")
-            say(f"say: part-{index + 1} L1-failed {detail}".strip())
+        # 记账必须在 send 之前（11-04 的教训：记账晚于写库就漏窗口）
+        receipt = ledger.note_sent(chat, part) if ledger is not None else None
+
+        try:
+            result = send(chat, part)
+            verdict = sending.classify(result=result)
+        except Exception as exc:                      # noqa: BLE001
+            # SendError 也是从这里进来的：它带 kind 和 attempted，
+            # 由 sending 判定是"确定没发"还是"不知道"。
+            result = None
+            verdict = sending.classify(error=exc)
+
+        if not verdict.sent:
+            if verdict.failed and ledger is not None and receipt is not None:
+                # 确定没发出去才撤账。未知要留着 —— 它可能已经发出去了，
+                # 读回来得认得出来（否则自环从这里开始）。
+                ledger.rollback(receipt)
+            if verdict.unknown:
+                say(f"say: part-{index + 1} UNKNOWN（{verdict.detail}）"
+                    f" —— 可能已发出，不重试、不续发")
+            else:
+                say(f"say: part-{index + 1} L1-failed {verdict.detail}".strip())
             return SendOutcome(False, "failed", sent, len(parts),
-                               detail or "send returned ok=False", last_confirmed,
-                               mismatches, unconfirmed)
+                               verdict.detail or verdict.code, last_confirmed,
+                               mismatches, unconfirmed, state=verdict.state)
 
         is_last = index == len(parts) - 1
         if is_last and final_async_confirm:
@@ -555,6 +584,9 @@ def send_parts(
             say(f"say: part-{index + 1} content-mismatch（库中={stored[:24]!r}）")
         last_confirmed = stored
         sent += 1
+        if ledger is not None and receipt is not None:
+            # 回填库里那一行的 id：以后"这一行是我发的"就不必再比文本
+            ledger.confirm(receipt, int(_msg_field(confirmed, "local_id", 0) or 0))
         if on_confirmed is not None:
             on_confirmed(index, confirmed)
 

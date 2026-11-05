@@ -23,6 +23,7 @@ if _VENDOR not in sys.path:
     sys.path.insert(0, _VENDOR)
 
 from bigfish.render import render as render_message  # noqa: E402
+from bigfish import identity                        # noqa: E402
 
 
 @dataclass
@@ -38,6 +39,10 @@ class ChatMessage:
     content: str
     shard: str = ""
     is_self: bool = False
+    #: 归属判定：self / peer / unknown（空 = 未判定）
+    identity: str = ""
+    #: 哪条规则得出的
+    identity_rule: str = ""
 
     def preview(self, width: int = 60) -> str:
         c = (self.content or "").replace("\n", " ")
@@ -481,6 +486,9 @@ class WeChatReader:
             mtype = str(m.get("type") or "")
             raw = str(m.get("content") or "")
             content = render_message(raw, mtype) if readable else raw
+            # 与 watcher 同一套判据：sender 解析不出时不再当成"对方说的"
+            who = identity.decide(sender, me, text=raw, chat_id=uid,
+                                  is_group=str(uid).endswith("@chatroom"))
             out.append(ChatMessage(
                 chat_id=uid,
                 local_id=int(m.get("local_id") or 0),
@@ -490,7 +498,9 @@ class WeChatReader:
                 sender_name=sender or "",
                 content=content,
                 shard=shard,
-                is_self=(sender == me) if sender else False,
+                is_self=who.is_self,
+                identity=who.who,
+                identity_rule=who.rule,
             ))
         return out
 

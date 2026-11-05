@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+from bigfish import scopes as SCOPES
+
 for _s in (sys.stdout, sys.stderr):
     if _s is not None:
         try:
@@ -52,6 +54,7 @@ from bigfish.watcher import Incoming, MessageWatcher            # noqa: E402
 from bigfish.wechat import WeChatReader                         # noqa: E402
 from bigfish.wechat_sender import (SendError, UiaSender,        # noqa: E402
                                    desktop_available, is_admin)
+from bigfish import identity                                    # noqa: E402
 
 HR = "=" * 70
 #: 配置在「用户看得见」的那层，不在程序资源里（paths.py 的规范）。
@@ -70,15 +73,21 @@ SPLIT_MARK = "{{split}}"
 # ----------------------------------------------------------------------
 @dataclass
 class AppConfig:
-    """运行时配置（config.json 的 auto_reply 段）。"""
+    """运行时配置（config.json 的 auto_reply 段）。
+
+    ⚠ 行为类的五个字段（allow_self / group_reply / group_allow_all /
+      max_reply_chars / quiet_hours）**不再是这个类上的属性**。
+      它们住在 `scopes` 的三层继承里，只能用 `cfg.scope(名字, chat_id)` 取。
+
+      为什么删掉而不是留一个"全局镜像"：镜像会漂移。
+      谁哪天顺手读一次 `cfg.quiet_hours`，读到的是加载那一刻的值，
+      和真正生效的值可能早就不是一回事 —— 这正是 D-61 的形状
+      （两处都能跑通、都不报错，只有用户发现"我改的东西没生效"）。
+      删掉之后，读错就是 AttributeError，当场看得见。
+    """
 
     chats: list[str] = field(default_factory=list)
-    allow_self: bool = False
     interval: float = 1.2
-    max_reply_chars: int = 300
-    quiet_hours: list[int] = field(default_factory=list)  # 如 [0,1,2,3,4,5,6]
-    group_reply: bool = True       # 群聊是否响应
-    group_allow_all: list[str] = field(default_factory=list)  # 无条件回的群
 
     # ── 说法层（config.json 顶层的 say 段）──
     say_enabled: bool = True
@@ -97,6 +106,33 @@ class AppConfig:
     listen_max_wait: float = 8.0
     listen_max_batch: int = 8
 
+    # ── 作用域（C-1：全局 / 账号 / 会话 三层继承）──
+    #
+    # 上面那些扁平字段是**全局视角**，只能表达"所有会话一样"。
+    # 11-04 自环事故就是它们撑不住：allow_self 只能全局开，
+    # 于是任何一个人的私聊需要它，等于所有人的私聊都开着它。
+    #
+    # 有会话上下文的调用点请用 `cfg.scope("allow_self", chat_id)`，
+    # 它按 chat → account → global → 默认 逐层回退。
+    raw: dict = field(default_factory=dict, repr=False)
+    bot_id: str = ""
+    #: 昵称 → id 的解析器（wechat.WeChatReader.resolve）。微信没开时为 None
+    resolver: Optional[object] = None
+    #: 命令行 `--allow-self` 的强制开关：显式覆盖，只用于自测
+    force_allow_self: bool = field(default=False, repr=False)
+
+    def scope(self, key: str, chat_id: Optional[str] = None, default: object = None):
+        """按三层作用域取一个字段的最终值。
+
+        `chat_id` 为空时只看得到 global（含旧路径），拿不到会话覆盖 ——
+        所以带会话语义的调用点必须把 chat_id 传进来。
+        """
+        if key == "allow_self" and self.force_allow_self:
+            return True          # 命令行显式开，压过配置
+        return SCOPES.get(self.raw, key, bot_id=self.bot_id or None,
+                          chat_id=chat_id, resolver=self.resolver,
+                          default=default)
+
     @classmethod
     def load(cls, path: str = CONFIG_PATH) -> "AppConfig":
         cfg = cls()
@@ -105,16 +141,10 @@ class AppConfig:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 d = data.get("auto_reply") or {}
+                cfg.raw = data
+                cfg.bot_id = str(d.get("account") or "")
                 cfg.chats = list(d.get("chats") or [])
-                cfg.allow_self = bool(d.get("allow_self", False))
                 cfg.interval = float(d.get("interval", cfg.interval))
-                cfg.max_reply_chars = int(
-                    d.get("max_reply_chars", cfg.max_reply_chars))
-                cfg.quiet_hours = [int(h) for h in
-                                   (d.get("quiet_hours") or [])]
-                cfg.group_reply = bool(d.get("group_reply", True))
-                cfg.group_allow_all = [str(x) for x in
-                                       (d.get("group_allow_all") or [])]
 
                 say = data.get("say") or {}
                 cfg.say_enabled = bool(say.get("enabled", True))
@@ -154,6 +184,47 @@ class Conversation:
 
 
 # ----------------------------------------------------------------------
+# 免打扰时段
+# ----------------------------------------------------------------------
+def _hour_of(text: object) -> Optional[int]:
+    """把 "23" / "23:00" 读成小时数。读不出返回 None。"""
+    head = str(text or "").strip().split(":")[0].strip()
+    if not head.isdigit():
+        return None
+    n = int(head)
+    return n if 0 <= n <= 23 else None
+
+
+def _quiet_now(values, tm) -> bool:
+    """当前时刻是否落在这些时段里。
+
+    两种写法都认（`scopes` 把值统一成字符串，因为 JSON 里可能混着数字）：
+
+        "23"             某个整点
+        "23:00-07:00"    区间，两端都含；start > end 表示跨夜
+    """
+    for raw in values or ():
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        if "-" in item:
+            left, _, right = item.partition("-")
+            start, end = _hour_of(left), _hour_of(right)
+            if start is None or end is None:
+                continue
+            if start <= end:
+                if start <= tm.tm_hour < end:
+                    return True
+            elif tm.tm_hour >= start or tm.tm_hour < end:
+                return True
+        else:
+            hour = _hour_of(item)
+            if hour is not None and hour == tm.tm_hour:
+                return True
+    return False
+
+
+# ----------------------------------------------------------------------
 # 主逻辑
 # ----------------------------------------------------------------------
 class BigFishApp:
@@ -165,7 +236,20 @@ class BigFishApp:
         self.model_cfg = model_cfg
         self.cfg = cfg
         self.dry = dry
+
+        # 作用域解析器：配置里的昵称键要靠它换成 id 才能匹配上。
+        # 微信没开时 resolve 返回 None，那一条配置就是"未命中"，
+        # 不会抛异常、也不会误命中别的会话。
+        try:
+            # 套一层缓存：一条消息会问 4~5 个字段，不缓存就要查好几遍微信库
+            cfg.resolver = SCOPES.memo_resolver(reader.resolve)
+            cfg.bot_id = str(getattr(reader, "wxid", "") or "") or cfg.bot_id
+        except Exception:
+            cfg.resolver = None
         self.convs: dict[str, Conversation] = {}
+        # 共同账本（D-1）：拦截与发送确认共用这一份
+        from bigfish.ledger import Ledger
+        self.ledger = Ledger()
         self.stats = {"recv": 0, "reply": 0, "fail": 0, "skip": 0}
         self._gate = None       # 群聊触发器，首次用到时构造
 
@@ -275,14 +359,26 @@ class BigFishApp:
         最后一条不该让整批陪它等 3 秒；确认不到也不影响已经发出去的前几条。
         """
         _text, base_id = pending
+        me_id = identity.self_id_of(self.reader)
 
         def worker() -> None:
             for _ in range(12):          # 0.25s × 12 = 3s
                 time.sleep(0.25)
                 try:
                     for m in self.reader.messages(chat, 6):
+                        # 这里问的是"我刚发的那句入库了没有"，所以要的是
+                        # **确定是自己**，不是"is_self 为真"。拿不准的时候
+                        # 宁可认为没入库（这一轮不进历史），也不能把别人的
+                        # 一句话当成自己说的写进对话。
+                        #
+                        # identity 为空 = 这个对象没走过判定（旧对象、替身）。
+                        # 那种情况按它自己的字段重算一次，而不是退回 is_self ——
+                        # 退回旧字段就等于把这次改动白做了。
+                        _who = getattr(m, "identity", "")
+                        if not _who:
+                            _who = identity.for_message(m, me_id).who
                         if (int(getattr(m, "local_id", 0)) > base_id
-                                and getattr(m, "is_self", False)):
+                                and _who == identity.WHO_SELF):
                             conv.add(self.soul.address or "我", m.content)
                             return
                 except Exception:
@@ -300,8 +396,15 @@ class BigFishApp:
         return self.convs[key]
 
     # ------------------------------------------------------------------
-    def in_quiet_hours(self) -> bool:
-        return time.localtime().tm_hour in self.cfg.quiet_hours
+    def in_quiet_hours(self, chat_id: str = "") -> bool:
+        """现在是不是**这个会话**的免打扰时段。
+
+        11-04 之前它读 `self.cfg.quiet_hours`（全局），于是给一个会话设的
+        安静时段会静音所有会话。现在按 scopes 三层取，`chat_id` 传谁的
+        就算谁的。
+        """
+        return _quiet_now(self.cfg.scope("quiet_hours", chat_id),
+                          time.localtime())
 
     def build_prompt(self, conv: Conversation, msg: Incoming,
                      body: str = "") -> tuple[str, str]:
@@ -385,39 +488,112 @@ class BigFishApp:
         return ("\n".join(sys_parts).strip(), "\n\n".join(user_parts))
 
     # ------------------------------------------------------------------
+    def _trace_identity(self, msg, verdict, is_group, me, decision=None,
+                        *, force=False):
+        """把"拿不准"的判定写进证据链。
+
+        旁路：写失败静默，绝不影响聊天。确定的判定不写（见 identity_trace）。
+        """
+        try:
+            from bigfish import identity_trace
+
+            identity_trace.record(
+                verdict,
+                # 不能用 `decision or ...`：Decision.__bool__ 返回 proceed，
+                # 而否决的 decision 恰好是 proceed=False，会被当成「没给」，
+                # 于是留痕里写成 self，看不出是谁按住的。
+                decision if decision is not None
+                else identity.admit(verdict, is_group=is_group),
+                chat_id=msg.chat_id, is_group=is_group,
+                sender=msg.sender_name, me=me,
+                text=msg.raw_content or msg.text, force=force)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     def _accept(self, msg: Incoming) -> Optional[BatchMessage]:
         """过滤 + 群聊判定。通过则返回可入批的消息，否则 None。"""
-        # allow_self 只对文件传输助手生效。
-        # 它是自测通道，不是生产开关 —— 线上误开会被自己的每一条消息喂饱。
-        if msg.is_self and not (self.cfg.allow_self
-                                and msg.chat_id == "filehelper"):
+        # ── 归属判定（A-1）──
+        #
+        # 11-04 之前这里是 `msg.is_self and not cfg.allow_self`：一个 bool，
+        # 而 bool 表达不了"我其实不知道"。现在三态，私聊保守、群聊宽松：
+        #   · 确定自己   → 只有自测通道才继续
+        #   · 确定对方   → 继续
+        #   · 拿不准     → 私聊直接放弃；群聊等到 gate 判定"叫没叫她"
+        is_group = msg.chat_id.endswith("@chatroom")
+        me = identity.self_id_of(self.reader)
+        verdict = identity.decide(
+            msg.sender_name, me,
+            text=msg.raw_content or msg.text,
+            chat_id=msg.chat_id, is_group=is_group)
+        allow_self = bool(self.cfg.scope("allow_self", msg.chat_id))
+
+        # 账本能否决判据（D-1）。只在判据说"对方"时用 ——
+        # 这是 11-04 那晚唯一缺的一环：判据错了，还有东西能按住。
+        if verdict.who == identity.WHO_PEER:
+            hit = self.ledger.lookup(msg.chat_id, msg.raw_content or msg.text)
+            if hit is not None:
+                ago = max(0.0, time.time() - hit.at)
+                self.log(f"[否决] {msg.chat_name}: 判据说对方说的，"
+                         f"但账本里 {ago:.0f} 秒前发过同一句，按自己发的处理")
+                vetoed = identity.Verdict(
+                    identity.WHO_SELF, "ledger_veto",
+                    verdict.evidence + (("ledger", hit.text[:24]),),
+                    f"账本里 {ago:.0f} 秒前发过这句")
+                # 留痕里的放行结论也要写清楚是"账本否决"，
+                # 不然回看只听得到"self"，看不出是谁把它按住的。
+                self._trace_identity(
+                    msg, vetoed, is_group, me, force=True,
+                    decision=identity.Decision(
+                        False, "ledger_veto",
+                        f"账本里 {ago:.0f} 秒前发过同一句"))
+                self.stats["skip"] += 1
+                return None
+
+        if verdict.who != identity.WHO_UNKNOWN:
+            decision = identity.admit(verdict, is_group=is_group,
+                                      allow_self=allow_self)
+            if not decision.proceed:
+                self.stats["skip"] += 1
+                self.log(f"[跳过] {msg.chat_name}: {decision.detail}"
+                         f"（{decision.reason}）")
+                return None
+        elif not is_group:
+            # 私聊拿不准 → 彻底静默（问过：不要提示、不要回一句）
             self.stats["skip"] += 1
+            self.log(f"[跳过] {msg.chat_name}: 拿不准是谁发的"
+                     f"（{verdict.rule}），不回")
+            self._trace_identity(msg, verdict, is_group, me)
             return None
+
         if not (msg.text or "").strip():
             self.stats["skip"] += 1
             self.log(f"[跳过] {msg.chat_name}: 空内容({msg.msg_type})")
             return None
-        if self.in_quiet_hours():
+        if self.in_quiet_hours(msg.chat_id):
             self.stats["skip"] += 1
             self.log(f"[安静时段] 跳过 {msg.chat_name}: {msg.preview(30)}")
             return None
 
-        is_group = msg.chat_id.endswith("@chatroom")
         body = msg.text
         at_bot = False
         if is_group:
             from bigfish.group_gate import GroupGate
 
+            # 两个群聊字段也按会话取。以前 `enable` 只在构造时设置一次，
+            # 改了配置不重开程序就不生效 —— 顺手修掉。
+            gate_enable = bool(self.cfg.scope("group_reply", msg.chat_id))
+            allow_list = self.cfg.scope("group_allow_all", msg.chat_id) or ()
+            gate_allow_all = (msg.chat_name in allow_list
+                              or msg.chat_id in allow_list)
+
             if self._gate is None:
                 self._gate = GroupGate(
                     self.reader._db, self.reader._db.wxid,
-                    enable=self.cfg.group_reply,
-                    allow_all=msg.chat_name in self.cfg.group_allow_all
-                    or msg.chat_id in self.cfg.group_allow_all)
+                    enable=gate_enable, allow_all=gate_allow_all)
             else:
-                self._gate.allow_all = (
-                    msg.chat_name in self.cfg.group_allow_all
-                    or msg.chat_id in self.cfg.group_allow_all)
+                self._gate.enable = gate_enable
+                self._gate.allow_all = gate_allow_all
 
             t = self._gate.check(msg.chat_id, msg.text, True)
             if not t.respond:
@@ -425,6 +601,23 @@ class BigFishApp:
                 self.log(f"[不接] {msg.chat_name} / {msg.sender_name}: "
                          f"{msg.preview(40)}（{t.reason}）")
                 return None
+
+            # 群聊里"拿不准"要放行，但必须真的叫了她（@ 或叫名字）。
+            # 免检群（group-allow-all）不算 —— 那是"这个群不用 @ 也回"，
+            # 不是"有人冲她说话"。
+            if verdict.who == identity.WHO_UNKNOWN:
+                decision = identity.admit(verdict, is_group=True,
+                                          woken=identity.woken_from_reason(t.reason))
+                if not decision.proceed:
+                    self.stats["skip"] += 1
+                    self.log(f"[跳过] {msg.chat_name}: 拿不准是谁发的，"
+                             f"也没叫她（{t.reason}）")
+                    self._trace_identity(msg, verdict, is_group, me)
+                    return None
+                self.log(f"[拿不准] {msg.chat_name}: 但她被叫到了"
+                         f"，按对方处理（{verdict.rule}）")
+                self._trace_identity(msg, verdict, is_group, me)
+
             body = t.clean_text
             at_bot = t.reason.startswith(("at-marker", "at-name", "called:"))
             self.log(f"[触发] {msg.chat_name} / {msg.sender_name}: {t.reason}")
@@ -493,8 +686,10 @@ class BigFishApp:
             self.stats["fail"] += 1
             self.log("[!] 模型返回空")
             return
-        if len(reply) > self.cfg.max_reply_chars:
-            reply = reply[: self.cfg.max_reply_chars] + "…"
+        # 上限也按会话取：群聊和私聊的长度习惯本来就不一样
+        max_chars = int(self.cfg.scope("max_reply_chars", batch.chat_id) or 0)
+        if max_chars > 0 and len(reply) > max_chars:
+            reply = reply[:max_chars] + "…"
 
         self.log(f"[想] {dt:.1f}s  in={len(system) + len(user)}字 out={len(reply)}字")
 
@@ -531,6 +726,7 @@ class BigFishApp:
             log=self.log,
             strict_confirm=self.cfg.strict_confirm,
             final_async_confirm=self._say_async_confirm,
+            ledger=self.ledger,
             on_confirmed=lambda _i, m: conv.add(self.soul.address or "我", m.content),
         )
         if outcome.pending is not None:
@@ -544,6 +740,13 @@ class BigFishApp:
                 extra.append(f"mismatch={outcome.mismatches}")
             self.log(f"[发] ✓ → {last.chat_name}：{len(parts)} 条 / {outcome.level}"
                      + (" / " + " ".join(extra) if extra else ""))
+        elif outcome.unknown:
+            # 未知不是失败：消息可能已经发出去了。
+            # 所以既不重发，也不把账本里的那一笔撤掉（见 bigfish/sending.py）。
+            self.stats["fail"] += 1
+            self.log(f"[发] ? {last.chat_name}：{outcome.detail}")
+            self.log("       消息结果未知 —— 可能已经发出去了，所以不会重发。"
+                     "如果对方说没收到，是这一条。")
         else:
             self.stats["fail"] += 1
             self.log(f"[发] ✗ {last.chat_name}：{outcome.level} {outcome.detail}")
@@ -583,7 +786,9 @@ def main() -> int:
     if args.who:
         cfg.chats = args.who
     if args.allow_self:
-        cfg.allow_self = True
+        # 命令行显式开自测通道。走 force 而不是改配置值 ——
+        # 不然它会和 scopes 的会话级判断打架，看不出到底谁在生效。
+        cfg.force_allow_self = True
     if args.interval > 0:
         cfg.interval = args.interval
 
@@ -626,6 +831,18 @@ def main() -> int:
         return 1
     me = reader.self_info()
     print(f"  账号       : {me.get('nick_name')}（{reader._db.account}）")
+
+    # ---- 身份闸 ----
+    #
+    # 没有自己的 wxid 就没法判断哪条消息是自己发的 —— 所有自环防护
+    # 都会从源头失效。这种状态不启动监听，而不是"先跑起来看看"。
+    # 11-04 那晚的教训：不知道自己是谁的时候开口，就是在赌。
+    try:
+        identity.require_me(identity.self_id_of(reader), where="app.py")
+    except identity.IdentityUnavailable as exc:
+        print()
+        print(f"  [!] {exc.reason}")
+        return 1
 
     # ---- 监听会话 ----
     if not cfg.chats:

@@ -68,7 +68,9 @@ S.detailCode = '';       // 当前打开详情的表情代码
 async function loadStickers() {
   if (!S.bridge) return;
   try {
-    const d = JSON.parse(await S.bridge.sticker_list());
+    // slim=true：不带 detail/tags/path —— 那三项合计 320 KB，
+    // 而翻页只显示缩略图和一句话。实测 1048 KB → 约 330 KB。
+    const d = JSON.parse(await S.bridge.sticker_list(true));
     if (!d.ok) return toast(d.error || '读取表情库失败');
 
     S.stickers = d;
@@ -83,9 +85,55 @@ async function loadStickers() {
     }
 
     renderStickerGrid(d.items);
+    fillThumbsInBackground(d.items);
   } catch (e) {
     console.error(e);
     toast('读取表情库失败');
+  }
+}
+
+/* 缩略图补齐：每次一批，直到没有缺的。
+ *
+ * 为什么放后台、为什么分批：导入 2000 张之后，一次性生成要 10 秒，
+ * 那 10 秒里界面是死的。每次 60 张（约 300ms），两次调用之间
+ * 浏览器能重绘、用户能点击。
+ *
+ * 补完的那一批就地换掉 img 的 src —— 不重排整个网格，
+ * 否则每批都把 2181 个 DOM 重建一遍，等于没优化。
+ */
+let _thumbFilling = false;
+
+async function fillThumbsInBackground(items) {
+  if (_thumbFilling || !S.bridge) return;
+  if (!items.some((it) => !it.thumb)) return;
+  _thumbFilling = true;
+  try {
+    for (let round = 0; round < 200; round++) {
+      const r = JSON.parse(await S.bridge.sticker_fill_thumbs(60));
+      if (!r.ok || !r.left) break;
+      // 不重新拉列表，直接问"现在哪些还有 thumb"
+      const d2 = JSON.parse(await S.bridge.sticker_list());
+      if (!d2.ok) break;
+      S.stickers = d2;
+      patchThumbSrcs(d2.items);
+    }
+  } catch (e) {
+    console.warn('补缩略图失败', e);
+  } finally {
+    _thumbFilling = false;
+  }
+}
+
+function patchThumbSrcs(items) {
+  const box = $('#stickerList');
+  if (!box) return;
+  for (const it of items) {
+    if (!it.thumb) continue;
+    const el = box.querySelector(`.sticker-item[data-code="${it.code}"] img`);
+    if (el && el.dataset.thumbed !== '1') {
+      el.src = stickerSrc(it.thumb);
+      el.dataset.thumbed = '1';
+    }
   }
 }
 
@@ -95,6 +143,18 @@ function stickerSrc(path) {
   return 'file:///' + encodeURI(String(path).replace(/\\/g, '/'));
 }
 
+/* 网格里的预览一律走缩略图。
+ *
+ * 以前是原图直读：2181 张 × 平均 0.79 Mpx ≈ 1580 Mpx 的解码，
+ * 外加 836 MB 磁盘读 —— 每进一次页面就是十几秒的白屏。
+ * 缩略图 256px、静态 WebP，同屏几十张加起来不到 2 Mpx。
+ *
+ * 没有 thumb 就回退原图：还没补出来的那几张宁可慢一点，不能空白。
+ */
+function stickerThumb(it) {
+  return stickerSrc(it.thumb ? it.thumb : it.path);
+}
+
 function stickerBytes(n) {
   if (!n) return '—';
   if (n < 1024) return n + ' B';
@@ -102,22 +162,35 @@ function stickerBytes(n) {
   return (n / 1048576).toFixed(1) + ' MB';
 }
 
-function renderStickerGrid(items) {
-  const box = $('#stickerList');
-  if (!items.length) {
-    box.innerHTML =
-      '<div class="empty-hint">还没有表情。点右上角「添加表情」放几张进来。<br>' +
-      '<span style="opacity:.75">任意格式都行，导入时统一转 GIF —— ' +
-      '只有 .gif 会被微信认成原生表情（会动、对方能长按添加）。</span></div>';
-    return;
-  }
+/* ────────── 分页 ──────────
+ *
+ * 为什么要分页，而不是"一次全画 + content-visibility"：
+ *
+ *   实测（Chromium 1440×900，2181 格，真界面真数据）：
+ *     全量 + content-visibility:auto   p50 22.0ms / p95 25.6ms / 首屏布局 29ms
+ *     全量、不开 content-visibility    p50 16.6ms / p95 19.0ms / 首屏布局 99ms
+ *     一页 60 张                       p50 16.5ms / p95 17.6ms / 首屏布局 ~15ms
+ *
+ *   content-visibility 在这里是**负优化**：每格都带 border-radius +
+ *   overflow:hidden，浏览器要为每个屏外格子反复做尺寸评估和裁剪，
+ *   比老老实实绘制它们还贵。所以它已经从 CSS 里删掉了。
+ *
+ * ⚠ 是**真翻页**，不是滚到底自动加载。
+ *   自动加载的问题不是性能，是手感：用户永远不知道自己在第几屏、
+ *   也不知道还有多少，划着划着一堆图冒出来，像永远划不到底。
+ *   翻页时页码、总页数都写着，翻到最后一张就是最后一张。
+ */
+const STICKER_PAGE = 60;
+S.stickerPage = 0;           // 当前第几页（0 起）
+S.stickerItems = [];         // 当前的全部条目
 
-  box.innerHTML = items.map((it) => {
-    const brief = (it.brief || '').trim();
-    const isGif = it.kind === 'sticker';
-    const frames = Number(it.frames || 1);
-    return `<div class="sticker-item" data-code="${esc(it.code)}" title="双击查看详情">
-      <div class="sticker-thumb"><img src="${stickerSrc(it.path)}" alt="" loading="lazy"></div>
+function stickerCardHtml(it) {
+  const brief = (it.brief || '').trim();
+  const isGif = it.kind === 'sticker';
+  // 页码对解析没有帮助：本页的图一定可见，直接按需加载即可，
+  // 不需要 loading="lazy"（它反而会让翻页瞬间出现一片空白）。
+  return `<div class="sticker-item" data-code="${esc(it.code)}" title="双击查看详情">
+      <div class="sticker-thumb"><img src="${stickerThumb(it)}" alt="" decoding="async"${it.thumb ? ' data-thumbed="1"' : ''}></div>
       <div class="sticker-meta">
         <div class="sticker-brief${brief ? '' : ' is-empty'}">${esc(brief || '没写说明')}</div>
         <div class="sticker-foot">
@@ -126,27 +199,111 @@ function renderStickerGrid(items) {
         </div>
       </div>
     </div>`;
-  }).join('');
+}
 
-  box.querySelectorAll('.sticker-item').forEach((el) => {
+function bindStickerCards(root) {
+  root.querySelectorAll('.sticker-item:not([data-bound])').forEach((el) => {
+    el.dataset.bound = '1';
     el.addEventListener('dblclick', () => openStickerDetail(el.dataset.code));
   });
 }
 
+function stickerPageCount() {
+  return Math.max(1, Math.ceil((S.stickerItems || []).length / STICKER_PAGE));
+}
+
+/* 渲染某一页。整页替换，不做增量 —— 一页只有 60 个格子，
+ * 整页重建 ≈ 15ms，比维护两套追加/回退逻辑省心得多。 */
+function renderStickerPage(page) {
+  const box = $('#stickerList');
+  if (!box) return;
+  const total = S.stickerItems.length;
+  const pages = stickerPageCount();
+  S.stickerPage = Math.max(0, Math.min(pages - 1, page));
+
+  const from = S.stickerPage * STICKER_PAGE;
+  const to = Math.min(total, from + STICKER_PAGE);
+  const slice = S.stickerItems.slice(from, to);
+
+  box.innerHTML = slice.map(stickerCardHtml).join('');
+  bindStickerCards(box);
+  updateStickerPager();
+  // 翻页后回到顶部，否则会停在上一页的位置，看起来像"少了一半"
+  const sc = document.getElementById('pages');
+  if (sc) sc.scrollTop = 0;
+}
+
+function renderStickerGrid(items) {
+  S.stickerItems = items || [];
+  S.stickerPage = 0;
+  const box = $('#stickerList');
+  box.innerHTML = '';
+
+  if (!S.stickerItems.length) {
+    box.innerHTML =
+      '<div class="empty-hint">还没有表情。点右上角「添加表情」放几张进来。<br>' +
+      '<span style="opacity:.75">任意格式都行，导入时统一转 GIF —— ' +
+      '只有 .gif 会被微信认成原生表情（会动、对方能长按添加）。</span></div>';
+    updateStickerPager();
+    return;
+  }
+  renderStickerPage(0);
+}
+
+function updateStickerPager() {
+  const bar = $('#stickerMoreBar');
+  if (!bar) return;
+  const pages = stickerPageCount();
+  const total = S.stickerItems.length;
+  if (pages <= 1) { bar.hidden = true; return; }
+  bar.hidden = false;
+  const from = S.stickerPage * STICKER_PAGE + 1;
+  const to = Math.min(total, (S.stickerPage + 1) * STICKER_PAGE);
+  setText('#stickerMoreText',
+    `第 ${S.stickerPage + 1} / ${pages} 页 · ${from}–${to} / ${total}`);
+  const prev = $('#btnStickerPrev');
+  const next = $('#btnStickerNext');
+  if (prev) prev.disabled = S.stickerPage <= 0;
+  if (next) next.disabled = S.stickerPage >= pages - 1;
+}
+
+$('#btnStickerPrev')?.addEventListener('click', () => renderStickerPage(S.stickerPage - 1));
+$('#btnStickerNext')?.addEventListener('click', () => renderStickerPage(S.stickerPage + 1));
+
 /* ────────── 详情弹窗 ────────── */
 
-function openStickerDetail(code) {
-  const it = (S.stickers.items || []).find((x) => x.code === code);
-  if (!it) return;
+async function openStickerDetail(code) {
+  const base = (S.stickers.items || []).find((x) => x.code === code);
+  if (!base) return;
   S.detailCode = code;
 
-  setText('#stickerDetailTitle', it.brief || '（没写说明）');
-  $('#stickerDetailImg').src = stickerSrc(it.path);
-  setText('#stickerDetailCode', it.code);
-  setText('#stickerDetailFile', it.file);
-  setText('#stickerDetailSize', stickerBytes(it.size));
-  setText('#stickerDetailFrames', String(it.frames || 1) + ' 帧');
+  // 先用列表里就有的字段把弹窗填上（不让用户看空白），
+  // 再补一次完整信息（detail / tags / 原图路径），通常 1 ms 内回来。
+  setText('#stickerDetailTitle', base.brief || '（没写说明）');
+  $('#stickerDetailImg').src = stickerSrc(base.thumb || base.path);
+  setText('#stickerDetailCode', base.code);
+  setText('#stickerDetailFile', base.file);
+  setText('#stickerDetailSize', stickerBytes(base.size));
+  setText('#stickerDetailFrames', String(base.frames || 1) + ' 帧');
+  $('#stickerDetailBrief').value = base.brief || '';
+  $('#stickerDetailDesc').value = '';
+  $('#stickerDetailDim').value = base.moodDim || '';
 
+  openModal('stickerDetailModal');
+
+  let it = base;
+  try {
+    const r = JSON.parse(await S.bridge.sticker_get(code));
+    if (r.ok && r.item) it = r.item;
+  } catch (e) {
+    console.warn('取详情失败，用列表里的字段兜底', e);
+  }
+  // 弹窗可能已经被关掉 / 换了另一张 —— 别把旧数据写进去
+  if (S.detailCode !== code) return;
+
+  setText('#stickerDetailTitle', it.brief || '（没写说明）');
+  $('#stickerDetailImg').src = stickerSrc(it.path || it.thumb);
+  setText('#stickerDetailSize', stickerBytes(it.size));
   $('#stickerDetailBrief').value = it.brief || '';
   $('#stickerDetailDesc').value = it.detail || '';
   $('#stickerDetailDim').value = it.moodDim || '';
@@ -154,7 +311,8 @@ function openStickerDetail(code) {
   $('#stickerDetailIntensity').value = inten;
   setText('#stickerDetailIntensityVal', String(inten));
 
-  openModal('stickerDetailModal');
+  // 记住完整版，保存/删除时用它，避免列表里只有精简字段
+  S.detailItem = it;
   setTimeout(() => $('#stickerDetailBrief').focus(), 80);
 }
 
@@ -222,9 +380,12 @@ function renderPending() {
   }
   wrap.hidden = false;
   setText('#stickerPendingCount', `已选 ${S.pending.length} 张`);
+  // 已选列表也用缩略图：2000 张原图在 180px 的滚动框里，
+  // 光是解码就能把这个弹窗拖死。
+  // 这里没有 bridge 往返，退化成原图 —— 但那条路径只在"刚选完、还没导入"时走。
   grid.innerHTML = S.pending.map((x, i) => `
     <div class="pending-cell" title="${esc(x.name)}">
-      <img src="${stickerSrc(x.path)}" alt="" loading="lazy">
+      <img src="${stickerSrc(x.path)}" alt="" loading="lazy" decoding="async">
       <button data-idx="${i}" title="移除">×</button>
     </div>`).join('');
 
@@ -252,19 +413,37 @@ async function doStickerImport() {
   btn.textContent = '导入中…';
 
   try {
-    // ① 导入（转 GIF、编号、落盘）
+    // ① 导入（查重 → 转 GIF → 编号 → 落盘 → 做缩略图）
+    //
+    // 分批：以前 2000 张一次塞进去，这一个 await 要等十几分钟，
+    // 期间按钮虽然写着"导入中…"，界面却连滚动都卡。
+    // 现在 40 张一往返，每批之间浏览器能重绘，进度是真的在动。
+    //
+    // ⚠ 批次别调太小：后端每批只写一次 index（1MB 左右），
+    //   20 张一批的话 2000 张要写 100 次。
     const paths = S.pending.map((x) => x.path);
-    const r = JSON.parse(await S.bridge.sticker_add(JSON.stringify(paths)));
-    if (!r.ok) {
-      toast(r.error || '导入失败');
-      return;
+    const BATCH = 40;
+    const added = [];
+    const failed = [];
+    const skipped = [];
+    const near = [];
+    for (let i = 0; i < paths.length; i += BATCH) {
+      const slice = paths.slice(i, i + BATCH);
+      btn.textContent = `导入 ${Math.min(i + BATCH, paths.length)}/${paths.length}…`;
+      const r = JSON.parse(await S.bridge.sticker_add(JSON.stringify(slice)));
+      if (!r.ok) {
+        toast(r.error || '导入失败');
+        break;
+      }
+      added.push(...(r.added || []));
+      failed.push(...(r.failed || []));
+      skipped.push(...(r.skipped || []));
+      near.push(...(r.near || []));
+      // 让浏览器喘一口气，进度文字才画得出来
+      await new Promise((res) => setTimeout(res, 0));
     }
-    const added = r.added || [];
-    const failed = r.failed || [];
-    if (failed.length) {
-      toast(`${failed.length} 张没进来：${failed[0].why}`);
-    }
-    if (!added.length) {
+    showImportReport({ added, failed, skipped, near });
+    if (!added.length && !skipped.length) {
       toast('一张都没导入成功');
       return;
     }
@@ -281,15 +460,44 @@ async function doStickerImport() {
           // 单张失败不影响其他
           console.warn('自动备注失败', code, e);
         }
+        if (done % 5 === 0) await new Promise((res) => setTimeout(res, 0));
       }
     }
 
-    toast(`导入 ${added.length} 张${autoDesc ? '，说明已写好' : ''}`);
     closeModal('stickerAddModal');
     loadStickers();
   } finally {
     btn.disabled = false;
     btn.textContent = '开始导入';
+  }
+}
+
+/* 导入报告：新增 / 重复跳过 / 相似提示 / 失败，四类分开说。
+ *
+ * 为什么要单独一块而不是一句 toast：
+ *   「2000 张里跳过 380 张重复」这件事，用户需要知道**具体是哪几张**，
+ *   否则会怀疑图丢了。这里先给一行汇总，再把明细写进日志区。 */
+function showImportReport({ added, failed, skipped, near }) {
+  const bits = [];
+  if (added.length) bits.push(`新增 ${added.length} 张`);
+  if (skipped.length) bits.push(`跳过重复 ${skipped.length} 张`);
+  if (failed.length) bits.push(`失败 ${failed.length} 张`);
+  if (near.length) bits.push(`相似 ${near.length} 张（已收）`);
+  toast(bits.length ? bits.join('，') : '没有变化');
+
+  const L = (t, k) => pushLog(`[表情] ${t}`, k);
+  if (skipped.length) {
+    L(`跳过 ${skipped.length} 张重复：` +
+      skipped.slice(0, 8).map((s) => `${s.file}（同 ${s.code}，${s.why}）`).join('；') +
+      (skipped.length > 8 ? ` …… 还有 ${skipped.length - 8} 张` : ''), '');
+  }
+  if (near.length) {
+    L(`${near.length} 张很像库里已有的图，仍然收进来了：` +
+      near.slice(0, 8).map((s) => `${s.file}（近 ${s.code}，${s.why}）`).join('；'), '');
+  }
+  if (failed.length) {
+    L(`${failed.length} 张没进来：` +
+      failed.slice(0, 8).map((s) => `${s.file}（${s.why}）`).join('；'), 'err');
   }
 }
 

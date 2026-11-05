@@ -813,6 +813,13 @@
           <div id="stickerList" class="sticker-grid">
             <div class="empty-hint">还没有表情。点右上角「添加表情」放几张进来。</div>
           </div>
+          <!-- 翻页条：固定一页 60 张，前后翻，不自动加载。
+               自动加载会让人"永远划不到底"，也说不出现在在第几屏。 -->
+          <div id="stickerMoreBar" class="sticker-pager" hidden>
+            <button class="btn btn-sm" id="btnStickerPrev">‹ 上一页</button>
+            <span id="stickerMoreText"></span>
+            <button class="btn btn-sm" id="btnStickerNext">下一页 ›</button>
+          </div>
         </div>
 
         <div class="card" style="margin-top:16px" id="stickerHintCard">
@@ -1344,6 +1351,29 @@
     </div>
 
 <div class="toast-wrap" id="toastWrap"></div>
+
+<!-- 会话级配置（C-1 三层作用域）
+     每个会话可以单独覆盖五个行为开关；没设的跟随上一层。
+     这里只改**这个会话**，全局默认在「设置」页。 -->
+<div class="scope-mask" id="scopeMask" hidden>
+  <div class="scope-dialog" role="dialog" aria-modal="true" aria-labelledby="scopeTitle">
+    <div class="scope-head">
+      <div>
+        <h3 id="scopeTitle">会话配置</h3>
+        <p class="scope-sub" id="scopeSub">只对这个会话生效；没设的跟随上一层。</p>
+      </div>
+      <button class="icon-btn scope-x" id="scopeClose" title="关闭">✕</button>
+    </div>
+    <div class="scope-body" id="scopeBody"></div>
+    <div class="scope-foot">
+      <span class="hint-line" id="scopeHint"></span>
+      <div class="scope-actions">
+        <button class="btn btn-sm" id="scopeInheritAll">全部恢复继承</button>
+        <button class="btn btn-sm btn-primary" id="scopeSave">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script src="qwebchannel.js"></script>
 <script src="app.js"></script>
