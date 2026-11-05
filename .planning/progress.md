@@ -1,8 +1,15 @@
 # 进度
 
-> 最后更新：2026-11-05 23:20（v0.7.0 已发布）
+> 最后更新：2026-11-05 23:20（v0.7.0 已发布：commit fb2dd79 / tag v0.7.0）
 
 ## 当前状态：v0.7.0 已发布
+
+```
+release  https://github.com/q825818504/bigfish-wechat/releases/tag/v0.7.0
+commit   fb2dd79（main 已推送）
+附件     BigFish-0.7.0-portable.zip  202.3 MB  sha256 139b2a26…
+         BigFish-0.7.0-manifest.json
+```
 
 ```
 C-1 配置作用域  ✅   A-1 身份判据  ✅   D-1 共同账本  ✅   B-1 发送信封  ✅
