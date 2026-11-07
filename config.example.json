@@ -1,6 +1,5 @@
 {
   "_comment": "大肥鱼 × 微信配置。模型接入看 docs/模型接入.md：选一家填 Key 就行，地址和协议已内置。",
-
   "llm": {
     "_comment": "channel 选预设（deepseek / moonshot / zhipu / qwen / volcengine / minimax / openai / anthropic / gemini / openrouter / siliconflow / magpie / ollama / custom …）。base_url 和 protocol 留空就用预设的。",
     "channel": "deepseek",
@@ -12,13 +11,15 @@
     "max_tokens": 2600,
     "timeout": 90
   },
-
   "auto_reply": {
     "_comment": "chats 是要监听的会话。私聊写联系人昵称，群聊写群名。",
-    "chats": ["文件传输助手"],
-    "interval": 1.2
+    "chats": [
+      "文件传输助手"
+    ],
+    "interval": 1.2,
+    "rhythm": "fast",
+    "_rhythm_note": "拟人节流档位。natural=120秒内最多写6次(超了冷却30~75秒)，calm=300秒内3次，fast=120秒内20次(冷却4~9秒)，off=关掉。默认 fast：一轮会发2~4条，natural 两轮就撞上限，表现是「聊几句突然不理你，过一会冒出一大堆」。"
   },
-
   "_comment_scopes": "行为开关走三层：chat → account → global → 代码默认值。布尔字段缺省=继承，false=显式关闭；列表/数字缺省=继承，给 [] 或 0 就是显式覆盖。键必须用平台 id（wxid_xxx / 123@chatroom / filehelper），昵称只做只读别名。说明见 docs/作用域配置.md。",
   "scopes": {
     "global": {
@@ -38,7 +39,6 @@
       }
     }
   },
-
   "update": {
     "_comment": "repo 留空就用内置的 q825818504/bigfish-wechat。fork 的人填自己的 owner/repo（填完整 URL 也行，会自动收拾）。",
     "repo": "",

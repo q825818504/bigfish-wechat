@@ -713,7 +713,13 @@ async function doLoadChats() {
     const d = JSON.parse(await S.bridge.list_chats(300));
     if (d.error) return toast(d.error);
     S.chats = d.chats || [];
-    for (const c of S.chats) if (c.watching) S.watching.add(c.username);
+    // ⚠ 后端是唯一真相。原来是「只加不减」——换过账号之后，上一个号的
+    //   勾选会残留在 S.watching 里，保存时又被写回后端。
+    //   有未保存的改动（watchDirty）时才保留本地状态，否则整体替换。
+    if (!S.watchDirty) {
+      S.watching = new Set(
+        S.chats.filter((c) => c.watching).map((c) => c.username));
+    }
     renderChats();
     toast(`读到 ${S.chats.length} 个会话`);
   } catch (e) {
@@ -3102,6 +3108,9 @@ async function loadPlugins() {
     PLUG.data = d;
     renderPluginList();
     renderPluginSeats();
+    // 入口可见性也吃这份数据。不在这里同步，就会出现「插件页显示已启用、
+    // 侧边栏还是没有表情包入口」——两处各存一份的老问题。
+    if (typeof syncPluginNav === 'function') syncPluginNav();
     // 详情页开着时同步刷新（改完开关后回填）
     if (PLUG.current) openPlugin(PLUG.current);
   } catch (e) {

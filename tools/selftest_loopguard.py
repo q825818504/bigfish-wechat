@@ -238,6 +238,23 @@ def test_echo() -> None:
     check("长句只差一两个字 → 认 echo（容纳末尾改写）",
           not v.allow and v.reason == "echo", f"{v}")
 
+    # ⚠ 按会话记账之后，admit 必须把 chat 传下去。
+    #   以前测试两边都用默认的 chat=""，所以"记账写 A 桶、查询读 B 桶"
+    #   这种错误看不出来 —— 线上就变成了文件传输助手里自答不止。
+    g7 = guard_with(clock, allow_self=True)
+    g7.note_sent("读回来的一句", "filehelper")
+    v = g7.admit(Msg("filehelper", "读回来的一句", True))
+    check("带会话记账后 admit 仍能认出 echo",
+          not v.allow and v.reason == "echo", f"{v}")
+
+    # 用"所有会话都放行"来隔离变量：这一步只该由账本决定，
+    # 不能被 L1 白名单挡住（旧 allow_self=True 只放 filehelper）。
+    g8 = guard_with(clock, allow_self_for=lambda _c: True)
+    g8.note_sent("在 A 会话说的话", "wxid_a")
+    v = g8.admit(Msg("wxid_b", "在 A 会话说的话", True))
+    check("账本按会话隔离：B 会话里同样的字不算 echo",
+          v.allow, f"{v}")
+
     # 窗口过期
     g6 = guard_with(clock, allow_self=True, echo_window=12.0)
     g6.note_sent("很久以前说的话")

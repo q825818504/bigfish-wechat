@@ -558,6 +558,20 @@ class BigFishApp:
                 self.log(f"[跳过] {msg.chat_name}: {decision.detail}"
                          f"（{decision.reason}）")
                 return None
+            if verdict.who == identity.WHO_SELF:
+                # 自己发的也要防回音（L2）。
+                #
+                # 文件传输助手这个自测通道里，自己打的字和她回的话**是同一个
+                # wxid 发的** —— 判据分不开，只有账本能分：她刚发过的是回音，
+                # 我刚打进去的不是。
+                #
+                # 没有这一步，allow_self 打开就必然自答到天荒地老。
+                hit = self.ledger.lookup(msg.chat_id, msg.raw_content or msg.text)
+                if hit is not None:
+                    self.stats["skip"] += 1
+                    self.log(f"[回环] {msg.chat_name}: 读到自己刚发的，跳过"
+                             f"（{msg.preview(24)}）")
+                    return None
         elif not is_group:
             # 私聊拿不准 → 彻底静默（问过：不要提示、不要回一句）
             self.stats["skip"] += 1
@@ -805,6 +819,20 @@ def main() -> int:
         print()
         print("  [!] 桌面锁着。UIA 需要可见的桌面，请解锁后重试。")
         return 1
+
+    # ---- 拟人节流 ----
+    # 和桌面版同一个理由：默认档 120 秒内只允许 6 次写动作，
+    # 一轮发 2~4 条，两轮就撞上，然后被按住 30~75 秒。
+    try:
+        from bigfish.wechat_sender import RHYTHM_NOTES, apply_rhythm
+
+        _rhythm_want = str(((cfg.raw or {}).get("auto_reply") or {})
+                           .get("rhythm") or "fast")
+        _rhythm_got = apply_rhythm(_rhythm_want)
+        if _rhythm_got:
+            print(f"  节流       : {_rhythm_got}（{RHYTHM_NOTES.get(_rhythm_got, '')}）")
+    except Exception:
+        pass
 
     # ---- 灵魂 ----
     try:

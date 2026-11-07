@@ -188,6 +188,25 @@ def test_sender_resets_attempted() -> None:
         W.wechat_window_visible = old_visible
 
 
+def test_rhythm() -> None:
+    """拟人节流档位。
+
+    ⚠ 线上真出过：默认 natural 档「120 秒内最多写 6 次」，而大肥鱼一轮
+      就发 2~4 条 —— 两轮撞上限，被按住 30~75 秒。用户看到的是
+      「聊几句突然不理我，过一会儿冒出一大堆」。底层日志有冷却记录为证。
+    """
+    section("拟人节流档位")
+    from bigfish import wechat_sender as W
+
+    check("四个档位都有说明",
+          set(W.RHYTHM_NOTES) == {"natural", "calm", "fast", "off"},
+          str(sorted(W.RHYTHM_NOTES)))
+    got = W.apply_rhythm("fast")
+    check("apply_rhythm 不抛异常、返回字符串", isinstance(got, str), repr(got))
+    got = W.apply_rhythm("根本不存在的档位")
+    check("乱写档位不炸", isinstance(got, str), repr(got))
+
+
 def test_consequences() -> None:
     section("8/9 后果")
     sent = S.from_result(Result(True))
@@ -218,6 +237,7 @@ def main() -> int:
     test_error()
     test_raw_returns()
     test_sender_resets_attempted()
+    test_rhythm()
     test_consequences()
 
     print(f"\n{'=' * 46}")

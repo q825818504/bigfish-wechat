@@ -110,6 +110,82 @@ if not BRIDGE_DIR:
 #   现在只有一个来源：paths.app_root()/config.json。
 CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 
+#: 设置页那个「处理自己发的消息」开关，代表的就是这一个会话。
+#:
+#: ⚠ 读和写必须都带上它。曾经写会话层、读全局层，结果是
+#:   「保存成功、界面还是关的」——钱花了没生效，最容易让人怀疑人生。
+#:   这个开关的语义就是「只对文件传输助手生效的自测通道」，
+#:   写成全局等于"所有会话都能回应自己"，正是 11-04 事故的形态。
+SELF_TEST_CHAT = "filehelper"
+
+#: 微信把表情读回来时渲染成的样子（render.py 里 type 47 / 11000）
+STICKER_MARKS = ("[表情]", "[动画表情]")
+
+#: 句子里出现这些词，就是"明确要一张图"。
+#: 命中后**不掷概率、不受冷却限制** —— 用户开口要了，还让他等 180 秒说不过去。
+STICKER_WANT_WORDS = ("表情包", "表情", "斗图", "发个图", "发张图", "来张图", "发图")
+
+
+def wants_sticker(text: str) -> bool:
+    """这句是不是在要表情包。
+
+    只做包含判断，不做语义分析：误判的代价是多发一张（她本来也会发），
+    漏判的代价是用户明确要求了却没反应 —— 后者难受得多。
+    """
+    value = str(text or "")
+    return any(w in value for w in STICKER_WANT_WORDS)
+
+#: 发出表情后，多久之内读回来的同一条算回环。
+#: 实测数据库落库要 10~12 秒（比文字慢得多），10 秒窗口会把"已发出"
+#: 误判成"没发出去"。这里给到 45 秒，留足余量。
+STICKER_ECHO_WINDOW = 45.0
+
+
+def restore_watching_for(c: dict, acc: str) -> list[str]:
+    """把某个号上次的监听列表恢复到 `auto_reply.chats`，并返回它。
+
+    三件事必须一起做，少一件就会出"界面勾着、启动说没选"，
+    或者"换了号还把上一个号的会话带过来"：
+
+      1. 这个号专属的那份（per_account）优先；
+      2. 从没存过就用全局那份当种子 —— 老版本只有这一份，
+         直接清空等于把老用户的选择丢掉；
+      3. **无论结果空不空，都写回 auto_reply.chats** ——
+         留着上一个号的值，启动时的兜底会把别人的会话捡起来。
+    """
+    ar = c.setdefault("auto_reply", {})
+    per = c.setdefault("per_account", {})
+    saved = per.get(acc)
+    if saved is None:
+        restored = [str(x) for x in (ar.get("chats") or [])]
+        if restored:
+            per[acc] = {"chats": list(restored)}
+    else:
+        restored = [str(x) for x in ((saved or {}).get("chats") or [])]
+    ar["chats"] = list(restored)
+    return restored
+
+
+def take_sticker_echo(sent: dict, chat: str, now: float,
+                      window: float = STICKER_ECHO_WINDOW) -> bool:
+    """这次读回来的表情，是不是我们刚发出去的那个？
+
+    表情在库里没有文本（content 是加密串），没法像文字那样比对内容，
+    只能靠**时间**：发出去的时候记一个时间戳，读回来的时候取走一个。
+
+    一对一取走（而不是"有记录就算"），是为了不误伤：她连发两张，
+    对方真的回一张时，取第二张的戳就不该再拦。
+    """
+    stamps = sent.get(chat)
+    if not stamps:
+        return False
+    while stamps and (now - stamps[0]) > window:
+        stamps.pop(0)
+    if not stamps:
+        return False
+    stamps.pop(0)
+    return True
+
 
 def is_admin() -> bool:
     """当前进程是否有管理员权限（UIA 热激活需要）。"""
@@ -644,25 +720,33 @@ class EngineWorker(QThread):
             return "", "after"
         cfg = _plugins.config_of("sticker")
 
-        # ---- 冷却 ----
-        now = time.time()
-        span = self._sticker_sent.setdefault(msg.chat_id, [])
-        span[:] = [t for t in span if now - t < float(cfg.get("cooldown", 180))]
-        if span:
-            return "", "after"
+        # ---- 被明确要求时，跳过冷却和概率 ----
+        #
+        # 以前这里只有「冷却 + 15% 概率」，**完全不看用户说了什么**。
+        # 于是用户说"发个表情给爷看看"，掷骰子没中就什么都不发，
+        # 她只能拿文字糊弄一句「鼓腮算表情不」。
+        wanted = wants_sticker(body)
 
-        # ---- 概率 ----
-        try:
-            rate = float(cfg.get("rate", 0.15))
-        except (TypeError, ValueError):
-            rate = 0.15
-        rate = max(0.0, min(1.0, rate))
-        if rate <= 0:
-            return "", "after"
-        import random
+        if not wanted:
+            # ---- 冷却 ----
+            now = time.time()
+            span = self._sticker_sent.setdefault(msg.chat_id, [])
+            span[:] = [t for t in span if now - t < float(cfg.get("cooldown", 180))]
+            if span:
+                return "", "after"
 
-        if random.random() > rate:
-            return "", "after"
+            # ---- 概率 ----
+            try:
+                rate = float(cfg.get("rate", 0.15))
+            except (TypeError, ValueError):
+                rate = 0.15
+            rate = max(0.0, min(1.0, rate))
+            if rate <= 0:
+                return "", "after"
+            import random
+
+            if random.random() > rate:
+                return "", "after"
 
         # ---- 插件选择 ----
         path, position = "", "after"
@@ -737,31 +821,37 @@ class EngineWorker(QThread):
         name = _os.path.basename(path)
         kind = classify_media(path)
         label = "表情包" if kind == "sticker" else "图片"
+        from bigfish import sending as _sending
+
         try:
             r = self.sender.send_media(msg.chat_name, path)
-        except SendError as exc:
-            self._log(f"[表情] 发送失败：{exc}", "err")
-            return
-        except Exception as exc:
-            self._log(f"[表情] 发送异常：{exc}", "err")
+            verdict = _sending.classify(result=r)
+        except Exception as exc:            # noqa: BLE001
+            r = None
+            verdict = _sending.classify(error=exc)
+
+        if verdict.failed:
+            self._log(f"[表情] 未成功：{verdict.detail}", "err")
             return
 
-        if not r.ok:
-            self._log(f"[表情] 未成功：{r.detail}", "err")
-            return
+        if verdict.unknown:
+            # 表情的落库比文字慢得多（实测 10~12 秒）。超时**不等于**没发出去 ——
+            # 实测就出现过"日志说失败、对方却收到了"。按可能已发出处理：
+            # 不重发，并且照常记时间戳，好让读回来的那条被认成回环。
+            self._log(f"[表情] 结果未知（{verdict.detail}）—— 可能已经发出去了，"
+                      f"按已发处理", "err")
 
-        # ⚠ 走到这里才说明 send_media **验过数据库**了。
-        #   以前这里之前有个无声的谎：函数无条件返回成功，
-        #   于是日志写「已发」，实际上对方什么都没收到。
+        # 到这里就是"确定发了"或"很可能发了"。两种都要记时间戳，
+        # 因为**读回来的那条不会告诉我们当时到底成没成**。
         self._sticker_sent.setdefault(msg.chat_id, []).append(time.time())
-        self._log(f"[表情] 已发 {label}：{name}", "out")
+        if verdict.sent:
+            self._log(f"[表情] 已发 {label}：{name}", "out")
+        else:
+            self._log(f"[表情] 记为已发（结果未知）：{label} {name}", "out")
         self.chat_event.emit(msg.chat_name, f"[{label}]", "out")
-        # 表情消息在库里没有文本，回环判定靠 is_self 就够；
-        # 这里不登记内容，避免把"[表情]"这种占位符当成文本去匹配。
-        try:
-            remember_sent("")
-        except Exception:
-            pass
+        # 表情**不往文本账本里记**：占位符只有"[表情]"三个字，任何一张
+        # 表情都对得上，写进去会把对方发的表情也误杀。
+        # 回环改用上面那个时间戳（`_sticker_sent` + `take_sticker_echo`）。
         # 顺手记一笔：她发过表情。以后能拿来做"表达习惯"。
         try:
             from bigfish import vault as _v
@@ -1105,6 +1195,18 @@ class EngineWorker(QThread):
                 chat_id=msg.chat_id,
                 is_group=str(msg.chat_id).endswith("@chatroom"))
             _is_group_msg = str(msg.chat_id).endswith("@chatroom")
+
+            # 表情的回环（D-1 补口）：表情在库里没有文本可比 —— 读回来只会
+            # 渲染成 "[表情]"，判据说"这是自己发的"，L2 的文本比对认不出来。
+            # 于是她发一张表情、读回来、当成对方发来的、再回一句（线上发生过）。
+            # 这里改用时间戳：刚发过一张，就吃掉一个戳。
+            if (_who.who == _identity.WHO_SELF
+                    and text in STICKER_MARKS
+                    and take_sticker_echo(self._sticker_sent, msg.chat_id,
+                                          time.time())):
+                self._log(f"[回环] {msg.chat_name}：读到自己刚发的表情，跳过",
+                          "")
+                return
 
             # 账本能否决判据（D-1）：判据说"对方"，但我一秒前正好发过这句。
             # 这是 11-04 那晚唯一缺的一环。
@@ -1460,6 +1562,14 @@ class EngineWorker(QThread):
                     + "\n\n（这些是原话样本，不是结论。是否成立、属于哪类，"
                       "你按本轮语境自己判断。）")
 
+            try:
+                from bigfish import plugins as _pl
+
+                _pl.ensure_loaded()
+                _sticker_on = _pl.is_enabled("sticker")
+            except Exception:
+                _sticker_on = False
+
             scene = (f"你在微信群「{msg.chat_name}」里，"
                      f"{msg.sender_name or '某人'} @了你。" if is_group
                      else f"你在微信上和「{msg.chat_name}」聊天。")
@@ -1475,6 +1585,14 @@ class EngineWorker(QThread):
                 "- 对方说「你怎么没回我」时，一句就够：「啊？我没看到」或「回错人了」，"
                   "不要展开解释\n"
                 "- 需要更多信息就一句话追问")
+            # 表情包：她**确实有**这个能力，但发不发由系统掷骰子决定
+            # （见 _pick_sticker）。不告诉她这件事，她就会用「（探头）」
+            # 这种括号文字假装发了张图 —— 用户看到的是一个气泡加两个括号。
+            if _sticker_on:
+                user_parts.append(
+                    "- 你有发表情包的能力，但**发不发由系统决定**，你控制不了，"
+                    "也不要在文字里表示自己发了。绝对不要用「（探头）」「（鼓腮）」"
+                    "这类括号文字冒充表情或动作")
             user_parts.append("## 最近的对话\n\n" +
                               "\n".join(f"{w}: {t}" for w, t in hist))
 
@@ -1514,6 +1632,7 @@ class EngineWorker(QThread):
                 self._log(f"[预演] {reply}", "think")
                 return
 
+            _t_plan0 = time.time()
             parts, gaps = self._say_plan(reply)
             if is_group and msg.sender_name and parts:
                 # 群里回复时带上 @，只加第一条 —— 每条都 @ 很吵
@@ -1528,6 +1647,7 @@ class EngineWorker(QThread):
             #   挑图会调一次模型（可能几秒到几十秒），放在发文字之前
             #   会把第一句话拖住 —— 实测出现过第一句等了 50 秒。
             #   所以：前置才提前挑；后置等文字发完再挑（那时慢也没人察觉）。
+            _t_pick0 = time.time()
             _sticker_mood = self._current_mood()
             sticker_pos = self._sticker_pos_hint(reply, _sticker_mood)
             sticker_path = ""
@@ -1541,6 +1661,7 @@ class EngineWorker(QThread):
                     self._send_sticker(msg, sticker_path, remember_sent)
                     sticker_path = ""
 
+            _t_send0 = time.time()
             sent_any = False
             try:
                 for _i, _part in enumerate(parts):
@@ -1602,17 +1723,39 @@ class EngineWorker(QThread):
 
                     self.stats.emit(self.recv_count, self.reply_count)
                     self._log(f"[发] {reply[:60]}", "out")
+                    # 耗时拆开看一眼。「聊几句之后突然安静几十秒」这种问题，
+                    # 光看 [想]/[发] 之间的空白是查不出来的 —— 必须知道
+                    # 是挑图、还是 UIA 发送吃的。超过 3 秒才打，免得刷屏。
+                    _seg = (("切条", _t_pick0 - _t_plan0),
+                            ("挑图", _t_send0 - _t_pick0),
+                            ("发送", time.time() - _t_send0))
+                    if max(v for _n, v in _seg) >= 3.0:
+                        self._log("[耗时] " + " / ".join(
+                            f"{n} {v:.1f}s" for n, v in _seg), "think")
                     self.chat_event.emit(msg.chat_name, reply[:60], "out")
 
                     # ⭐ 发完文字，再挑表情包。
                     #   失败只记日志，不影响这一轮 —— 对方已经从文字里
                     #   读到内容了，表情是附加品，丢了不算聊崩。
                     if sticker_pos == "after":
+                        # ⚠ 这一段是**串行**的：挑图要调一次模型，
+                        #   跑完引擎才回去收下一条消息。花 40 秒的话，
+                        #   用户看到的就是"聊几句之后突然安静"。
+                        #   所以它必须单独记时 —— 它发生在 [发] 之后，
+                        #   上面那条汇总日志覆盖不到。
+                        _t_after = time.time()
                         try:
                             sticker_path, _pos = self._pick_sticker(
                                 msg, body, reply, mood=_sticker_mood)
                         except Exception as exc:
                             self._log(f"[表情] 挑选失败：{exc}", "err")
+                        _cost = time.time() - _t_after
+                        if _cost >= 3.0:
+                            self._log(
+                                f"[耗时] 后置挑图 {_cost:.1f}s"
+                                f"（这段时间引擎不接新消息）"
+                                f"{'，挑中一张' if sticker_path else '，结果没挑'}"
+                                , "think")
                         if sticker_path:
                             self._send_sticker(msg, sticker_path, remember_sent)
 
@@ -1669,6 +1812,23 @@ class EngineWorker(QThread):
 
         self.watcher.on_message = handle
         self.watcher.start()
+        # 拟人节流的档位。**必须在真正发送之前设好** ——
+        # 默认的 natural 是「120 秒内 6 次」，而一轮就发 2~4 条，
+        # 两轮就撞上，然后被按住 30~75 秒（线上真的这样）。
+        try:
+            from bigfish.wechat_sender import RHYTHM_NOTES, apply_rhythm
+
+            _cfg = load_json_config().get("auto_reply") or {}
+            _want = str(_cfg.get("rhythm") or "fast")
+            _got = apply_rhythm(_want)
+            if _got:
+                self._log(f"[节流] 节奏档 {_got} —— {RHYTHM_NOTES.get(_got, '')}",
+                          "")
+            else:
+                self._log(f"[节流] 设不了节奏档 {_want!r}，按底层默认走", "err")
+        except Exception as exc:
+            self._log(f"[节流] 设置失败：{exc}", "err")
+
         self._log(f"开始监听 {len(self.watching)} 个会话", "in")
 
         while not self._stop:
@@ -1694,7 +1854,13 @@ class Backend(QObject):
         super().__init__()
         self.window = window
         self.worker: EngineWorker | None = None
-        self.watching: list[str] = []
+        # ⚠ 必须从这里读，不能留空。
+        #
+        #   真出过的 bug：界面上的勾选来自「选账号」那一处的返回值，
+        #   而 start_engine 读的是 self.watching —— 后者原本只在**手动保存**
+        #   时才被赋值。于是界面明明勾着 1 个，点启动却说"没有选择要监听的
+        #   会话"，非要取消再勾一次才行。
+        self.watching: list[str] = self._watching_from_config()
         self.started_at = 0.0
         self.last_error = ""
         self.recv_count = 0
@@ -1712,6 +1878,26 @@ class Backend(QObject):
         self._tests: dict = {}
         # 「获取模型列表」的票据表。同一个理由，另一件事。
         self._fetches: dict = {}
+
+    def _watching_from_config(self) -> list[str]:
+        """配置里写着的监听列表。
+
+        优先这个号专属的那份（per_account），没有再退回 auto_reply.chats。
+        这两处必须和 `set_watching` 写的地方一一对应，否则又会出现
+        "界面勾着、后端说没有"。
+        """
+        try:
+            c = load_json_config()
+            ar = c.get("auto_reply") or {}
+            acc = str(ar.get("account") or "")
+            if acc:
+                per = ((c.get("per_account") or {}).get(acc) or {})
+                saved = [str(x) for x in (per.get("chats") or [])]
+                if saved:
+                    return saved
+            return [str(x) for x in (ar.get("chats") or [])]
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     # 账号选择
@@ -1861,11 +2047,9 @@ class Backend(QObject):
             # 每个微信号各存一份监听列表。
             # 理由：不同号关注的会话完全不同（工作号 vs 私人号），
             # 共用一份等于每次切换都要重勾一遍。
-            per = c.setdefault("per_account", {})
-            saved = per.get(acc) or {}
-            restored = [str(x) for x in (saved.get("chats") or [])]
-            if restored:
-                ar["chats"] = restored
+            restored = restore_watching_for(c, acc)
+            # 界面拿到的是 restored，后端也必须是同一份 —— 否则点启动会说没选。
+            self.watching = list(restored)
             try:
                 save_json_config(c)
             except Exception:
@@ -4251,7 +4435,8 @@ class Backend(QObject):
             # 而不是"文件里写着什么"。两者从 7.x 起就可能不是一回事。
             "max_reply_chars": _scopes.get(c, "max_reply_chars"),
             "quiet_hours": list(_scopes.get(c, "quiet_hours") or ()),
-            "allow_self": bool(_scopes.get(c, "allow_self")),
+            "allow_self": bool(_scopes.get(c, "allow_self",
+                                      chat_id=SELF_TEST_CHAT)),
             "group_reply": bool(_scopes.get(c, "group_reply")),
             "group_allow_all": list(_scopes.get(c, "group_allow_all") or ()),
         }, ensure_ascii=False)
@@ -4318,7 +4503,8 @@ class Backend(QObject):
                 [str(x) for x in (d.get("group_allow_all") or [])])
             # 显式写 true/false，不留 None：留 None 会被旧的全局 true 重新点亮。
             _scopes.set_chat_value(
-                c, "filehelper", "allow_self", bool(d.get("allow_self", False)))
+                c, SELF_TEST_CHAT, "allow_self",
+                bool(d.get("allow_self", False)))
 
             save_json_config(c)
             return json.dumps({"ok": True})
@@ -4429,6 +4615,9 @@ class Backend(QObject):
         if self.worker and self.worker.isRunning():
             return json.dumps({"ok": True, "note": "已在运行"})
 
+        if not self.watching:
+            # 兜底：配置里明明有，就别让用户去"取消再勾一次"。
+            self.watching = self._watching_from_config()
         if not self.watching:
             return json.dumps({"error": "没有选择要监听的会话"},
                               ensure_ascii=False)

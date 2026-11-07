@@ -62,6 +62,40 @@ class SendError(RuntimeError):
         super().__init__(msg)
 
 
+#: 拟人节流的档位说明。给日志和设置页用。
+RHYTHM_NOTES = {
+    "natural": "默认档：120 秒内最多写 6 次，超了冷却 30~75 秒",
+    "calm": "保守档：300 秒内最多写 3 次，超了冷却 60~150 秒",
+    "fast": "宽松档：120 秒内最多写 20 次，超了只冷却 4~9 秒",
+    "off": "关掉节流（仅对照用）",
+}
+
+
+def apply_rhythm(name: str) -> str:
+    """设置 UIA 的拟人节流档位，返回实际生效的档名（失败返回空串）。
+
+    ⚠ 这一层是**故意**慢的：写动作之间要有间隔、短时间内写太多次要冷却，
+      目的是让她看起来像人在操作，而不是机器。
+
+      但 `natural` 档的上限是「120 秒内 6 次」，而大肥鱼一轮就发 2~4 条 ——
+      两轮就撞上，然后被按住 30~75 秒。用户看到的是「聊几句突然不理我，
+      过一会儿又冒出一大堆」。线上的确是这个现象（底层日志有冷却记录）。
+
+      `fast` 档把上限提到 20 次、冷却缩到 4~9 秒 —— 仍然不是恒速，
+      但正常的对话节奏不会再被截断。
+    """
+    try:
+        from wechatauto import rhythm
+
+        want = str(name or "fast").strip().lower()
+        if want not in ("natural", "calm", "fast", "off"):
+            want = "fast"
+        rhythm.set_profile(want)
+        return rhythm.profile().name
+    except Exception:
+        return ""
+
+
 def is_admin() -> bool:
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())

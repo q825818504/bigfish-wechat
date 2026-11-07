@@ -293,6 +293,199 @@ def test_isolation() -> None:
           and scopes.get(STORE, "allow_self", chat_id=PEER) is False)
 
 
+def test_watching_bootstrap() -> None:
+    """监听列表必须能从配置里自己读出来。
+
+    ⚠ 真出过的 bug：界面上的勾选来自「选账号」的返回值，而 start_engine
+      读的是 Backend.watching —— 后者原本只在**手动保存**时才被赋值。
+      于是界面勾着、后端是空的，点启动就报"没有选择要监听的会话"，
+      非要把会话取消再勾一次才能启动。
+    """
+    section("监听列表（启动时自读）")
+
+    class Bare:
+        pass
+
+    def load_with(cfg):
+        D.load_json_config = lambda: copy.deepcopy(cfg)
+        return D.Backend._watching_from_config(Bare())
+
+    got = load_with({"auto_reply": {"chats": ["filehelper"]}})
+    check("auto_reply.chats 能读到", got == ["filehelper"], str(got))
+
+    got = load_with({
+        "auto_reply": {"account": "wxid_a", "chats": ["old"]},
+        "per_account": {"wxid_a": {"chats": ["filehelper"]}},
+    })
+    check("这个号专属的优先于全局", got == ["filehelper"], str(got))
+
+    got = load_with({
+        "auto_reply": {"account": "wxid_b", "chats": ["old"]},
+        "per_account": {"wxid_a": {"chats": ["filehelper"]}},
+    })
+    check("别的号的配置不串过来", got == ["old"], str(got))
+
+    got = load_with({"auto_reply": {"chats": [123, "filehelper"]}})
+    check("非字符串也转成字符串", got == ["123", "filehelper"], str(got))
+
+    got = load_with({})
+    check("什么都没配 → 空", got == [], str(got))
+
+    def boom():
+        raise RuntimeError("配置坏了")
+    D.load_json_config = boom
+    check("配置读不出来 → 空，不抛",
+          D.Backend._watching_from_config(Bare()) == [])
+
+    install_fake_io()          # 恢复
+
+
+def test_wants_sticker() -> None:
+    """用户在要表情包吗。
+
+    ⚠ 线上出过：用户说「发个表情给爷看看」，她回了「鼓腮算表情不」。
+      原因是表情包只看 15% 概率，**完全不读用户说了什么**。
+    """
+    section("要不要表情包（意图）")
+
+    want = D.wants_sticker
+    check("「发个表情给爷看看」→ 要", want("发个表情给爷看看"))
+    check("「来个表情包」→ 要", want("来个表情包"))
+    check("「斗图吗」→ 要", want("斗图吗"))
+    check("「发张图过来」→ 要", want("发张图过来"))
+    check("「今天天气不错」→ 不要", not want("今天天气不错"))
+    check("空串 → 不要", not want(""))
+    check("None 不炸", want(None) is False)
+    # 已知代价：用户只是在夸表情时也会算"要"，多发一张而已，
+    # 比"明确要求了却没反应"便宜。
+    check("「你这表情挺好玩」→ 也算要（已知误判，可接受）",
+          want("你这表情挺好玩"))
+
+
+def test_restore_watching() -> None:
+    """切账号时的监听列表恢复。三件事必须同时成立。"""
+    section("切账号恢复监听列表")
+
+    # 1) 从没存过 → 用全局那份当种子，并落成这个号专属的
+    c = {"auto_reply": {"chats": ["filehelper"]}}
+    got = D.restore_watching_for(c, "wxid_a")
+    check("首次进入：沿用全局那份", got == ["filehelper"], str(got))
+    check("顺手落成这个号专属的",
+          c["per_account"]["wxid_a"]["chats"] == ["filehelper"], str(c))
+
+    # 2) 这个号存过 → 用它，且覆盖全局
+    c = {"auto_reply": {"chats": ["old"]},
+         "per_account": {"wxid_a": {"chats": ["filehelper"]}}}
+    got = D.restore_watching_for(c, "wxid_a")
+    check("有专属配置就用专属的", got == ["filehelper"], str(got))
+    check("全局那份被同步", c["auto_reply"]["chats"] == ["filehelper"], str(c))
+
+    # 3) 这个号明确存了空 → 必须清空全局，不能把上一个号的捡回来
+    c = {"auto_reply": {"chats": ["上一个号的会话"]},
+         "per_account": {"wxid_b": {"chats": []}}}
+    got = D.restore_watching_for(c, "wxid_b")
+    check("专属配置为空 → 就是空", got == [], str(got))
+    check("全局也必须跟着清空（否则启动兜底会捡回别人的会话）",
+          c["auto_reply"]["chats"] == [], str(c))
+
+    # 4) 切到第三个号（没存过），全局现在是空 → 不能凭空给东西
+    got = D.restore_watching_for(c, "wxid_c")
+    check("新号没存过、全局是空 → 空", got == [], str(got))
+
+
+def test_sticker_echo() -> None:
+    """表情回环：时间戳一对一取走。
+
+    ⚠ 线上真出过：她发了一张表情，日志写"发送失败"（数据库 12 秒才落库，
+      窗口只等 10 秒），于是没记账 → 表情读回来被当成对方发来的 →
+      她又回了一句。表情在库里没有文本，只能靠时间认。
+    """
+    section("表情回环（时间戳）")
+
+    take = D.take_sticker_echo
+    sent: dict = {}
+    now = 1000.0
+
+    check("没发过表情 → 不拦", take(sent, "c1", now) is False)
+    check("别的会话发过 → 本会话不拦",
+          take({"c2": [now]}, "c1", now) is False)
+
+    sent = {"c1": [now]}
+    check("刚发过一张 → 认出是回环", take(sent, "c1", now + 2) is True)
+    check("戳被取走了（一对一，不会一直拦）", take(sent, "c1", now + 3) is False)
+
+    sent = {"c1": [now, now + 1]}
+    take(sent, "c1", now + 5)
+    check("发两张、只回一张 → 还剩一张的戳", sent["c1"] == [now + 1], str(sent))
+
+    sent = {"c1": [now]}
+    check("超过窗口就不认（45 秒）",
+          take(sent, "c1", now + 60) is False)
+
+    sent = {"c1": [now - 100, now]}
+    check("过期戳先被清掉，不会挡住新的",
+          take(sent, "c1", now + 1) is True and sent["c1"] == [], str(sent))
+
+    check("占位符覆盖两种写法",
+          "[表情]" in D.STICKER_MARKS and "[动画表情]" in D.STICKER_MARKS)
+
+
+# ══════════════════════════════════════════════════════════════════
+class SettingsBackend(FakeBackend):
+    """设置页那一对 slot（get_config / save_config）。
+
+    它们要碰 `self.watching`，所以比会话弹层多一个属性。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.watching: list[str] = []
+
+    get_config = D.Backend.get_config
+    save_config = D.Backend.save_config
+
+
+def test_settings_allow_self_roundtrip() -> None:
+    """设置页的「处理自己发的消息」：存完必须读得回来。
+
+    ⚠ 这条是真出过的 bug：写会话层、读全局层，于是界面点开→保存→
+      显示「已保存」，勾选框却弹回关闭。磁盘上明明是 true。
+      用户以为没生效，其实生效了 —— 只是界面看错了地方。
+    """
+    section("设置页 allow_self 存取一致")
+
+    b = SettingsBackend()
+    STORE.clear()
+    STORE.update({"auto_reply": {"interval": 1.2}})
+
+    check("初始是关的", json.loads(b.get_config())["allow_self"] is False)
+
+    r = json.loads(b.save_config(json.dumps({"allow_self": True})))
+    check("保存返回成功", r.get("ok") is True, str(r))
+    check("存完读回来是开的（曾经读回 False）",
+          json.loads(b.get_config())["allow_self"] is True)
+
+    chat = (STORE.get("scopes") or {}).get("chat") or {}
+    check("写在会话层 filehelper，不写 global",
+          chat.get("filehelper", {}).get("allow_self") is True, str(chat))
+    glob = (STORE.get("scopes") or {}).get("global") or {}
+    check("global 里没有 allow_self（否则所有会话都能回自己）",
+          "allow_self" not in glob, str(glob))
+
+    r = json.loads(b.save_config(json.dumps({"allow_self": False})))
+    check("关掉也返回成功", r.get("ok") is True, str(r))
+    check("关掉之后读回来是关的",
+          json.loads(b.get_config())["allow_self"] is False)
+    chat = (STORE.get("scopes") or {}).get("chat") or {}
+    check("关掉写的是显式 false，不是删掉（删掉会被旧值点亮）",
+          chat.get("filehelper", {}).get("allow_self") is False, str(chat))
+
+    # 旧全局 true 不能把已经关掉的开关重新点亮
+    STORE["auto_reply"]["allow_self"] = True
+    check("旧配置里的全局 true 不会覆盖显式 false",
+          json.loads(b.get_config())["allow_self"] is False)
+
+
 # ══════════════════════════════════════════════════════════════════
 def main() -> int:
     print("会话配置接口回归测试（desktop.py 的两个 slot）")
@@ -302,6 +495,11 @@ def main() -> int:
     test_write_value()
     test_rejects()
     test_isolation()
+    test_settings_allow_self_roundtrip()
+    test_watching_bootstrap()
+    test_restore_watching()
+    test_wants_sticker()
+    test_sticker_echo()
 
     print(f"\n{'=' * 46}")
     total = PASS + FAIL

@@ -233,7 +233,12 @@ class LoopGuard:
             return Verdict(False, "self", "自己发的，跳过")
 
         # L2 内容比对
-        if self.is_echo(text):
+        #
+        # ⚠ 必须带上会话。账本从 D-1 起按会话记，这里不带 chat 就会去查
+        #   "全局桶"——那里永远是空的，于是这一步**永远不命中**。
+        #   代价：文件传输助手里她把自己回的每一条都当成对方说的，
+        #   一条接一条地接自己的话（线上真的发生了）。
+        if self.is_echo(text, chat):
             return Verdict(False, "echo", "读到自己刚发的，跳过")
 
         return Verdict(True)

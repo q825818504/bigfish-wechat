@@ -254,6 +254,21 @@ def test_ledger_veto() -> None:
     check("账本没记过的照常放行",
           app2._accept(incoming("你今天怎么样", local_id=10)) is not None)
 
+    # 自测通道：allow_self 打开后，她自己的回音不能当对方的话（L2）
+    app5, sender5 = make_app()
+    app5.cfg.raw = {"scopes": {"chat": {"filehelper": {"allow_self": True}}}}
+    app5.ledger.note_sent("filehelper", "收到收到，信号满格")
+    echo = incoming("收到收到，信号满格", chat="文件传输助手",
+                    chat_id="filehelper", sender="wxid_me", local_id=20)
+    echo.is_self = True
+    check("自测通道里读到自己刚发的 → 不回",
+          app5._accept(echo) is None)
+    typed = incoming("你睡不睡", chat="文件传输助手",
+                     chat_id="filehelper", sender="wxid_me", local_id=21)
+    typed.is_self = True
+    check("自测通道里自己打的字（账本没记过）→ 照常回",
+          app5._accept(typed) is not None)
+
     # 发一条，账本要自己记上（send_parts 里 note_sent）
     app3, sender3 = make_app()
     app3.hit = 0
