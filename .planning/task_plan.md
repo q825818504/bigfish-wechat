@@ -434,9 +434,9 @@ exe 自检 16/17（UIA 需管理员）。
 - [x] 跑自检与打包
 - [x] 生成 portable zip + manifest
 - [x] 审计 zip 内容（无配置/密钥/数据）
-- [ ] commit + tag + push
-- [ ] GitHub Release + 附件
-- [ ] 发布后核验
+- [x] commit + tag + push
+- [x] GitHub Release + 附件
+- [x] 发布后核验
 
 ### 发布硬门
 
