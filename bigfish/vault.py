@@ -405,6 +405,23 @@ def probe_writable(target: str) -> Tuple[bool, str]:
             return True, ""
         except Exception:
             pass
+        # 第三种：等一拍再试一次固定名。
+        #
+        # 为什么要重试：2026-11-08 实测，刚跑完一次 1.8GB 的数据备份之后，
+        # 同一个目录连探两次都偶发 EACCES —— 那是备份进程的瞬时占用，
+        # 不是权限问题。但自检会因此从「23 通过」掉成「22 通过 / 1 失败」，
+        # 而启动时误判成"数据目录不可写"更糟：她可能拒绝启动。
+        #
+        # 30ms 足够让瞬时占用释放；真没权限的话这次仍然会失败，
+        # 只是多花 30 毫秒。这笔买卖划算。
+        try:
+            time.sleep(0.03)
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("probe")
+            os.remove(probe)
+            return True, ""
+        except Exception:
+            pass
         try:
             if os.path.exists(probe):
                 os.remove(probe)
