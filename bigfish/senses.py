@@ -221,6 +221,17 @@ def _weather_text(data: Dict[str, Any]) -> str:
         return ""
 
 
+def weather_ready() -> bool:
+    """天气这一块是否可用（配了城市）。
+
+    城市是用户所在地，不能猜、不能给默认值 —— 猜错比没有更糟：
+    她会说"今天下雨"，而你在另一个半球。
+    但"没配就永远不提天气"这件事必须让用户看见一次，
+    否则他只会觉得"天气功能没做"，而不是"我少填了一个字段"。
+    """
+    return bool(_city())
+
+
 def refresh(now: Optional[float] = None, *,
             city: Optional[str] = None,
             root: Optional[str] = None) -> str:

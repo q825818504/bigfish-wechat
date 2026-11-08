@@ -131,6 +131,12 @@ def tone_of(mood: float, dims: Optional[Dict[str, Any]]) -> str:
 
     刻意**不写情绪词**（"难过""开心"），只写怎么说。
     写"你有点难过"她会演；写"一句能说完的就别分两条"她会照做。
+
+    ⚠ 维度的量纲是 **0..100**（`mood_judge` 用 -10..10 的增量累加后
+      clamp 到 0..100）。这里以前按 0..10 判（`sad >= 4`），于是
+      攒过两轮之后 `sad >= 4` 恒真 —— `mood < 55` 时她永远在说
+      "这一轮你没什么兴致"，不管实际是 5 还是 50。
+      阈值要和写入方同一个量纲，否则这个函数输出的是常数不是情绪。
     """
     sad = _dim(dims, "sad")
     worry = _dim(dims, "worry")
@@ -143,12 +149,12 @@ def tone_of(mood: float, dims: Optional[Dict[str, Any]]) -> str:
         # 两处都写会变成同一句话说两遍，既占 token 又像在反复叮嘱。
         return "这一轮你话不多。能一句说完的，不要拆成两条。"
     if mood < 55:
-        if sad >= 4 or heartache >= 4:
+        if sad >= 40 or heartache >= 40:
             return "这一轮你没什么兴致，句子短一点就行。"
-        if worry >= 4:
+        if worry >= 40:
             return "这一轮你有点悬着心，话会往那件事上靠，但不用反复说。"
         return "这一轮你不太想展开，简短回应就好。"
-    if mood >= 80 and (sweet >= 4 or happy >= 5):
+    if mood >= 80 and (sweet >= 40 or happy >= 50):
         return "这一轮你整个人是松的，可以多说半句，但别变成一串。"
     return ""
 

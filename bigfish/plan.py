@@ -249,10 +249,10 @@ def ensure_yesterday(items: List[Dict[str, Any]],
     seed = ""
     for line in yesterday or []:
         s = str(line or "").strip()
-        if s and "（做完了）" not in s:
+        if s and "（做完了）" not in s and "（过去了）" not in s:
             # "昨天 14:00 把书看完" → "把书看完"
             seed = re.sub(r"\A.*?\d{1,2}[:：]\d{2}\s*", "", s).strip()
-            seed = seed.replace("（做完了）", "").strip()
+            seed = seed.replace("（做完了）", "").replace("（过去了）", "").strip()
             if seed:
                 break
     if not seed:
@@ -306,6 +306,7 @@ def yesterday_lines(state: Any, *, now: float) -> List[str]:
         if not what:
             continue
         at = str(item.get("at") or "").strip()
-        mark = "（做完了）" if item.get("done") else ""
+        mark = ("（过去了）" if item.get("done_by") == "elapsed"
+                else "（做完了）" if item.get("done") else "")
         out.append(f"{at} {what}{mark}".strip())
     return out

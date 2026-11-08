@@ -68,7 +68,16 @@ class Mood:
             return "情绪低"
         return "情绪很低"
 
-    def active_dims(self, threshold: float = 0.15) -> List[str]:
+    def active_dims(self, threshold: float = 15.0) -> List[str]:
+        """活跃维度，带上强度。
+
+        ⚠ 量纲是 **0..100**，不是 0..1。
+          `mood_judge` 判定时给的是 -10..10 的增量，累加后 clamp 到 0..100；
+          这里以前按 0..1 处理（阈值 0.15 + `{v:.0%}`），于是
+          `happy=45` 会被格式化成 "4500%"，而 `worry=3` 也被判成活跃。
+          提示词里出现过「偏开心7000%、甜蜜3500%」——比不给情绪更伤，
+          因为她会照着这个比例去演。
+        """
         names = {
             "happy": "开心", "calm": "平静", "sweet": "甜",
             "heartache": "心軟", "worry": "担心",
@@ -77,7 +86,7 @@ class Mood:
         out = []
         for k, v in sorted(self.dims.items(), key=lambda x: -x[1]):
             if v >= threshold:
-                out.append(f"{names.get(k, k)}{v:.0%}")
+                out.append(f"{names.get(k, k)}{v:.0f}")
         return out
 
 
@@ -143,7 +152,8 @@ def find_node() -> Optional[str]:
 
 
 def _load_context_bridge(query: str = "", data_root: str = "",
-                         scope: str = "", timeout: float = 25.0) -> Context:
+                         scope: str = "", timeout: float = 25.0,
+                         chat: str = "") -> Context:
     """调用 bridge.mjs 取上下文。
 
     任何失败都返回带 warnings 的空 Context，不抛异常——
@@ -167,6 +177,8 @@ def _load_context_bridge(query: str = "", data_root: str = "",
     cmd = [node, _BRIDGE, "context", "--root", root]
     if scope:
         cmd += ["--scope", scope]
+    if chat:
+        cmd += ["--chat", chat]
     if query:
         cmd += ["--query", query]
 
@@ -214,10 +226,14 @@ def _load_context_bridge(query: str = "", data_root: str = "",
     return ctx
 
 
-def _local_memory(query: str) -> Tuple[str, str]:
+def _local_memory(query: str, chat: str = "") -> Tuple[str, str]:
     """L2：桥接拿不到记忆时，用本地 Python 记忆库兜底。
 
     返回 (memory_text_json, level)。level: "" / "recent" / "empty"。
+
+    ⚠ `chat` 是必须传的：这条兜底会走 `search_with_fallback`，
+      而它的降级分支是"全库最近 N 条原文"。不传会话就是拿别人的私聊
+      兜底 —— 比正常检索更容易串人。
     """
     try:
         from bigfish import memory as M, vault as V
@@ -231,7 +247,8 @@ def _local_memory(query: str) -> Tuple[str, str]:
         except Exception:
             bank = ""
         items, _level = M.search_with_fallback(
-            db, bank or "dafeiyu", query or "", limit=8, max_chars=2400)
+            db, bank or "dafeiyu", query or "", limit=8, max_chars=2400,
+            session=f"wechat:{chat}" if chat else "")
         if not items:
             # 桥接挂了、本地也没捞到 → 这一轮只能空记忆
             return "", "empty"
@@ -245,17 +262,22 @@ def _local_memory(query: str) -> Tuple[str, str]:
 
 
 def load_context(query: str = "", data_root: str = "",
-                 scope: str = "", timeout: float = 25.0) -> Context:
+                 scope: str = "", timeout: float = 25.0,
+                 chat: str = "") -> Context:
     """取上下文；桥接失败时自动降级到本地记忆。
 
     degraded: "" 正常 / "recent" 用了本地最近原文 / "empty" 记忆不可用
+
+    ⚠ `chat` 必须由调用方给（`chat_id`）。它只用于一件事：
+      把记忆检索收窄到"当前这个会话"。不给就是全库检索，
+      跟 B 聊天时能捞到 A 的私聊原话 —— README 承诺过不会这样。
     """
     ctx = _load_context_bridge(query=query, data_root=data_root,
-                               scope=scope, timeout=timeout)
+                               scope=scope, timeout=timeout, chat=chat)
     # 桥接成功且有记忆，或桥接没报错（只是没命中）→ 不降级
     if ctx.memory_text or not ctx.warnings:
         return ctx
-    text, level = _local_memory(query)
+    text, level = _local_memory(query, chat)
     if text:
         ctx.memory_text = text
         ctx.warnings.append("桥接无记忆，已用本地原文兜底")

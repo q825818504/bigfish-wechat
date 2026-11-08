@@ -272,7 +272,9 @@ def compare(fp_a: Dict[str, str],
         return 1, "完全相同的文件"
 
     worst, changed = grid_delta(fp_a.get("cg") or "", fp_b.get("cg") or "")
-    sd = hamming(fp_a.get("sh") or "", fp_b.get("sh") or "")
+    # （原本这里还算了一个 `hamming(sh_a, sh_b)` 的感知哈希距离，
+    #   但下面的判据全部基于 grid_delta 的 `changed/worst`，
+    #   它从来没参与过判断 —— 删掉省一次无意义的计算。）
 
     # ① 几乎没有格子换内容 + 配色也几乎没变 → 同一张图重导出
     if changed <= NEAR_GRID_CELLS and worst <= COLOUR_TOLERANCE:

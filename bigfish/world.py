@@ -171,11 +171,70 @@ class World:
         try:
             from bigfish import senses
 
+            # 城市没配 → 天气永远不会被注入。这不是 bug，是少填一个字段；
+            # 但用户看不到这一行，只会以为"天气功能没做"。
+            # 只提示一次：这个 tick 每 30 分钟跑一遍，刷屏没有意义。
+            if not getattr(self, "_warned_no_city", False):
+                self._warned_no_city = True
+                if not senses.weather_ready():
+                    self._log(
+                        "[感知] 还没填城市（插件页 → 生活 → 天气城市），"
+                        "天气这一块暂时不会出现", "err")
             line = senses.refresh()
             if line:
                 self._log(f"[感知] 天气：{line}", "")
         except Exception as exc:
             self._log(f"[感知] 天气刷新失败：{exc}", "")
+
+    def _today_talk(self, db: str, bank: str, chat_id: str, now: float,
+                    *, fallback=None) -> list:
+        """今天这个会话说过的话。
+
+        ⚠ 以前这里直接 `history.load(limit=24)` —— 那是"最近 24 条"，
+          没有"今天"这个概念。23:50 写复盘时，读到的可能是**昨天下午**
+          的对话，于是复盘会写「今天他说……」，而那句话是三天前的。
+
+          这件事比看起来严重：复盘的结果会写进灵魂的 `selfNotes`，
+          是"她对他的理解"。基于串了日子的原料做出的理解，
+          一旦落进人格就没人查得出来 —— 而她之后每轮都会读到它。
+
+        `history` 的 jsonl 没有时间戳，做不了这件事；`messages` 表有
+        `source_time`（毫秒），所以改从那里取。
+        过滤结果为空时回退旧的读法：最坏等于现状，
+        不会让她因为"今天真没聊"而拿不到任何素材。
+        """
+        _fallback = list(fallback or [])
+        if not db or not chat_id:
+            return _fallback
+        try:
+            import time as _t
+
+            from bigfish import memory as M
+
+            lt = _t.localtime(now)
+            day_start = _t.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                                   0, 0, 0, 0, 0, -1))
+            conn = M.connect(db, read_only=True)
+            try:
+                rows = conn.execute(
+                    "SELECT role, text FROM messages "
+                    "WHERE bank=? AND session=? "
+                    "AND COALESCE(source_time, recorded_at) >= ? "
+                    "ORDER BY COALESCE(source_time, recorded_at) LIMIT 40",
+                    (bank, f"wechat:{chat_id}",
+                     int(day_start * 1000))).fetchall()
+            finally:
+                conn.close()
+            out = []
+            for r in rows:
+                text = str(r["text"] or "").strip()
+                if not text:
+                    continue
+                who = "她" if r["role"] == "assistant" else "对方"
+                out.append(f"{who}: {text}")
+            return out[-24:] if out else _fallback
+        except Exception:
+            return _fallback
 
     def _gather_day_materials(self, now: float, *, day: str, chat_id: str,
                               db: str, owner: str) -> tuple:
@@ -199,7 +258,8 @@ class World:
 
         materials["plan"] = [
             f"{x.get('at')} {x.get('what')}"
-            + ("（做完了）" if x.get("done") else "")
+            + ("（过去了）" if x.get("done_by") == "elapsed"
+               else "（做完了）" if x.get("done") else "")
             for x in (getattr(self._life(), "plan", None) or [])
             if isinstance(x, dict)]
 
@@ -254,9 +314,11 @@ class World:
         materials["facts"] = facts
 
         try:
-            materials["talk"] = [
+            _hist_talk = [
                 f"{w}: {t}" for w, t in
                 (history.load(chat_id, limit=24) if chat_id else [])]
+            materials["talk"] = self._today_talk(
+                db, bank, chat_id, now, fallback=_hist_talk)
         except Exception:
             materials["talk"] = []
 
@@ -465,7 +527,23 @@ class World:
                 raw = call_model(mcfg, _sys, user)
                 parsed, err = N.parse(raw)
                 if not parsed:
-                    self._log(f"[复盘] 今天没写出来（{err}），跳过", "think")
+                    # ⚠ 失败也要 `mark_done`，否则 `due()` 在入睡前 30 分钟的
+                    # 窗口里一直为真，下一个 tick（5 秒后）就会再调一次模型 ——
+                    # 一次 JSON 抽风等于一整晚几百次调用。日志只写一行，
+                    # 看到的是"她今晚复盘的次数比聊天多"。
+                    #
+                    # 今天漏一次复盘的代价 << 每晚烧几百次模型的代价：
+                    # 明天照样复盘，而明天读的是明天那 24 小时。
+                    # 素材不足那条分支本来就是这么做的（见上），
+                    # 这里以前漏了，两条路不一致。
+                    self._log(f"[复盘] 今天没写出来（{err}），今天不再试", "think")
+                    N.mark_done(life, day=day)
+                    try:
+                        from bigfish import life as L
+
+                        L.save(life, force=True)
+                    except Exception:
+                        pass
                     return
 
                 receipt = N.apply_result(
@@ -493,7 +571,20 @@ class World:
                           + (f"｜{parsed.get('summary')}"
                              if parsed.get("summary") else ""), "in")
             except Exception as exc:
-                self._log(f"[复盘] 失败（明天再试）：{exc}", "")
+                # ⚠ 失败也要收口。`due()` 在入睡前 30 分钟里一直为真，
+                #   `_narrative_busy` 只挡并发、不挡重试 —— 这里以前什么都不做，
+                #   于是模型超时/429 一次，就每 5 秒重试一次，
+                #   直到窗口结束（最多几百次调用）。
+                #   日志还写着「明天再试」，和实际行为正好相反。
+                self._log(f"[复盘] 失败（今天不再试）：{exc}", "")
+                try:
+                    from bigfish import life as _L
+                    from bigfish import narrative as _N
+
+                    _N.mark_done(life, day=day)
+                    _L.save(life, force=True)
+                except Exception:
+                    pass
             finally:
                 self._narrative_busy = False
 

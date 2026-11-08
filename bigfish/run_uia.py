@@ -106,7 +106,6 @@ class BigFish:
         if mem:
             user_parts.append("## 你记得的事\n\n" + mem)
 
-        addr = self.soul.address or "对方"
         is_group = msg.chat_id.endswith("@chatroom")
         scene = (f"你在微信群「{msg.chat_name}」里，"
                  f"{msg.sender_name or '某人'} 刚说了话。" if is_group

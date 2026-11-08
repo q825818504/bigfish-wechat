@@ -206,7 +206,7 @@ async function loadMemoryStore(root, scope) {
  * stdout 一行 JSON，stderr 一律忽略（Python 那边的日志）。
  * 找不到 python / 超时 / 输出不是 JSON —— 一律返回 null，让调用方退回 ②。
  */
-async function localRecall(root, dbPath, query, maxChars, warnings) {
+async function localRecall(root, dbPath, query, maxChars, warnings, chat) {
   const py = process.env.BIGFISH_PYTHON ||
     (process.platform === 'win32' ? 'python' : 'python3');
   // ⚠ 必须显式要求 Python 用 UTF-8 写 stdout。
@@ -223,8 +223,13 @@ async function localRecall(root, dbPath, query, maxChars, warnings) {
     .filter(Boolean).join(process.platform === 'win32' ? ';' : ':') };
   try {
     const { spawnSync } = await import('node:child_process');
-    const r = spawnSync(py, ['-m', 'bigfish.memory', '--recall', dbPath,
-      '--query', query, '--maxChars', String(maxChars)],
+    // ⚠ `--session` 不是可选的优化项：不传就是全库检索，
+    //   跟 A 聊天时能捞到 B 的私聊原话。会话键的格式必须和
+    //   desktop.py 写库时一致（`wechat:<chat_id>`），否则过滤永远空。
+    const argv = ['-m', 'bigfish.memory', '--recall', dbPath,
+      '--query', query, '--maxChars', String(maxChars)];
+    if (chat) argv.push('--session', `wechat:${chat}`);
+    const r = spawnSync(py, argv,
       { encoding: 'utf-8', env, timeout: 15000, windowsHide: true });
     const raw = (r.stdout || '').trim();
     if (!raw) {
@@ -285,6 +290,11 @@ async function main() {
   const scope = args.scope;
   const query = args.query || '';
   const maxChars = Number(args.maxChars || 2400);
+  // 当前会话（chat_id）。只用来收紧**本地检索**的隔离：
+  // 退路 ②（legacyRecall 走原版 MemoryStore）没有这个参数，
+  // 那条路仍然可能跨会话取原文 —— 但它只在本地检索不可用时才走到，
+  // 而且在 Python 侧本地检索已经支持过滤之后，命中率会明显高于退路。
+  const chat = args.chat || '';
 
   if (!root) {
     console.log(JSON.stringify({ ok: false, error: '--root 必填' }));
@@ -369,7 +379,7 @@ async function main() {
     if (!dbPath) {
       warnings.push('找不到记忆库');
     } else {
-      memory = await localRecall(root, dbPath, query, maxChars, warnings);
+      memory = await localRecall(root, dbPath, query, maxChars, warnings, chat);
       if (!memory) {
         memory = await legacyRecall(root, scopeId, query, maxChars, dbPath, warnings);
       }

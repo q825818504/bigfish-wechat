@@ -66,6 +66,7 @@ import json
 import os
 import random
 import re
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -337,6 +338,18 @@ def load(root: Optional[str] = None) -> ProactiveState:
         st.sent_today = int(st.sent_today or 0)
     except Exception:
         st.sent_today = 0
+    # 惩罚字段也要收敛：老存档里没有这三项，手改过的 state.json 里可能是
+    # 字符串。`penalty()` 直接拿它和 now 比大小，类型不对会抛，
+    # 而那条路没有 try —— 一次脏值就能让主动开口整段失效。
+    try:
+        st.neglect_level = max(0, min(3, int(st.neglect_level or 0)))
+    except Exception:
+        st.neglect_level = 0
+    for _name in ("penalty_until", "last_check_in_at"):
+        try:
+            setattr(st, _name, float(getattr(st, _name) or 0.0))
+        except Exception:
+            setattr(st, _name, 0.0)
     return st
 
 
@@ -356,6 +369,19 @@ def save(st: ProactiveState, root: Optional[str] = None) -> bool:
             # 她会永远停在"从没努力过"的状态，加成永远不起作用。
             "miss_streak": int(getattr(st, "miss_streak", 0) or 0),
             "last_roll_at": float(getattr(st, "last_roll_at", 0.0) or 0.0),
+            # ── 被无视（p0-1）的三个字段 ──
+            #
+            # ⚠ 这三个以前没存。`miss_streak`（掷骰没中）存了，
+            #   但"被彻底放下"的惩罚没存 —— 于是重启一次，
+            #   neglect_level 归 0、penalty_until 归 0，
+            #   她满血回来继续找你。
+            #
+            #   症状是"她会往回收"这个卖点只在同一次运行里成立：
+            #   冷落三天、重启一次、又从"你最近很忙吗"开始。
+            #   惩罚必须活过重启，否则它不是性格，只是内存里的临时变量。
+            "neglect_level": int(getattr(st, "neglect_level", 0) or 0),
+            "penalty_until": float(getattr(st, "penalty_until", 0.0) or 0.0),
+            "last_check_in_at": float(getattr(st, "last_check_in_at", 0.0) or 0.0),
         })
         return True
     except Exception:
@@ -376,9 +402,40 @@ def roll_day(st: ProactiveState, now: float) -> bool:
     return True
 
 
+def stable_anchor(*parts: Any) -> float:
+    """跨进程稳定的去重锚点。
+
+    ⚠ 以前用的是内置 `hash()`。它对 str 每次进程启动都带随机 salt
+    （PYTHONHASHSEED），所以同一句话今天算出 A、明天算出 B ——
+    `used_anchors` 里存的那 40 个历史值跨重启全部失配，
+    去重实际上只在单次运行内有效。
+
+    而它唯一的用途恰恰是**跨天**：同一个生日、同一个话头别问第二遍。
+    于是症状是"重启之后她可以把同一个生日再问一次"，
+    只在重启后出现，最容易被当成"模型今天不听话"。
+
+    sha1 前 6 字节 ≈ 281 万亿种取值，撞车概率远低于一天几十条的量级。
+    """
+    raw = "\x1f".join(str(p) for p in parts).encode("utf-8")
+    return float(int.from_bytes(hashlib.sha1(raw).digest()[:6], "big") % 10_000_000)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 闸门
 # ══════════════════════════════════════════════════════════════════════
+
+def in_window(now: float) -> bool:
+    """现在是否在允许她主动开口的时间窗内。
+
+    单独抽出来是因为**追问也要用它**。追问同样是一句不请自来的话，
+    但它以前走的是另一条路（`due_followups`），只查间隔和概率，
+    完全不查时段 —— 于是 21:00 发出去、他没回的那条，会在 03:00
+    追一句「你怎么没回我」，她睡着照发。闸门管的不是「主动消息」，
+    管的是「所有她先开口的话」，两个入口必须共用同一套判断。
+    """
+    t = datetime.fromtimestamp(now)
+    return WINDOW_START <= (t.hour + t.minute / 60) <= WINDOW_END
+
 
 def gate_block_reason(st: ProactiveState, *, now: float, per_day: int,
                       life_state: Any, last_peer_at: float,
@@ -402,8 +459,7 @@ def gate_block_reason(st: ProactiveState, *, now: float, per_day: int,
         return f"距上一条还差 {left:.0f} 分钟"
 
     # 3. 时段
-    hour = datetime.fromtimestamp(now).hour + datetime.fromtimestamp(now).minute / 60
-    if not (WINDOW_START <= hour <= WINDOW_END):
+    if not in_window(now):
         return f"不在允许时段（{WINDOW_START:.0f}:00–{WINDOW_END:.0f}:30）"
 
     # 4. 她醒着吗
@@ -466,7 +522,7 @@ def candidate_open_loop(st: ProactiveState, *, chat_id: str, now: float,
     if lines and lines[-1][0] == me:
         return None
 
-    anchor = float(hash(text) % 10_000_000)     # 稳定的锚点，去重用
+    anchor = stable_anchor(text)     # 稳定的锚点，去重用
     if any(abs(a - anchor) < 1 for a in st.used_anchors):
         return None
 
@@ -668,7 +724,7 @@ def candidate_date(st: ProactiveState, *, chat_id: str, now: float,
             want = today + timedelta(days=delta)
             if target != want:
                 continue
-            anchor = float(abs(hash(f"{label}:{target.isoformat()}")) % 10_000_000)
+            anchor = stable_anchor(label, target.isoformat())
             if any(abs(a - anchor) < 1 for a in st.used_anchors):
                 continue
             when = "今天" if delta == 0 else "明天"
@@ -1045,8 +1101,26 @@ def followup_probability(*, bond_hit: bool, mood: float, energy: float) -> float
 
 def due_followups(st: ProactiveState, *, now: float, life_state: Any,
                   bond_hit: bool = False) -> List[Tuple[str, Dict[str, Any]]]:
-    """哪些会话该考虑追问了。返回 [(chat_id, awaiting_item)]。"""
+    """哪些会话该考虑追问了。返回 [(chat_id, awaiting_item)]。
+
+    ⚠ 追问也要过闸门。以前这里只查「间隔够不够」和「到没到时间」，
+    于是 21:00 发出去的那条会在 03:00 追问 —— 凌晨三点问「你怎么没回我」，
+    而且她还睡着。这不是"执着"，是骚扰，也是这个系统最容易被卸载的原因。
+
+    所以先跑一遍和主动开口同一套的硬闸门（睡着 / 太累 / 不在时段），
+    再谈概率。概率只决定"要不要"，闸门决定"能不能"。
+    """
     out: List[Tuple[str, Dict[str, Any]]] = []
+
+    # ── 硬闸门：睡着 / 太累 / 不在时段，一条都不追 ──
+    if life_state is not None:
+        if getattr(life_state, "asleep", False):
+            return []
+        if float(getattr(life_state, "energy", 100) or 0) < MIN_ENERGY:
+            return []
+    if not in_window(now):
+        return []
+
     try:
         from bigfish.vault import read_mood_state
 

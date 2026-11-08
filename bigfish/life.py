@@ -645,7 +645,15 @@ def current_plan_item(state: LifeState, now: float) -> str:
 
     取法：开始时间 ≤ 现在的最后一条。全是未来的话用第一条
     （刚醒来时第一条通常就是"洗漱/吃早饭"，用第一条比空着更像人）。
+
+    ⚠ 先校验 `plan_day`：这份 plan 是不是**今天**排的。
+      跨天之后旧 plan 还留在内存里（生成失败时特意保留，好过没有安排），
+      但它不能当今天用 —— 否则醒来第一句"我在收拾屋子"说的是昨天的事。
+      生成日程要调一次模型（几秒到几十秒），那段窗口以前就是这么错的。
     """
+    if (state.plan and state.plan_day and state.day
+            and state.plan_day != state.day):
+        return ""
     entries = []
     for item in state.plan or []:
         if not isinstance(item, dict):
@@ -668,8 +676,19 @@ def current_plan_item(state: LifeState, now: float) -> str:
     return chosen or entries[0][1]
 
 
-def mark_plan_done(state: LifeState, what: str, *, now: float) -> bool:
-    """标记某条日程做完了。按原文匹配，不做模糊 —— 宁可标不上，不要标错。"""
+def mark_plan_done(state: LifeState, what: str, *, now: float,
+                   by: str = "manual") -> bool:
+    """标记某条日程结束了。按原文匹配，不做模糊 —— 宁可标不上，不要标错。
+
+    `by` 决定这条是**怎么**结束的，渲染时要分开写：
+      · "manual"  用户/调用方明确说做完了 → 写「（做完了）」
+      · "elapsed" 那个时段过去了，她换去做下一件 → 写「（过去了）」
+
+    为什么必须分开：日程是"打算做什么"，不是"做了什么"。按时段过去就
+    一律标"做完了"，等于替她编一件她没做完的事 —— 和 D-36（事实要有
+    来源）直接冲突。但她确实在那个时段"在"做这件事（day_trace 有记录），
+    所以也不能当它没发生。"过去了"是唯一诚实的说法。
+    """
     for item in state.plan or []:
         if not isinstance(item, dict):
             continue
@@ -678,6 +697,7 @@ def mark_plan_done(state: LifeState, what: str, *, now: float) -> bool:
                 return False
             item["done"] = True
             item["done_at"] = float(now)
+            item["done_by"] = str(by or "manual")[:12]
             return True
     return False
 
@@ -699,6 +719,7 @@ def set_plan(state: LifeState, items: List[Dict[str, Any]], *,
             "at": at,
             "what": what,
             "done": bool(item.get("done")),
+            "done_by": str(item.get("done_by") or "")[:12],
             "shareable": item.get("shareable") is not False,
             "from": str(item.get("from") or "self")[:12],
         })
@@ -721,7 +742,8 @@ def plan_for_prompt(state: LifeState, *, now: float,
     entries = entries[:limit]
     lines = []
     for item in entries:
-        mark = "（做完了）" if item.get("done") else ""
+        mark = ("（过去了）" if item.get("done_by") == "elapsed"
+                else "（做完了）" if item.get("done") else "")
         lines.append(f"- {item.get('at')} {item.get('what')}{mark}")
     if not lines:
         return ""
@@ -816,6 +838,21 @@ def refresh_doing(state: LifeState, now: float) -> bool:
     label, items = _slot_for(now)
     if state.doing_slot == label and state.doing:
         return False
+    # 跨时段了：上一条"计划里的事"到此结束。
+    #
+    # 只在她**确实进入过那一条**时才记（`current_plan_item` 是唯一来源）。
+    # 静态池里的事（在看书 / 收拾屋子）不属于日程，不该出现在计划列表里，
+    # 也就不会被标成"过去了"。
+    #
+    # 以前这里什么都不做，于是 `done` 永远是 False：
+    #   · 渲染里的「（做完了）」三个字永远不会出现
+    #   · 「至少一条接昨天」只能接一条"看不出做没做完"的条目，
+    #     于是反复提同一件早就翻篇的事
+    _prev = str(state.doing or "").strip()
+    _plan_whats = {str(x.get("what") or "").strip()
+                   for x in (state.plan or []) if isinstance(x, dict)}
+    if _prev and _prev in _plan_whats:
+        mark_plan_done(state, _prev, now=now, by="elapsed")
     state.doing_slot = label
     state.doing = (current_plan_item(state, now)
                    or _pick_doing(day_key(now), label, items))

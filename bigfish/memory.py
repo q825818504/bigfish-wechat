@@ -266,6 +266,21 @@ DERIVED_STATEMENTS: Tuple[str, ...] = (
         last_message INTEGER NOT NULL DEFAULT 0,
         last_run INTEGER NOT NULL DEFAULT 0,
         last_error TEXT NOT NULL DEFAULT '')""",
+    # 反思水位（按会话）。
+    #
+    # ⚠ 上面那张表的主键只有 bank。一个库里只要有两个会话（私聊 + 群、
+    #   或者两个人），先反思的那个会把水位推到它自己那批的末尾，
+    #   另一个会话的消息 id 全都 <= watermark —— 于是**永不提炼**。
+    #   症状是"只有最近说话的那个人有事实记录"，非常难查：
+    #   日志里一切正常，只是另一个人永远是陌生人。
+    #
+    # 新表按 (bank, session) 分开记；老表保留不动，作兼容与汇总用。
+    """CREATE TABLE IF NOT EXISTS reflection_sessions (
+        bank TEXT NOT NULL, session TEXT NOT NULL,
+        last_message INTEGER NOT NULL DEFAULT 0,
+        last_run INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(bank, session))""",
 
     # ── v3：多用户隔离 ────────────────────────────────────────────────
     #
@@ -1613,7 +1628,8 @@ class MemoryUnavailable(RuntimeError):
 
 
 def _search_chunks_impl(path: str, bank: str, query: str, *, limit: int = 8,
-                        max_chars: int = 2400) -> List[Dict[str, Any]]:
+                        max_chars: int = 2400,
+                        session: str = "") -> List[Dict[str, Any]]:
     """原文检索：FTS5(bm25) 排序 → MMR 去冗余 → 按分数填满预算。
 
     返回 [{chunk, message, role, text, time, score}]。
@@ -1625,6 +1641,13 @@ def _search_chunks_impl(path: str, bank: str, query: str, *, limit: int = 8,
       4. 只读打开，不拷库。
 
     ⚠ 库打不开时抛 `MemoryUnavailable`（给降级用）；"没命中"仍然返回 []。
+
+    ⚠ `session` 是**谁在说话**（`wechat:<chat_id>`），不是可选的优化项。
+      以前这里的 SQL 只有 `m.bank = ?`，而 bank 恒为 "dafeiyu" ——
+      于是「你记得的事」这一段是全库共享的：跟 B 聊天时能检索到 A 的
+      私聊原话，降级到最近原文时更是直接取全库最新 N 条。
+      README 写着"你不会看到别人的私密内容"，facts 层做到了，原文层没有。
+      传空串时保持旧的全库行为，是为了不破坏 CLI 与自检的既有用法。
     """
     if not path or not os.path.isfile(path):
         raise MemoryUnavailable(f"记忆库不存在：{path or '(空路径)'}")
@@ -1640,13 +1663,19 @@ def _search_chunks_impl(path: str, bank: str, query: str, *, limit: int = 8,
         except Exception:
             raise MemoryUnavailable(f"记忆库打不开：{exc}") from exc
     try:
+        where = "search_index MATCH ? AND m.bank = ?"
+        params: List[Any] = [expr, bank]
+        if session:
+            where += " AND m.session = ?"
+            params.append(session)
+        params.append(max(20, int(limit) * 6))
         rows = conn.execute(
             "SELECT s.rowid AS chunk, bm25(search_index) AS rank "
             "FROM search_index s JOIN chunks c ON c.id = s.rowid "
             "JOIN messages m ON m.id = c.message "
-            "WHERE search_index MATCH ? AND m.bank = ? "
+            f"WHERE {where} "
             "ORDER BY rank LIMIT ?",
-            (expr, bank, max(20, int(limit) * 6))).fetchall()
+            params).fetchall()
         if not rows:
             return []
         idmap = {int(r["chunk"]): float(r["rank"]) for r in rows}
@@ -1715,7 +1744,7 @@ def _search_chunks_impl(path: str, bank: str, query: str, *, limit: int = 8,
 
 
 def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
-                  max_chars: int = 2400) -> List[Dict[str, Any]]:
+                  max_chars: int = 2400, session: str = "") -> List[Dict[str, Any]]:
     """兼容入口：任何失败都返回 []。
 
     老调用点（界面自检、CLI）用它，不需要处理异常；
@@ -1723,12 +1752,13 @@ def search_chunks(path: str, bank: str, query: str, *, limit: int = 8,
     """
     try:
         return _search_chunks_impl(path, bank, query, limit=limit,
-                                   max_chars=max_chars)
+                                   max_chars=max_chars, session=session)
     except Exception:
         return []
 
 
-def recent_chunks(path: str, bank: str, limit: int = 20) -> List[Dict[str, Any]]:
+def recent_chunks(path: str, bank: str, limit: int = 20,
+                  session: str = "") -> List[Dict[str, Any]]:
     """L2 兜底：不查 FTS，直接取最近 N 条原文。
 
     场景：FTS 索引坏了 / 查询词一个都没命中时，她至少还知道最近聊过什么。
@@ -1743,8 +1773,11 @@ def recent_chunks(path: str, bank: str, limit: int = 20) -> List[Dict[str, Any]]
             "SELECT c.id AS chunk, c.text, c.message, m.role, "
             "COALESCE(m.source_time, m.recorded_at) AS t "
             "FROM chunks c JOIN messages m ON m.id = c.message "
-            "WHERE m.bank = ? ORDER BY t DESC LIMIT ?",
-            (bank, max(1, int(limit)))).fetchall()
+            "WHERE m.bank = ?"
+            + (" AND m.session = ?" if session else "")
+            + " ORDER BY t DESC LIMIT ?",
+            ((bank, session, max(1, int(limit))) if session
+             else (bank, max(1, int(limit))))).fetchall()
         out = []
         n = len(rows) or 1
         for i, r in enumerate(rows):
@@ -1765,7 +1798,8 @@ def recent_chunks(path: str, bank: str, limit: int = 20) -> List[Dict[str, Any]]
 
 
 def search_with_fallback(path: str, bank: str, query: str, *,
-                         limit: int = 8, max_chars: int = 2400
+                         limit: int = 8, max_chars: int = 2400,
+                         session: str = ""
                          ) -> Tuple[List[Dict[str, Any]], str]:
     """带降级的检索：返回 (items, level)。
 
@@ -1773,15 +1807,19 @@ def search_with_fallback(path: str, bank: str, query: str, *,
       · "ok"      正常（含"确实没命中"——那不是降级）
       · "recent"  检索失败，退回最近 N 条原文
       · "empty"   记忆库打不开，只能空记忆
+
+    ⚠ 降级也要守 `session`：`recent_chunks` 是全库取最新 N 条，
+      不传 session 的话"兜底"会比正常检索更容易串人。
     """
     try:
         items = _search_chunks_impl(path, bank, query, limit=limit,
-                                    max_chars=max_chars)
+                                    max_chars=max_chars, session=session)
         return items, "ok"
     except Exception:
         pass
     try:
-        return recent_chunks(path, bank, limit=max(5, min(limit, 20))), "recent"
+        return recent_chunks(path, bank, limit=max(5, min(limit, 20)),
+                             session=session), "recent"
     except Exception:
         return [], "empty"
 
@@ -1825,10 +1863,12 @@ def render_recall(items: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def recall_text(path: str, bank: str, query: str, *, max_chars: int = 2400) -> str:
+def recall_text(path: str, bank: str, query: str, *, max_chars: int = 2400,
+                session: str = "") -> str:
     """检索并渲染。失败返回空串，绝不抛 —— 记忆坏了不能拖垮聊天。"""
     try:
-        return render_recall(search_chunks(path, bank, query, max_chars=max_chars))
+        return render_recall(search_chunks(path, bank, query,
+                                          max_chars=max_chars, session=session))
     except Exception:
         return ""
 
@@ -2767,7 +2807,8 @@ REFLECT_SYSTEM = """你在帮一个角色把她记得的事整理成「事实」
 4. object 是具体内容，一句话，不要带"她说""好像"这类转述前缀。
 5. confidence 0~1：原文明确陈述 0.8~0.9；从语气推测 0.4~0.6；玩笑/气话/客套 0.2~0.3
    或干脆不提。
-6. chunks 填支持这条事实的原文编号（下面每行开头的 [n]），至少一个。
+6. chunks 填支持这条事实的**真实编号**：每行括号里 `chunk` 后面那个数字
+   （例：`[3] (chunk 247)` 就填 247，不是填 3）。至少一个。
    **这个编号会被程序拿去核对**，填一个不存在的编号这条事实会被直接丢掉。
 7. evidence 摘 20 字以内的原话片段作依据。
 8. **不确定就少提**。宁缺毋滥：一次情绪、玩笑、客套不能变成长期标签。
@@ -3137,8 +3178,9 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
     except Exception as exc:
         return {"ok": False, "error": str(exc), "added": 0}
     try:
-        st = conn.execute("SELECT * FROM reflection_state WHERE bank=?",
-                          (bank,)).fetchone()
+        st = conn.execute(
+            "SELECT * FROM reflection_sessions WHERE bank=? AND session=?",
+            (bank, session)).fetchone()
         watermark = int(st["last_message"] or 0) if st else 0
         rows = conn.execute(
             "SELECT id, role, text, COALESCE(source_time, recorded_at) AS t "
@@ -3148,12 +3190,18 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
             return {"ok": True, "added": 0, "repaired": 0, "skipped": True,
                     "reason": "没有新消息"}
         lines, chunk_ids, names = [], [], []
+        # 行号 → 这一行真正的 chunk id（一行可能切成多片）。
+        # 提示词里每行长这样：`[3] (chunk 247,248) 对方：...` ——
+        # 行号和真实 id 是两个不同的数，而核对要的是后者。
+        # 这里把映射留住，好在核对时把"模型填了行号"也救回来。
+        line_chunks: Dict[int, List[int]] = {}
         for i, r in enumerate(rows, 1):
             who = "她" if r["role"] == "assistant" else "对方"
             chunk_rows = conn.execute(
                 "SELECT id FROM chunks WHERE message=?", (int(r["id"]),)).fetchall()
             cids = [int(c[0]) for c in chunk_rows]
             chunk_ids.extend(cids)
+            line_chunks[i] = list(cids)
             tag = ",".join(str(c) for c in cids) or "-"
             lines.append(f"[{i}] (chunk {tag}) {who}：{r['text'][:400]}")
         # 锚点表没有 owner 列 —— 锚点是"这个名字指的是谁"，天然共享；
@@ -3171,8 +3219,8 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
             raw = call_model(REFLECT_SYSTEM, user)
         except Exception as exc:
             conn.execute(
-                "INSERT INTO reflection_state(bank,session,last_message,last_run,last_error) "
-                "VALUES(?,?,?,?,?) ON CONFLICT(bank) DO UPDATE SET "
+                "INSERT INTO reflection_sessions(bank,session,last_message,last_run,last_error) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(bank,session) DO UPDATE SET "
                 "last_run=excluded.last_run, last_error=excluded.last_error",
                 (bank, session, watermark, now, str(exc)[:300]))
             conn.commit()
@@ -3183,11 +3231,23 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
         mirrored = 0
         failed = []
         for f in facts:
-            # ⚠ 模型给的 chunk 编号只当**线索**：取与本批原文的交集。
-            #   交集为空说明它指的是一条不存在的来源 —— 以前这里是
-            #   `or chunk_ids[:1]`，等于**替模型伪造一个来源**，然后照写不误。
-            #   这和"任何记忆都要有来源"是直接冲突的，所以改成拒收。
-            picked = [c for c in f.source_chunks if c in valid_chunks]
+            # ⚠ 模型给的编号有两种可能，必须都认：
+            #   · 提示词要求填 `chunk` 后面那个**真实 id**（比如 247）；
+            #   · 但历史提示词只教了"每行开头的 [n]"，老模型/缓存会填**行号**。
+            #
+            #   以前这里只认 chunk id。于是只要库里有历史，第 1 行的
+            #   chunk id 就不是 1，模型填 `[1]` → `1 ∈ {247,…}` 为假 →
+            #   **整条事实被拒收**。facts 表长期为 0、日志成片
+            #   "来源编号无效"、她"记得却不完全记得"，根因都在这一行。
+            #
+            #   交集为空仍然拒收（不能替模型伪造来源）—— 这一点没变。
+            picked: List[int] = []
+            for c in f.source_chunks:
+                if c in valid_chunks:
+                    picked.append(c)
+                elif c in line_chunks:
+                    picked.extend(x for x in line_chunks[c] if x in valid_chunks)
+            picked = list(dict.fromkeys(picked))
             if not picked:
                 failed.append(f"{f.predicate}: 来源编号无效（{f.source_chunks[:3]}），拒收")
                 continue
@@ -3226,9 +3286,9 @@ def reflect_on_session(path: str, bank: str, session: str, call_model,
                         failed.append(f"{f.predicate}: 锚点 {err_a}")
         last_id = int(rows[-1]["id"])
         conn.execute(
-            "INSERT INTO reflection_state(bank,session,last_message,last_run,last_error) "
-            "VALUES(?,?,?,?,'') ON CONFLICT(bank) DO UPDATE SET "
-            "session=excluded.session, last_message=excluded.last_message, "
+            "INSERT INTO reflection_sessions(bank,session,last_message,last_run,last_error) "
+            "VALUES(?,?,?,?,'') ON CONFLICT(bank,session) DO UPDATE SET "
+            "last_message=excluded.last_message, "
             "last_run=excluded.last_run, last_error=''",
             (bank, session, last_id, now))
         conn.commit()
@@ -3318,6 +3378,9 @@ def rebuild_derived(path: str, *, rebuild_facts: bool = False) -> Dict[str, Any]
                 conn.execute("DELETE FROM facts")
                 conn.execute("DELETE FROM fact_events")
                 conn.execute("DELETE FROM reflection_state")
+                # 水位表有两张，漏一张的话重建索引之后旧水位还在，
+                # 新消息会被判成"已经提炼过"，事实层重新变成空的。
+                conn.execute("DELETE FROM reflection_sessions")
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         return {"ok": True, "chunks": n}
     except Exception as exc:
@@ -3413,6 +3476,7 @@ def _cli(argv: Sequence[str]) -> int:
     query = ""
     max_chars = 2400
     bank = ""
+    session = ""
     i = 0
     while i < len(args):
         a = args[i]
@@ -3433,6 +3497,11 @@ def _cli(argv: Sequence[str]) -> int:
         elif a == "--bank" and i + 1 < len(args):
             bank = args[i + 1]
             i += 1
+        elif a == "--session" and i + 1 < len(args):
+            # 只检索这一个会话的原话。bridge.mjs 会把当前 chat_id 拼成
+            # `wechat:<chat_id>` 传下来 —— 不传就是全库（老行为）。
+            session = args[i + 1]
+            i += 1
         i += 1
 
     if cmd == "health":
@@ -3441,7 +3510,8 @@ def _cli(argv: Sequence[str]) -> int:
     if not db or not query:
         print(json.dumps({"ok": False, "error": "缺少 db 或 query"}, ensure_ascii=False))
         return 2
-    items = search_chunks(db, bank or _default_bank(db), query, max_chars=max_chars)
+    items = search_chunks(db, bank or _default_bank(db), query,
+                          max_chars=max_chars, session=session)
     print(json.dumps({
         "ok": bool(items),
         "text": render_recall(items),

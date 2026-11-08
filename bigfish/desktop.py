@@ -869,7 +869,7 @@ class EngineWorker(QThread):
         # 局部 import：桥接起不来不该拖垮整个程序启动（和 memory 同一个理由）
         from bigfish.bridge_client import load_context
 
-        ctx = load_context(query=incoming or "")
+        ctx = load_context(query=incoming or "", chat=chat_id)
         # 桥接挂了不能等于她失忆：降级状态要让用户看见，否则
         # "她怎么不记得了"会被当成记忆坏了，实际是 Node 没起来。
         if getattr(ctx, "degraded", ""):
@@ -1050,7 +1050,7 @@ class EngineWorker(QThread):
                 # 用上一轮她说的话 + 更早一轮你说的话当第二查询
                 alt = " ".join(t for _w, t in hist[-3:])
                 if alt.strip() and alt.strip() != (incoming or "").strip():
-                    extra_ctx = load_context(query=alt.strip()[:200])
+                    extra_ctx = load_context(query=alt.strip()[:200], chat=chat_id)
                     extra_mem = extra_ctx.render_memory()
                     if extra_mem:
                         mem_now = (mem_now + "\n" + extra_mem).strip()
@@ -1449,7 +1449,7 @@ class EngineWorker(QThread):
 
                 # 判定前先记住此刻。余韵的判据是**真实差值**，
                 # 不是模型自报的 moodDelta（那个已经除过 3、还夹过界）。
-                before: Dict[str, Any] = {}
+                before: dict = {}
                 try:
                     before = mood_judge.read_mood_state_now() or {}
                 except Exception:
@@ -1529,10 +1529,24 @@ class EngineWorker(QThread):
         import time as _t
 
         now = _t.time()
-        last = getattr(self, "_last_reflect", 0.0)
-        if now - last < 600:
+        # ⚠ 限频要**按会话**，不能一个全局变量。
+        #
+        #   以前这里是 `self._last_reflect` 一个数：群里聊十句，私聊这
+        #   十分钟里的消息就一条都不反思了。而水位是按会话推进的，那些
+        #   被跳过的消息随后会被水位跨过去 —— 于是**永久**不会被提炼。
+        #
+        #   症状：只有最近说话的那个会话有事实，其他会话永远是陌生人。
+        #   闸门只是省调用的，它不该改变"哪些消息会被记住"。
+        if not isinstance(getattr(self, "_last_reflect_by_chat", None), dict):
+            self._last_reflect_by_chat = {}
+        _last_map = self._last_reflect_by_chat
+        if now - float(_last_map.get(chat_id, 0.0)) < 600:
             return
-        self._last_reflect = now
+        _last_map[chat_id] = now
+        # 顺手收敛：只留最近 50 个会话，否则这是个只增不减的字典。
+        if len(_last_map) > 50:
+            for _k in sorted(_last_map, key=lambda k: _last_map[k])[:-50]:
+                _last_map.pop(_k, None)
 
         def work() -> None:
             try:
@@ -2449,14 +2463,30 @@ class EngineWorker(QThread):
                     #   所以每轮都做；"够不够格"由跨天数判定，不在这里判。
                     try:
                         if body:
+                            # ⚠ 必须在这里 import `memory`。
+                            #   以前写的是 `_M.observe_habit(...)`，而 `_M`
+                            #   在这个作用域**根本没有定义** → NameError →
+                            #   被下面的 `except Exception: pass` 吞掉。
+                            #   于是习惯层从来没有过任何一条观察：
+                            #   `habits` 表恒空、score 永不衰减、
+                            #   「对方反复说过的事」那一段永远不出现。
+                            #   这类 bug 不会报错、不会进日志，只会让一个功能
+                            #   安静地不存在 —— 比崩溃难查十倍。
+                            from bigfish import memory as _M
                             from bigfish import vault as _v2
+
                             _M.observe_habit(_v2.memory_db_path(), "dafeiyu",
                                              _owner, body,
                                              at=_source_ms(msg))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._log(f"[习] 观察失败：{exc}", "")
                 else:
-                    self._log(f"[发送失败] {r.detail}", "err")
+                    # 失败原因在循环里已经逐条记过（`[发] ✗/?` + 记账回滚）。
+                    # 这里以前是 `f"[发送失败] {r.detail}"`，而 `r` 在
+                    # 这个作用域不存在 —— 第一条就发失败时它会抛 NameError，
+                    # 而外层只 `except SendError`，捕获不到，
+                    # 会一直冒到 watcher 的线程里。现在只留一句结论。
+                    self._log("[发] 这一轮一条都没发出去", "err")
             except SendError as exc:
                 self._log(f"[发送失败] {exc}", "err")
                 self.failed.emit(str(exc))
