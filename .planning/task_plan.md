@@ -1,5 +1,10 @@
 # 任务计划
 
+> ⚠ **推送前先看** [git-push.md](git-push.md)：这个仓库的 git 凭证已经配好
+> （令牌在 `D:\大脑\github.txt`），push / 建 Release 不弹窗。
+> 卡住的话跑一次 `python tools/setup-git-token.py`。
+
+
 > 2026-11-08 10:00 更新（**v0.9.7 已发布**）
 
 ## 发布策略
