@@ -999,14 +999,14 @@ class World:
             return
 
         # ⚠ 这个 `me` 只用来在 hist 里区分"谁说的"，所以**必须**和
-        #   `history.append` 存进去的那个值一致 —— 那里存的是 soul.address
-        #   （「爸」）。以前这里算的是 soul.name（「大肥鱼」）或 wxid，
-        #   两边永远不相等，于是 `candidate_open_loop` 会把**她自己最后说的
-        #   那句话**当成"他最后说的是……"。
-        soul = self._soul()
+        #   `history.append` 存进去的那个值一致 —— 两边都改成「我」。
+        #
+        #   以前两处都用 soul.address（「爸」）：那是**她对主人的称呼**。
+        #   一来它不是她的名字，二来她对四条丶说话时也写着「爸」，
+        #   history 里就变成「爸: 当然是我自己的呀」—— 下一轮 prompt
+        #   会把这句话当成对方说的（2026-11-08 用户发现日志把四条丶写成"爸"）。
+        #   固定用「我」最稳：对方不会自称「我」。
         me = "我"
-        if soul is not None:
-            me = str(getattr(soul, "address", "") or "我")
 
         cands = P.collect(
             pro, chat_id=chat_id, now=now, me=me,
@@ -1323,11 +1323,8 @@ class World:
         try:
             from bigfish import history
 
-            who = "我"
-            soul = self._soul()
-            if soul is not None:
-                who = str(getattr(soul, "address", "") or "我")
-            history.append(chat_id, who, text)
+            # 和引擎回复用同一个署名（见上面 `me` 的注释）
+            history.append(chat_id, "我", text)
         except Exception:
             pass
 

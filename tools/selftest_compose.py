@@ -71,10 +71,17 @@ class FakeEngine:
         self._life = None
         self.mcfg = None
         self.reader = None
+        self.owner_id = ""
         self.logs: list[str] = []
 
     def _log(self, text: str, kind: str = "") -> None:
         self.logs.append(text)
+
+    def _peer_name_parts(self, chat_id, chat_name, sender_name=""):
+        # 用真实实现：称呼规则本身也是"她是谁"的一部分，
+        # 假一个回去，这条自检就测不到「对四条丶却叫爸」那类错。
+        return D.EngineWorker._peer_name_parts(
+            self, chat_id, chat_name, sender_name)
 
 
 def main() -> int:
@@ -146,6 +153,35 @@ def main() -> int:
     check("system 里有末尾守卫（9990）",
           any("资料" in s and "要求" in s for s in a["sys_parts"]),
           str([s[:20] for s in a["sys_parts"]]))
+
+    # ── 称呼必须按会话走 ──
+    #
+    # 2026-11-08 用户发现：四条丶问「你主人是谁」，心情日志写成
+    # 「爸突然问她主人是谁」。根因是 soul.address（她对主人的称呼）
+    # 被当成所有人的称呼。这三条守的就是它。
+    from bigfish import memory as _M
+
+    e.owner_id = _M.owner_of_private("wxid_selftest")
+    addr = (soul.address or "").strip()
+    if addr:
+        check("主人私聊用她平时叫他的那个称呼",
+              e._peer_name_parts("wxid_selftest", "老爸", "") == addr,
+              e._peer_name_parts("wxid_selftest", "老爸", ""))
+    check("其他人用会话名，不是「爸」",
+          e._peer_name_parts("wxid_other", "四条丶", "") == "四条丶",
+          e._peer_name_parts("wxid_other", "四条丶", ""))
+    check("群聊用说话人",
+          e._peer_name_parts("123@chatroom", "某个群", "四条丶") == "四条丶",
+          e._peer_name_parts("123@chatroom", "某个群", "四条丶"))
+    if addr:
+        # 人格段里那句「称呼对方「爸」」必须被换掉，否则她会对着四条丶叫爸
+        c = D.EngineWorker._compose(
+            e, **{**kw, "chat_id": "wxid_other", "chat_name": "四条丶",
+                  "is_owner_chat": False, "owner_id": e.owner_id})
+        head = c["sys_parts"][0] if c["sys_parts"] else ""
+        check("人格段里的称呼跟着会话换",
+              f"称呼对方「{addr}」" not in head and "四条丶" in head,
+              head[:80])
 
     # ── 出口 ──
     from bigfish import proactive as P

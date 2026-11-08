@@ -296,6 +296,51 @@ def test_adaptive() -> None:
           len(out) == 1 and len(out[0].messages) == 3, f"{out}")
 
 
+def test_post_reply_grace() -> None:
+    """她刚说完话，对方接着说的算同一话题。
+
+    2026-11-08 用户现场：她回完一句，对方隔几秒补一句，她再回一条——
+    看起来像两个人在互刷。根因是这种情况走的是普通窗口（4 秒），
+    没有"她刚说完"这个上下文。
+    """
+    # 1) 她 0s 说完，对方 1s 继续说 → 等满 6s 冷却
+    clock = Clock()
+    b = L.MessageBatcher(clock=clock)
+    b.feed(msg("c1", "小明", "那你说说", at=1.0), replied_at=0.0)
+    clock.now = 4.0
+    check("冷却期内 4s 不封批", b.tick() == [], "sealed too early")
+    clock.now = 6.0
+    out = b.tick()
+    check("冷却 6s 到期封批", len(out) == 1, f"{out}")
+
+    # 2) 她 0s 说完，对方 5s 才说 → 冷却只剩 1s，但普通窗口（4s）更长，
+    #    取两者较大值：宁可多等，也别在她刚说完就抢话
+    clock = Clock()
+    b = L.MessageBatcher(clock=clock)
+    b.feed(msg("c1", "小明", "那你说说", at=5.0), replied_at=0.0)
+    clock.now = 8.9
+    check("冷却叠加普通窗口（不提前封批）", b.tick() == [], "sealed early")
+    clock.now = 9.0
+    check("冷却叠加后 9s 封批", len(b.tick()) == 1, "did not seal")
+
+    # 3) 距她说完已经 10s → 超过冷却，按普通窗口（短消息 4s）
+    clock = Clock()
+    b = L.MessageBatcher(clock=clock)
+    b.feed(msg("c1", "小明", "在吗", at=10.0), replied_at=0.0)
+    clock.now = 12.0
+    check("冷却过期后走普通窗口", b.tick() == [], "sealed too early")
+    clock.now = 14.0
+    check("普通窗口 4s 封批", len(b.tick()) == 1, "did not seal")
+
+    # 4) 被 @ 时不加冷却（对方在叫你，别让人等）
+    clock = Clock()
+    b = L.MessageBatcher(clock=clock)
+    b.feed(msg("c1", "小明", "@大肥鱼 在吗", at=1.0, at_bot=True),
+           replied_at=0.0)
+    clock.now = 2.1
+    check("@ 不套冷却（1s 就回）", len(b.tick()) == 1, "被冷却拖住了")
+
+
 def main() -> int:
     print("=" * 66)
     print("倾听层自检（攒批 / 到期 / 硬上限 / 自适应窗口）")
@@ -304,6 +349,7 @@ def main() -> int:
     test_listen()
     test_adaptive()
     test_transcript()
+    test_post_reply_grace()
 
     print("\n" + "=" * 66)
     if FAIL:

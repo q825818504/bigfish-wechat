@@ -58,7 +58,7 @@ class ListenPolicy:
     #: 单条最短间隔（同一会话 0.3s 内的重复推送视为同一条）
     min_gap: float = 0.3
 
-    # ── 自适应窗口（v0.5.1）──
+    # ── 自适应窗口（v0.10.5）──
     #
     # 固定的 quiet_same_author 有个根本问题：**短消息和长消息的"说完程度"不一样**。
     #
@@ -79,6 +79,14 @@ class ListenPolicy:
 
     #: 关掉自适应就退回固定 quiet_same_author（老行为）
     adaptive: bool = True
+
+    # ── 回复后冷却（2026-11-08 加）──
+    #
+    # 她刚回完一句，对方接着说 —— 那是**同一个话题在继续**，不该马上再回一次。
+    # 以前这种情况按普通窗口（4 秒）走：对方隔 5 秒补一句，她就再回一条，
+    # 两个人变成一问一答地刷屏（用户原话：「没有将它合并看待」）。
+    # 现在：她说完之后 `post_reply_grace` 秒内到达的消息，等满这个冷却再封批。
+    post_reply_grace: float = 6.0
 
 
 #: 句末标点：说完了
@@ -195,8 +203,13 @@ class MessageBatcher:
         self._buckets: Dict[str, _Bucket] = {}
 
     # ------------------------------------------------------------------
-    def feed(self, msg: BatchMessage) -> Optional[Batch]:
-        """收一条消息。返回非 None 表示这一批已经满了、需要立刻处理。"""
+    def feed(self, msg: BatchMessage,
+             replied_at: Optional[float] = None) -> Optional[Batch]:
+        """收一条消息。返回非 None 表示这一批已经满了、需要立刻处理。
+
+        `replied_at` 是"她上一次在这个会话说话"的 monotonic 时刻 ——
+        传进来才会启用回复后冷却（见 ListenPolicy.post_reply_grace）。
+        """
         if msg.is_self:
             return None
         now = self._clock()
@@ -234,6 +247,14 @@ class MessageBatcher:
                 quiet = min(quiet, self.policy.quiet_mention)
             elif msg.is_bare_media:
                 quiet = max(quiet, self.policy.quiet_media)
+
+            # 她刚说完话：对方接着说的这一串算同一话题，等满冷却再封批。
+            # 被 @ 时不加 —— 那是明确在叫她，让人等着才奇怪。
+            if (not msg.at_bot) and replied_at:
+                since = at - float(replied_at)
+                grace = float(self.policy.post_reply_grace or 0.0)
+                if 0 <= since < grace:
+                    quiet = max(quiet, grace - since)
 
             deadline = at + quiet
             # 硬上限：永远不超过第一条 + max_wait

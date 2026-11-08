@@ -385,15 +385,35 @@ class WeChatUIA:
         """
         if diag is not None:
             diag.update({'win32': bool(_HAS_WIN32), 'matched': 0, 'kept': 0,
-                         'dropped_no_dll': 0})
+                         'dropped_no_dll': 0, 'error': ""})
         if not _HAS_WIN32:
             return []
         res = []
+
+        def _is_hung(h) -> bool:
+            """窗口是否已「未响应」——和任务管理器里那个标记同一个判据。
+
+            ⚠ pywin32 **没有** ``win32gui.IsHungAppWindow``。
+              2026-11-08 在这里直接写了 win32gui.IsHungAppWindow(h)，
+              抛 AttributeError 被外层 `except Exception: pass` 吞掉，
+              于是**每一个窗口都被跳过**：matched=0 → _find_main()=None →
+              UIA 永远「未就绪」，而微信窗口明明好好的。
+              必须走 ctypes，并且把失败记进 diag，别再让它静默。
+            """
+            try:
+                return bool(ctypes.windll.user32.IsHungAppWindow(h))
+            except Exception:
+                return False
 
         def cb(h, _):
             try:
                 title = win32gui.GetWindowText(h)
                 if win32gui.IsWindowVisible(h) and _title_is_main(title):
+                    # 微信从托盘恢复时会重建顶层窗口，旧的那个还留在窗口站里：
+                    # 标题照样是「微信」，但界面已经点不动了。挑到它的症状是
+                    # 「点它没反应、ShowWindow 也唤不回来」。
+                    if _is_hung(h):
+                        return True
                     if diag is not None:
                         diag['matched'] += 1
                     pid = self._pid_from_hwnd(h)
@@ -404,8 +424,9 @@ class WeChatUIA:
                             diag['kept'] += 1
                     elif diag is not None:
                         diag['dropped_no_dll'] += 1
-            except Exception:
-                pass
+            except Exception as exc:
+                if diag is not None:
+                    diag['error'] = f"{type(exc).__name__}: {exc}"[:160]
             return True
         try:
             win32gui.EnumWindows(cb, None)

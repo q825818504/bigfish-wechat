@@ -165,16 +165,27 @@ async function refreshStatus() {
     const pb = $('#btnPower');
     pb.classList.toggle('is-on', s.running);
 
-    setText('#ovState', s.running ? '运行中' : (s.error ? '出错了' : '未启动'));
+    // 运行中但发送通道不可用 = 只监听不发送。必须当场说，
+    // 否则用户以为启动成功了，等她回话等到天亮（2026-11-08 现场）。
+    const sendDown = !!s.running && !s.dry && s.sender === false;
+    setText('#ovState', s.running
+      ? (sendDown ? '运行中 · 发不出去' : '运行中')
+      : (s.error ? '出错了' : '未启动'));
     setText('#ovStateHint', s.running
-      ? '她在听着。微信里有人说话就会回。'
+      ? (sendDown
+          ? (s.error || '微信窗口没打开：现在只监听、不发送。打开微信窗口后会自动恢复。')
+          : '她在听着。微信里有人说话就会回。')
       : (s.error || '登录并选择会话后，点右侧按钮启动。'));
-    setText('#statusText', s.running ? '运行中' : (s.error ? '出错' : '未启动'));
-    setDot(s.running ? 'on' : (s.error ? 'err' : ''));
+    setText('#statusText', s.running
+      ? (sendDown ? '发不出去' : '运行中')
+      : (s.error ? '出错' : '未启动'));
+    setDot(s.running && !sendDown ? 'on' : (s.error || sendDown ? 'err' : ''));
 
     const tag = $('#ovPowerTag');
-    tag.textContent = s.running ? `监听 ${s.watching || 0} 个会话` : '等待启动';
-    tag.className = 'tag' + (s.running ? ' ok' : '');
+    tag.textContent = s.running
+      ? (sendDown ? '只监听 · 不发送' : `监听 ${s.watching || 0} 个会话`)
+      : '等待启动';
+    tag.className = 'tag' + (s.running && !sendDown ? ' ok' : '');
 
     $('#ovRecv').innerHTML = `${s.recv ?? 0}<small>条</small>`;
     $('#ovReply').innerHTML = `${s.reply ?? 0}<small>条</small>`;
@@ -242,8 +253,14 @@ $('#btnRecheck').addEventListener('click', async () => {
 $('#btnDiagnose').addEventListener('click', () => $('#btnRecheck').click());
 $('#btnOpenWechat').addEventListener('click', async () => {
   if (!S.bridge) return;
-  await S.bridge.open_wechat();
-  toast('已尝试打开微信');
+  try {
+    // open_wechat 现在返回 {ok, msg}：微信收在托盘时 ShowWindow 可能只叫出
+    // 一个"空壳窗口"（点不动、X 也关不掉），必须把恢复路径说给用户。
+    const r = JSON.parse(await S.bridge.open_wechat());
+    toast(r.msg || (r.ok ? '已尝试打开微信' : '没找到微信窗口'));
+  } catch (e) {
+    toast('打开微信失败');
+  }
 });
 
 /* ────────── 会话 ────────── */
@@ -602,7 +619,8 @@ async function saveWatch() {
       JSON.stringify([...S.watching])));
     if (r.error) return toast(r.error);
     S.watchDirty = false;
-    toast('已保存 · 这 ' + S.watching.size + ' 个会话会持续监听');
+    toast('已保存 · 这 ' + S.watching.size + ' 个会话会持续监听'
+          + (r.hot ? '（已即时生效，不用重启）' : ''));
     updateWatchBar();
   } catch (e) {
     toast('保存失败');

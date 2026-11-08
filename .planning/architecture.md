@@ -364,11 +364,33 @@ DragFinish                  必须调，否则第二次拖放失败
   └── Backend          Slot 接口
         ↕ 信号
   QThread (EngineWorker)
-        └── MessageWatcher（内部再起一个轮询线程）
-        └── 模型调用（阻塞，但不影响界面）
-        └── UIA 发送（阻塞）
-        └── threading.Thread × N  心情判断（daemon，跑完就退）
+        ├── MessageWatcher（内部一个 1.2s 轮询线程）
+        ├── bigfish-batch   防抖：每 200ms 封批，只入队
+        ├── bigfish-gen1/2  生成：模型 / 切条 / 挑图（每会话一把锁）
+        ├── bigfish-send    投递：唯一碰 UIA 的线程
+        └── threading.Thread × N  心情判断 / 反思（daemon，跑完就退）
 ```
+
+三段式（2026-11-08，见 D-109）：
+
+```
+watcher → batcher ──封批──► gen_queue ──► gen×2 ──► outbox ──► send×1
+          防抖窗口           有界 64      并行          FIFO      串行
+```
+
+**为什么生成能并行、投递不能**：
+
+模型调用是同步 HTTP，两个会话可以同时在各自线程里「想」；
+但微信只有一个窗口、一个输入框、一个剪贴板 —— 两个线程同时写会发错人。
+`UiaSender.send/send_media` 外面还有一把 `_UIA_SEND_LOCK` 兜底，
+补一句、主动消息、表情包都从同一道闸门排队。
+
+**同一会话一把锁**：从开始生成到投递完成。保证她记得自己刚说了什么；
+代价是同一会话的下一批要等这条发完（聊天本来就是一來一回）。
+
+**预算与观测**：生成 90 秒（`turn_timeout`，可 per-chat），超时丢弃；
+这一轮用掉 60% 预算时跳过挑图。`data/turns.jsonl` 每轮记
+wait / gen / queue / send 四段 + outcome，排查「她为什么慢」用它。
 
 **心情判断为什么要单起线程**：
 它要调一次模型（1~2 秒）。如果同步做，两条消息紧接着来时会明显卡顿 ——

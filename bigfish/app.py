@@ -379,7 +379,7 @@ class BigFishApp:
                             _who = identity.for_message(m, me_id).who
                         if (int(getattr(m, "local_id", 0)) > base_id
                                 and _who == identity.WHO_SELF):
-                            conv.add(self.soul.address or "我", m.content)
+                            conv.add("我", m.content)
                             return
                 except Exception:
                     return
@@ -484,7 +484,7 @@ class BigFishApp:
             "也不要把标记写进正文"
         )
         user_parts.append("## 最近的对话\n\n"
-                          + conv.transcript(self.soul.address or "我"))
+                          + conv.transcript("我"))
         return ("\n".join(sys_parts).strip(), "\n\n".join(user_parts))
 
     # ------------------------------------------------------------------
@@ -709,7 +709,7 @@ class BigFishApp:
 
         if self.dry:
             self.log(f"[预演] {reply!r}")
-            conv.add(self.soul.address or "我", reply)
+            conv.add("我", reply)
             return
 
         # 分条 + 节奏 + 逐条确认
@@ -741,7 +741,7 @@ class BigFishApp:
             strict_confirm=self.cfg.strict_confirm,
             final_async_confirm=self._say_async_confirm,
             ledger=self.ledger,
-            on_confirmed=lambda _i, m: conv.add(self.soul.address or "我", m.content),
+            on_confirmed=lambda _i, m: conv.add("我", m.content),
         )
         if outcome.pending is not None:
             self._spawn_confirm(outcome.pending, last.chat_name, conv)

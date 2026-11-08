@@ -433,6 +433,17 @@ item("长大", lambda: _run_unit("selftest_growth.py"))
 # 这类冲突不会报错，只会让她说出一句莫名其妙的话。
 item("接话与补一句", lambda: _run_unit("selftest_afterthought.py"))
 item("界面契约", lambda: _run_unit("selftest_ui_pages.py"))
+# 发送收尾体检：2026-11-08 线上"微信收到了、日志说这一轮一条都没发出去"。
+# 根因是缩进塌陷 —— 整段收尾（记忆库 / 心情 / 成功日志）活埋在 except 里，
+# 语法完全合法、不报错，只能查语法树。
+item("发送收尾", lambda: _run_unit("selftest_send_tail.py"))
+# 监听热更新：运行中新增/取消会话必须立刻生效。
+# 以前 set_watching 只改内存 + 存盘，watcher._chats 不动 ——
+# 用户加了监控，对方说话没反应，日志里连一行 [收] 都没有。
+item("监听热更新", lambda: _run_unit("selftest_watch_hot.py"))
+# 每轮观测：data/turns.jsonl 的格式、裁剪、静默失败。
+# 排查"她为什么慢"只能靠它 —— 日志是给人读的，这个是给脚本读的。
+item("每轮观测", lambda: _run_unit("selftest_turns.py"))
 
 # ════════════════════════════════════════════════════════════════
 section("结果汇总")

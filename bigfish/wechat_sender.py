@@ -32,10 +32,13 @@
 from __future__ import annotations
 
 import ctypes
+import functools
 import os
 import subprocess
 import sys
+import threading
 import time
+from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Optional
 
@@ -103,16 +106,99 @@ def is_admin() -> bool:
         return False
 
 
-def _wechat_hwnd() -> int:
-    """微信主窗口句柄。找不到返回 0。"""
+def _wechat_hwnd(visible_only: bool = True) -> int:
+    """微信主窗口句柄。找不到（或只剩卡死的）返回 0。
+
+    ⚠ 不能用 FindWindowW("Qt51514QWindowIcon", None)。
+
+    微信从托盘恢复时会**重建**顶层窗口，旧的那个还留在窗口站里：
+    IsWindow 为真、标题还叫「微信」，但界面已经点不动了 ——
+    用户看到的就是「窗口没反应、点 X 也关不掉」。
+    FindWindowW 返回哪个**不保证**，抓到旧窗口时 ShowWindow 唤不回来、
+    UIA 点它没反应，只能从托盘再点一次让微信重建窗口。
+
+    所以这里按「没卡死 + 面积最大」自己挑。
+    IsHungAppWindow 是 Windows 直接给的判据（和任务管理器里那个
+    「未响应」同一个），比「标题对不对」可靠。
+
+    ``visible_only=False`` 时**连收在托盘的也返回** ——
+    那是 ``force_show_wechat()`` 唯一的抓手：窗口已经藏起来了，
+    只找可见的等于永远叫不出来（0.10.6 第一版就踩了这个坑）。
+    """
     try:
         u = ctypes.windll.user32
-        u.FindWindowW.restype = ctypes.c_void_p
-        hwnd = (u.FindWindowW("Qt51514QWindowIcon", None)
-                or u.FindWindowW(None, "微信"))
-        return int(hwnd or 0)
+        u.IsWindowVisible.argtypes = [wintypes.HWND]
+        u.IsWindowVisible.restype = wintypes.BOOL
+        u.IsIconic.argtypes = [wintypes.HWND]
+        u.IsIconic.restype = wintypes.BOOL
+        u.IsHungAppWindow.argtypes = [wintypes.HWND]
+        u.IsHungAppWindow.restype = wintypes.BOOL
+        u.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+        u.GetWindowTextLengthW.restype = ctypes.c_int
+        u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        u.GetWindowTextW.restype = ctypes.c_int
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u.GetWindowRect.restype = wintypes.BOOL
+
+        found = []
+        proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def _each(hwnd, _lparam):
+            try:
+                if visible_only and (not u.IsWindowVisible(hwnd)
+                                     or u.IsIconic(hwnd)):
+                    return True
+                if u.IsHungAppWindow(hwnd):
+                    return True                   # 卡死的旧窗口，别去碰
+                n = u.GetWindowTextLengthW(hwnd)
+                if n <= 0:
+                    return True
+                buf = ctypes.create_unicode_buffer(n + 1)
+                u.GetWindowTextW(hwnd, buf, n + 1)
+                title = buf.value
+                if "微信" not in title and "Weixin" not in title:
+                    return True
+                r = wintypes.RECT()
+                u.GetWindowRect(hwnd, ctypes.byref(r))
+                area = max(0, r.right - r.left) * max(0, r.bottom - r.top)
+                if area > 0:
+                    found.append((area, int(hwnd)))
+            except Exception:
+                pass
+            return True
+
+        u.EnumWindows(proc(_each), 0)
+        found.sort(reverse=True)
+        return found[0][1] if found else 0
     except Exception:
         return 0
+
+
+def window_state_hint() -> str:
+    """给「打不开会话」这类失败附一句现场：窗口多大、在不在。
+
+    窄窗口（实测 952×697）里微信会把左侧导航栏与搜索框收起来，
+    UIA 树里根本没有 ``mmui::MainTabBar`` —— open_chat 找不到搜索框就失败。
+    日志只写「打不开会话」时，用户没法判断是窗口太小还是程序坏了。
+    """
+    try:
+        u = ctypes.windll.user32
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u.GetWindowRect.restype = wintypes.BOOL
+        hwnd = _wechat_hwnd()
+        if not hwnd:
+            return "微信主窗不可见（收在托盘、已关闭，或窗口未响应）"
+        r = wintypes.RECT()
+        u.GetWindowRect(hwnd, ctypes.byref(r))
+        w, h = max(0, r.right - r.left), max(0, r.bottom - r.top)
+        if w < 1000 or h < 760:
+            return (f"窗口 {w}×{h} 偏窄/偏矮 —— 微信在这种尺寸下会收起导航栏"
+                    f"和搜索框，UIA 找不到会话入口；把窗口拉大一点再试")
+        return (f"窗口 {w}×{h} —— 如果它点不动、X 也关不掉，那是微信收进托盘后"
+                f"留下的残留窗口（程序 ShowWindow 只能让它重新出现，Qt 那头"
+                f"已经不处理输入了）；从任务栏右下角的微信图标点一下即可")
+    except Exception:
+        return ""
 
 
 def wechat_window_visible() -> bool:
@@ -137,18 +223,155 @@ def force_show_wechat(wait: float = 0.5) -> bool:
     为什么不用驱动自己的 ensure_window(wake=True)：它在窗口不可见时会
     **阻塞等待**（实测一次 94 秒），期间这一轮回复就卡死了。
     这里只做「能拉就拉，拉不起来立刻返回」，让调用方快速失败。
+
+    ⚠ 句柄必须用 ``visible_only=False`` 找：窗口已经藏起来了，
+      只找可见窗口等于永远叫不出来 —— 0.10.6 第一版就踩了这个坑，
+      日志表现正是「已尝试把它叫出来但没成功」。
     """
-    hwnd = _wechat_hwnd()
+    hwnd = _wechat_hwnd(visible_only=False)
     if not hwnd:
         return False
     try:
         u = ctypes.windll.user32
-        u.ShowWindow(hwnd, 9)          # SW_RESTORE：最小化/隐藏都能恢复
+        u.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_uint]
+        # 收在托盘时只发 SW_RESTORE 有时只点亮任务栏图标、不动窗口。
+        # 先 SW_SHOW 强制显示，再 SW_RESTORE 还原大小。
+        u.ShowWindow(hwnd, 5)          # SW_SHOW
+        u.ShowWindow(hwnd, 9)          # SW_RESTORE
+        # 托盘隐藏会把窗口压到 z 序最底；前台被别的窗口锁定时
+        # SetForegroundWindow 会被系统忽略。一次 topmost 往返把它顶上来。
+        SWP_NOSIZE, SWP_NOMOVE, SWP_SHOWWINDOW = 0x0001, 0x0002, 0x0040
+        u.SetWindowPos(hwnd, ctypes.c_void_p(-1), 0, 0, 0, 0,
+                       SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW)
+        u.SetWindowPos(hwnd, ctypes.c_void_p(-2), 0, 0, 0, 0,
+                       SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW)
         u.SetForegroundWindow(hwnd)
         time.sleep(wait)
         return wechat_window_visible()
     except Exception:
         return False
+
+
+def _weixin_pids() -> list:
+    """当前在跑的 Weixin.exe 进程号。"""
+    try:
+        import psutil
+
+        out = []
+        for proc in psutil.process_iter(["name"]):
+            try:
+                if (proc.info.get("name") or "").lower() == "weixin.exe":
+                    out.append(int(proc.pid))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        pass
+    try:
+        raw = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq Weixin.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, encoding="gbk",
+            errors="replace", timeout=10).stdout or ""
+    except Exception:
+        return []
+    pids = []
+    for line in raw.splitlines():
+        parts = [x.strip('" ') for x in line.split('","')]
+        if len(parts) >= 2 and parts[0].lower().endswith("weixin.exe"):
+            try:
+                pids.append(int(parts[1]))
+            except Exception:
+                pass
+    return pids
+
+
+def find_weixin_exe() -> str:
+    """找 Weixin.exe。顺序：已运行进程 → 注册表 → 常见安装位置。
+
+    不做全盘搜索 —— 一次 CHANGELOG 里写过的教训：扫盘比功能本身还贵。
+    """
+    try:
+        import psutil
+
+        for proc in psutil.process_iter(["name", "exe"]):
+            try:
+                if ((proc.info.get("name") or "").lower() == "weixin.exe"
+                        and proc.info.get("exe")):
+                    return str(proc.info["exe"])
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        import winreg
+
+        keys = (
+            (winreg.HKEY_CURRENT_USER, r"Software\Tencent\Weixin"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Tencent\Weixin"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tencent\Weixin"),
+            (winreg.HKEY_CURRENT_USER, r"Software\Tencent\WeChat"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Tencent\WeChat"),
+        )
+        for root, key in keys:
+            try:
+                with winreg.OpenKey(root, key) as k:
+                    for name in ("InstallPath", "InstallDir", "Path"):
+                        try:
+                            val, _t = winreg.QueryValueEx(k, name)
+                        except OSError:
+                            continue
+                        cand = os.path.join(str(val), "Weixin.exe")
+                        if os.path.isfile(cand):
+                            return cand
+            except OSError:
+                continue
+    except Exception:
+        pass
+
+    for cand in (
+        r"D:\WeChat\Weixin\Weixin.exe",
+        r"C:\Program Files\Tencent\Weixin\Weixin.exe",
+        r"C:\Program Files (x86)\Tencent\Weixin\Weixin.exe",
+        os.path.join(os.path.expandvars(r"%ProgramFiles%"),
+                     "Tencent", "Weixin", "Weixin.exe"),
+        os.path.join(os.path.expandvars(r"%ProgramFiles(x86)%"),
+                     "Tencent", "Weixin", "Weixin.exe"),
+        os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"),
+                     "Tencent", "Weixin", "Weixin.exe"),
+    ):
+        if os.path.isfile(cand):
+            return cand
+    return ""
+
+
+def start_weixin_process() -> tuple:
+    """确保微信**进程**在跑。返回 (ok, 给用户看的一句话)。
+
+    为什么不是"把窗口拽到前台"：微信收在托盘后，主窗的 HWND 还在，
+    但 Qt 那头已经不处理输入了 —— ShowWindow 拽出来的是残留窗口，
+    点它没反应、X 也关不掉（2026-11-08 用户实测）。
+    真要恢复只能靠微信自己的托盘图标；程序能做的是：进程不在就把它拉起来。
+    """
+    pids = _weixin_pids()
+    if pids:
+        return True, (f"微信进程已经在运行（PID {pids[0]}）。"
+                      f"如果托盘里那个窗口点不动，从托盘图标点一下即可。")
+    exe = find_weixin_exe()
+    if not exe:
+        return False, ("找不到 Weixin.exe。请手动打开微信，"
+                       "或在设置页填微信安装路径。")
+    try:
+        subprocess.Popen(
+            [exe], cwd=os.path.dirname(exe), close_fds=True,
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+    except Exception as exc:
+        return False, f"启动微信失败：{exc}"
+    return True, "已启动微信进程，等它加载完，发送通道会自动恢复。"
 
 
 def desktop_available() -> bool:
@@ -163,6 +386,28 @@ def desktop_available() -> bool:
         return False
     except Exception:
         return False
+
+
+#: 所有 UIA 写入的串行闸门。
+#:
+#: 微信只有一个窗口、一个输入框、一个剪贴板 —— 两个线程同时写会互相踩，
+#: 轻则发错人，重则把 A 会话的话发进 B 的输入框。
+#:
+#: 引擎现在把「生成」放进两个 worker 并行跑，但「投递」只有一条线程。
+#: 这把锁是**最后一道保险**：不管调用方是引擎回复、补一句、表情包
+#: 还是 world 的主动消息，最终都从这里排队出去。
+_UIA_SEND_LOCK = threading.Lock()
+
+
+def _serialized_send(fn):
+    """给会写微信窗口的方法加串行锁。"""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with _UIA_SEND_LOCK:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass
@@ -265,10 +510,19 @@ class UiaSender:
         # 先把窗口拉出来（不阻塞），拉不出来就快速失败
         if not wechat_window_visible():
             force_show_wechat()
+            # 微信从托盘恢复要一点时间（Qt 重建窗口 + 重排布局）。
+            # 以前只等 force_show 那 0.5 秒就判死，正好撞在"窗口还没出来"上 ——
+            # 用户看到的是"程序启动成功了"，然后一整晚一条都发不出去。
+            for _ in range(8):            # 最多再等 3.2 秒
+                if wechat_window_visible():
+                    break
+                time.sleep(0.4)
         if not wechat_window_visible():
+            _hint = window_state_hint()
             raise SendError(
                 "微信窗口不可见（已关闭或缩到托盘）。"
-                "已尝试把它叫出来但没成功 —— 本条未发送。",
+                "已尝试把它叫出来但没成功 —— 本条未发送。"
+                + (f"（{_hint}）" if _hint else ""),
                 kind="window")
 
         if not is_admin():
@@ -339,6 +593,7 @@ class UiaSender:
             pass
         return ""
 
+    @_serialized_send
     def send(self, who: str, text: str,
              verify_identity: bool = True) -> SendResult:
         """给 who 发一条文本。
@@ -357,8 +612,10 @@ class UiaSender:
 
         self.wake()
         if not wechat_window_visible():
+            _hint = window_state_hint()
             raise SendError(
-                "微信窗口在发送前又不见了 —— 本条未发送。",
+                "微信窗口在发送前又不见了 —— 本条未发送。"
+                + (f"（{_hint}）" if _hint else ""),
                 kind="window")
 
         now = self.current_chat()
@@ -368,7 +625,11 @@ class UiaSender:
             if not self.open_chat(who):
                 time.sleep(0.6)
                 if not self.open_chat(who):
-                    raise SendError(f"打不开会话: {who!r}", kind="open")
+                    _hint2 = window_state_hint()
+                    raise SendError(
+                        f"打不开会话: {who!r}"
+                        + (f"（{_hint2}）" if _hint2 else ""),
+                        kind="open")
             time.sleep(0.35)
             now = self.current_chat()
             if now != who:
@@ -457,6 +718,7 @@ class UiaSender:
         except Exception as exc:
             raise SendError(f"初始化 GUI 门面失败: {exc}", kind="init") from exc
 
+    @_serialized_send
     def send_media(self, who: str, path: str,
                    verify_identity: bool = True) -> SendResult:
         """给 who 发一个本地媒体文件（图片 / GIF 表情包 / 其他文件）。
@@ -493,8 +755,10 @@ class UiaSender:
 
         self.wake()
         if not wechat_window_visible():
+            _hint = window_state_hint()
             raise SendError(
-                "微信窗口在发送前又不见了 —— 本条未发送。",
+                "微信窗口在发送前又不见了 —— 本条未发送。"
+                + (f"（{_hint}）" if _hint else ""),
                 kind="window")
 
         now = self.current_chat()
@@ -504,7 +768,11 @@ class UiaSender:
             if not self.open_chat(who):
                 time.sleep(0.6)
                 if not self.open_chat(who):
-                    raise SendError(f"打不开会话: {who!r}", kind="open")
+                    _hint2 = window_state_hint()
+                    raise SendError(
+                        f"打不开会话: {who!r}"
+                        + (f"（{_hint2}）" if _hint2 else ""),
+                        kind="open")
             time.sleep(0.35)
             now = self.current_chat()
             if now != who:

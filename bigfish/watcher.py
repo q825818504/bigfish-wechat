@@ -166,6 +166,25 @@ class MessageWatcher:
             self._prefill[uid] = set()
         return uid
 
+    def unwatch(self, chat: str) -> bool:
+        """取消监听一个会话。运行中改监听列表用（不必重启引擎）。
+
+        名字解析必须和 ``watch()`` 用同一套规则 —— 否则「取消」会在
+        新的 uid 上什么都不做，而旧的那个照旧每 1.2 秒查一遍库。
+        """
+        uid = self.db.username_by_nickname(chat) or chat
+        if not (uid.endswith("@chatroom") or uid.startswith("wxid_")
+                or uid == "filehelper"):
+            gid = self.db.group_name_to_id(chat)
+            if gid:
+                uid = gid
+        if uid not in self._chats:
+            return False
+        self._chats.remove(uid)
+        self._wm.pop(uid, None)
+        self._prefill.pop(uid, None)
+        return True
+
     def watch_all_recent(self, limit: int = 10) -> List[str]:
         """监听最近活跃的若干会话。"""
         out = []

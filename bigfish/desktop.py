@@ -355,6 +355,63 @@ def _ensure_config_home() -> None:
         _migrate_config_path(lo, CONFIG_PATH)
 
 
+def _cut_at_sentence(text: str, limit: int) -> str:
+    """超长回复按**句子边界**截断，宁可少说一句，也不吐半截字。
+
+    以前是 `reply[:limit] + "…"`：31 字的回复被砍成「…你要不说我…」，
+    用户看到的就是「日志里内容显示不全」—— 其实是她的话被打断了。
+
+    `{{split}}` 不算字数：它不是她说的字，却占 11 个字符，
+    出现一次就让 30 字预算缩水三分之一。标记本身要留着，
+    后面 `say.split_reply` 还要靠它分段。
+    """
+    marker = "{{split}}"
+    plain = text.replace(marker, "")
+    if len(plain) <= limit:
+        return text
+
+    # 按句末标点 / 分条标记切段（标记单独成段，不占预算）
+    segs: list = []
+    buf = ""
+    i = 0
+    while i < len(text):
+        if text.startswith(marker, i):
+            if buf:
+                segs.append(buf)
+                buf = ""
+            segs.append(marker)
+            i += len(marker)
+            continue
+        buf += text[i]
+        if text[i] in "。！？!?～~\n":
+            segs.append(buf)
+            buf = ""
+        i += 1
+    if buf:
+        segs.append(buf)
+
+    out: list = []
+    used = 0
+    for seg in segs:
+        if seg == marker:
+            out.append(seg)
+            continue
+        if used + len(seg) > limit:
+            break
+        out.append(seg)
+        used += len(seg)
+
+    joined = "".join(out).strip()
+    # 截在标记后面会多出一段空话（split_reply 会把它当一条空消息）
+    while joined.endswith(marker):
+        joined = joined[: -len(marker)].rstrip()
+    if joined.replace(marker, "").strip():
+        # 截掉的部分不补省略号：完整的句子比"…"更像人说话
+        return joined
+    # 第一句就超预算：只能硬切，但至少别把分条标记算进去
+    return plain[:limit].rstrip("，,、 ") + "…"
+
+
 def _source_ms(msg) -> "int | None":
     """入站消息的发生时间，毫秒。取不到就返回 None（让写入方用当前时间）。
 
@@ -517,6 +574,67 @@ def _open_block(owner: str, tier: str, question: str) -> str:
             if hit:
                 items = hit
         return "\n".join(f"- {i['predicate']}：{i['object']}" for i in items[:6])
+    except Exception:
+        return ""
+
+
+def _owner_echo_block(owner: str, tier: str, chat_id: str,
+                      hours: float = 24.0, limit: int = 5) -> str:
+    """主人专用：「最近别处提到你的事」。
+
+    为什么需要这一段：
+      A2 把原文检索按 session 收窄了（防止翻到别人的私聊），副作用是
+      **主人自己也看不到别人在别的会话里提到他**。四条丶说「其实我知道
+      你主人是谁」「你主人是老爸！」，主人回头问「听说有人在打听我」——
+      她手里一条依据都没有，只能答「我怎么不知道」（2026-11-08 现场）。
+
+    边界：
+      · 只对 tier=owner 生效，只读 messages 表，不做关键词放行判断
+      · 不碰 `_open_block` 的白名单 —— 那段管"能不能告诉别人"，
+        这段管"主人自己该知道什么"
+      · 只挑提到「主人」或主人昵称的原文，避免把别人的闲话整段搬过来
+    """
+    try:
+        from bigfish import memory as M, vault as V
+
+        if tier != M.TIER_OWNER or not owner:
+            return ""
+        db = V.memory_db_path()
+        if not (db and os.path.isfile(db)):
+            return ""
+        cutoff = int((time.time() - hours * 3600) * 1000)
+        conn = M.connect(db, read_only=True)
+        try:
+            names = {}
+            try:
+                for row in conn.execute("SELECT owner, display_name FROM owners"):
+                    names[str(row[0])] = str(row[1] or "")
+            except Exception:
+                names = {}
+            rows = conn.execute(
+                "SELECT session, text, COALESCE(source_time, recorded_at) AS t "
+                "FROM messages WHERE bank=? AND role='user' AND session<>? "
+                "AND COALESCE(source_time, recorded_at)>=? "
+                "ORDER BY t DESC LIMIT 200",
+                ("dafeiyu", f"wechat:{chat_id}", cutoff)).fetchall()
+        finally:
+            conn.close()
+
+        me_name = names.get(owner, "") or ""
+        words = [w for w in ("主人", me_name) if w]
+        if not words:
+            return ""
+        out = []
+        for r in rows:
+            text = str(r["text"] or "").strip()
+            if not text or not any(w in text for w in words):
+                continue
+            sess = str(r["session"] or "")
+            who = names.get("private:" + sess) or sess.replace("wechat:", "")
+            out.append(f"- {who}：{text[:60]}")
+            if len(out) >= limit:
+                break
+        return "\n".join(out)
     except Exception:
         return ""
 
@@ -886,7 +1004,17 @@ class EngineWorker(QThread):
         # 守卫必须最后出现（越靠后越有分量），时间感知要在心情之前
         # （"现在几点"是处境，"此刻怎样"是气氛，处境先立住）。
         # 详见 bigfish/plugins/__init__.py 的 BUILTIN_SEATS / PLUGIN_SEATS。
-        _sections = [(860, ctx.persona or self.soul.render_persona())]
+        _persona_text = ctx.persona or self.soul.render_persona()
+        # 人格段里写着「称呼对方「爸」」——那是她对**主人**的叫法。
+        # 照搬到四条丶的会话里，她就会把对方叫成"爸"（2026-11-08 实锤：
+        # 心情日志把四条丶写成了"爸突然问她主人是谁"）。
+        # 这里只替换这一处措辞，人格的其余部分一个字不动。
+        _addr = str(getattr(self.soul, "address", "") or "").strip()
+        _peer = self._peer_name_parts(chat_id, chat_name, sender_name)
+        if _addr and _peer and _peer != _addr:
+            _persona_text = _persona_text.replace(
+                f"称呼对方「{_addr}」", f"称呼对方「{_peer}」")
+        _sections = [(860, _persona_text)]
         if ctx.mood and ctx.mood.injected_text.strip():
             _sections.append((900, "\n## 这会儿的状态\n\n"
                                    + ctx.mood.injected_text.strip()))
@@ -1033,6 +1161,14 @@ class EngineWorker(QThread):
             if x and x.strip())
         if _impression:
             user_parts.append("## 你印象里的他\n\n" + _impression)
+
+        # ── 主人专用：最近别处提到你的事 ──
+        #
+        # 原文检索按会话隔离（A2），代价是主人看不到别人在别处怎么提他。
+        # 这一节只给 tier=owner，且只挑提到「主人」/他昵称的原文。
+        _echo = _owner_echo_block(_owner, _tier, chat_id)
+        if _echo:
+            user_parts.append("## 最近别处提到你的事（只有你能看到）\n\n" + _echo)
 
         # ── 原文：不够就再查一次（v6）──
         #
@@ -1305,7 +1441,7 @@ class EngineWorker(QThread):
         if getattr(self, "dry", False):
             self._log(f"[接话·预演] 本来会补一句：{text}", "think")
             return
-        if self.sender is None:
+        if self.sender is None and not self._ensure_sender():
             self._log("[接话] 补的那句取消：UIA 未就绪", "err")
             return
 
@@ -1331,13 +1467,53 @@ class EngineWorker(QThread):
         try:
             from bigfish import history as _H4
 
-            _who = "我"
-            if self.soul is not None:
-                _who = str(getattr(self.soul, "address", "") or "我")
-            _H4.append(str(a.get("chat_id") or ""), _who, text)
+            # 署名「我」而不是 soul.address —— 见 handle() 里同一处注释
+            _H4.append(str(a.get("chat_id") or ""), "我", text)
         except Exception:
             pass
         self._log(f"[接话] 补一句：{text}", "out")
+
+    def _ensure_sender(self, quiet: bool = False) -> bool:
+        """确保 UIA 发送通道可用；不可用就当场再试一次。
+
+        ⚠ 启动时失败 ≠ 整晚都失败。
+
+        以前只在 `_run()` 开头试一次，失败就把 `self.sender` 钉死成 None：
+        之后每一轮都生成回复、每一轮都「[未发送] UIA 未就绪」——
+        用户看到的是"启动成功"，实际一条都没发出去（2026-11-08 现场）。
+
+        而第一次失败的原因往往过几秒就没了：微信还收在托盘、
+        微信刚重启、桌面刚解锁、窗口还在重排。所以每轮都给它一次机会。
+
+        `quiet=True` 只给启动那一刻用：外层会自己打一条更完整的说明，
+        这里就不要再报一遍原因了。
+        """
+        if self.sender is not None:
+            return True
+        try:
+            from bigfish.wechat_sender import UiaSender as _UiaSender
+
+            sender = _UiaSender()
+            sender.wake()
+        except Exception as exc:
+            # 限频：60 秒最多说一次，否则每轮回复都刷一行同样的红字
+            now = time.time()
+            if not quiet and now - float(getattr(self, "_sender_warn_at", 0.0)) >= 60:
+                self._sender_warn_at = now
+                self._log(f"[警告] UIA 仍未就绪，这一轮发不出去：{exc}", "err")
+                try:
+                    self.failed.emit(str(exc))
+                except Exception:
+                    pass
+            return False
+
+        self.sender = sender
+        self._log("UIA 已就绪（自动恢复，不用重启程序）", "in")
+        try:
+            self.failed.emit("")      # 清掉界面上的红字
+        except Exception:
+            pass
+        return True
 
     def _say_plan(self, reply: str, policy=None):
         """按「说法」插件的参数切条 + 算节奏。插件坏了就整段发。
@@ -1381,7 +1557,7 @@ class EngineWorker(QThread):
         """发出去，并把结果记进日志/统计。失败不抛，只记。"""
         from bigfish.wechat_sender import SendError, classify_media
 
-        if self.sender is None:
+        if self.sender is None and not self._ensure_sender(quiet=True):
             return
         import os as _os
 
@@ -1427,6 +1603,43 @@ class EngineWorker(QThread):
         except Exception:
             pass
 
+    def _peer_name(self, msg) -> str:
+        """这一轮的「对方」该怎么称呼。
+
+        ⚠ `soul.address` 是**她对主人的称呼**（这里配的是「爸」），
+          不是"所有人"的称呼。以前心情判定无条件拿它当 owner_name，
+          于是四条丶问一句「你主人是谁」，日志就写成
+          「爸突然问她主人是谁」—— 把第三者写成了主人（2026-11-08 用户发现）。
+
+        规则：
+          · 群聊 → 说话人的名字（群成员不能共用一个称呼）
+          · 主人那条私聊 → 用她平时叫他的那个称呼（「爸」）
+          · 其他私聊 → 会话名（「四条丶」）
+        """
+        return self._peer_name_parts(
+            str(getattr(msg, "chat_id", "") or ""),
+            str(getattr(msg, "chat_name", "") or ""),
+            str(getattr(msg, "sender_name", "") or ""))
+
+    def _peer_name_parts(self, chat_id: str, chat_name: str,
+                         sender_name: str = "") -> str:
+        """`_peer_name` 的拆开版：`_compose` 手里只有字段，没有 msg 对象。"""
+        chat_id = str(chat_id or "")
+        chat_name = str(chat_name or "").strip()
+        sender = str(sender_name or "").strip()
+        addr = str(getattr(self.soul, "address", "") or "").strip()
+        if chat_id.endswith("@chatroom"):
+            return sender or chat_name or "对方"
+        if addr:
+            try:
+                from bigfish import memory as _M
+
+                if self.owner_id and _M.owner_of_private(chat_id) == self.owner_id:
+                    return addr
+            except Exception:
+                pass
+        return chat_name or "对方"
+
     def _judge_mood_async(self, user_text: str, reply: str, msg) -> None:
         """后台判断心情，不阻塞下一轮对话。
 
@@ -1440,7 +1653,7 @@ class EngineWorker(QThread):
         import threading
 
         self_name = getattr(self.soul, "name", "") or ""
-        owner = getattr(self.soul, "address", "") or "对方"
+        owner = self._peer_name(msg)
         chat_id = str(getattr(msg, "chat_id", "") or "")
 
         def work() -> None:
@@ -1464,7 +1677,7 @@ class EngineWorker(QThread):
                 v = r.get("verdict") or {}
                 cur = r.get("mood")
                 delta = int(v.get("moodDelta") or 0)
-                reason = str(v.get("reason") or "")[:24]
+                reason = str(v.get("reason") or "")[:60]
                 self._log(
                     f"[心情] {cur if cur is not None else '?'}"
                     f"（判定 {delta:+d}，可信 {v.get('confidence')}）"
@@ -1595,7 +1808,6 @@ class EngineWorker(QThread):
                         lines = _H.load(chat_id, limit=60)
                         transcript = chr(10).join(f"{w}: {txt}" for w, txt in lines)
                         if transcript.strip():
-                            self._last_bond = now_b
                             sys_b, user_b = _B.build_request(transcript)
                             raw_b = call_model(self.mcfg, sys_b, user_b)
                             passed, rejected = _B.parse_bonds(raw_b, transcript)
@@ -1609,13 +1821,22 @@ class EngineWorker(QThread):
                                     confidence=item["confidence"])
                                 if ok and why == "added":
                                     added += 1
+                            # ⚠ 计时器必须放在**跑完之后**。
+                            #   以前它在 call_model 之前 —— 一次 502 就把
+                            #   关系提炼关掉 6 小时，下一次真成功也要等到
+                            #   下一个 6 小时窗口，日志还只说"提炼失败"。
+                            self._last_bond = now_b
                             if added:
                                 self._log(f"[关系] +{added} 条", "")
                             if rejected:
                                 self._log(f"[关系] {len(rejected)} 条没有原话依据，已丢弃"
                                           f"（{rejected[0][:40]}）", "")
                 except Exception as exc:
-                    self._log(f"[关系] 提炼失败：{exc}", "")
+                    # 30 分钟后再试。这类失败基本都是上游的（502 / 推理把
+                    # max_tokens 吃光导致空正文），不是数据坏了 —— 把基准
+                    # 往前挪 6 小时再减 30 分钟，下一次判断自然落在 30 分钟后。
+                    self._last_bond = _t.time() - 6 * 3600 + 1800
+                    self._log(f"[关系] 提炼失败（30 分钟后再试）：{exc}", "")
             except Exception as exc:
                 self._log(f"[记] 反思异常：{exc}", "err")
 
@@ -1781,15 +2002,20 @@ class EngineWorker(QThread):
 
         if not self.dry:
             # UIA 初始化失败不应该让整个引擎死掉：
-            # 监听和生成仍然有价值，只是发不出去。
-            try:
-                self.sender = UiaSender()
-                self.sender.wake()
-                self._log("UIA 已就绪", "in")
-            except Exception as exc:
-                self.sender = None
-                self._log(f"[警告] UIA 初始化失败，本次只监听不发送：{exc}",
-                          "err")
+            # 监听和生成仍然有价值，只是暂时发不出去。
+            # ⚠ 但也**不能一次失败定终身** —— 后面每一轮都会再试
+            #   （见 _ensure_sender），微信窗口打开后自己就恢复了。
+            if not self._ensure_sender(quiet=True):
+                self._log(
+                    "[警告] 发送通道不可用：现在只监听、不发送。"
+                    "把微信窗口打开（或从托盘点出来）后会自动恢复，"
+                    "不需要重启程序。", "err")
+                try:
+                    self.failed.emit(
+                        "UIA 未就绪：现在只监听、不发送。"
+                        "打开微信窗口后会自动恢复。")
+                except Exception:
+                    pass
 
         from bigfish.bridge_client import load_context
 
@@ -1837,6 +2063,10 @@ class EngineWorker(QThread):
         #   现在的判据是"**我们自己主动连发**"：只统计引擎自动发的，
         #   而且要密集到不正常（30 秒 6 条）。人聊天的节奏不会这样。
         last_reply_at: dict = {}        # chat_id -> [时间戳...]
+        #: 她刚说完话的时刻（monotonic），给倾听层做「回复后冷却」用。
+        #   ⚠ 不能用 last_reply_at：那是 time.time()，而 batcher 全程用
+        #   time.monotonic()，两种时钟混着比会得出负数。
+        _reply_mono: dict = {}
         # 昵称缓存：chat_id -> 上次记下的名字。
         # 微信里改备注/昵称之后，wxid 不变但名字变了 —— 每次来消息顺手
         # 比对一次，变了才写库（不然每条消息都要开一次 sqlite，聊天密了会拖）。
@@ -1862,10 +2092,16 @@ class EngineWorker(QThread):
             except Exception:
                 pass
 
-        def handle(msg) -> None:
+        def handle(msg) -> "dict | None":
             nonlocal gate          # 群聊触发器在 run 里建，这里只改引用
             if self._stop:
-                return
+                return None
+
+            # 这一轮的计时起点。生成有硬预算：模型卡住 / 挑图太慢时，
+            # 宁可丢掉这一轮，也不要十分钟后突然冒出一句三天前的话。
+            _t_turn0 = time.time()
+            _t_recv = float(getattr(msg, "timestamp", 0) or 0) or _t_turn0
+            _turn_timeout = float(scope_of("turn_timeout", msg.chat_id) or 90.0)
 
             text = (msg.text or "").strip()
             if not text:
@@ -2210,6 +2446,24 @@ class EngineWorker(QThread):
                 self.failed.emit(str(exc))
                 return
             dt = time.time() - t0
+            # ── 生成预算 ──
+            # call_model 自己会超时重试，但"重试三次 + 挑图"叠起来可能几分钟。
+            # 超过预算的这一轮直接丢掉：十分钟后冒出一句旧话，比不回更糟。
+            _spent = time.time() - _t_turn0
+            if _spent > _turn_timeout:
+                self._log(
+                    f"[超时] 这一轮生成用了 {_spent:.0f}s（上限 {_turn_timeout:.0f}s），"
+                    f"丢弃 —— 迟到的回复比不回复更奇怪", "err")
+                try:
+                    from bigfish import turns as _turns_t
+
+                    _turns_t.record(chat=msg.chat_id, chat_name=msg.chat_name,
+                                    outcome="timeout",
+                                    wait_ms=int((_t_turn0 - _t_recv) * 1000),
+                                    gen_ms=int(_spent * 1000))
+                except Exception:
+                    pass
+                return None
 
             reply = (reply or "").strip()
             if not reply:
@@ -2238,7 +2492,16 @@ class EngineWorker(QThread):
                     self._log(
                         f"[接话] 不接（连着第 {self._silent_streak} 次）："
                         f"对方这句没内容可接", "think")
-                    return
+                    try:
+                        from bigfish import turns as _turns_s
+
+                        _turns_s.record(chat=msg.chat_id, chat_name=msg.chat_name,
+                                        outcome="silent",
+                                        wait_ms=int((_t_turn0 - _t_recv) * 1000),
+                                        gen_ms=int((time.time() - _t_turn0) * 1000))
+                    except Exception:
+                        pass
+                    return None
                 # 说了"必须回"还是给了 - ：给一个最简反应，别让这一轮空着
                 _main = "嗯"
             if not is_group:
@@ -2254,8 +2517,8 @@ class EngineWorker(QThread):
             if _policy_now is not None:
                 _max_chars = min(_max_chars or 10 ** 6,
                                  max(18, _policy_now.max_chars))
-            if _max_chars > 0 and len(reply) > _max_chars:
-                reply = reply[:_max_chars].rstrip("，,、 ") + "…"
+            if _max_chars > 0 and len(reply.replace("{{split}}", "")) > _max_chars:
+                reply = _cut_at_sentence(reply, _max_chars)
 
             self._log(f"[想] {dt:.1f}s  {len(reply)}字", "think")
 
@@ -2263,11 +2526,11 @@ class EngineWorker(QThread):
                 # 预演没有发送环节，直接进历史
                 if _after_text:
                     self._log(f"[接话·预演] 本来会补一句：{_after_text}", "think")
-                hist.append((self.soul.address or "我", reply))
+                hist.append(("我", reply))
                 try:
                     from bigfish import history as _H3
 
-                    _H3.append(msg.chat_id, self.soul.address or "我", reply)
+                    _H3.append(msg.chat_id, "我", reply)
                 except Exception:
                     pass
                 self._log(f"[预演] {reply}", "think")
@@ -2279,217 +2542,316 @@ class EngineWorker(QThread):
                 # 群里回复时带上 @，只加第一条 —— 每条都 @ 很吵
                 parts[0] = f"@{msg.sender_name} {parts[0]}"
 
-            if self.sender is None:
-                self._log(f"[未发送] UIA 未就绪，生成内容：{reply[:50]}",
-                          "think")
-                return
-
-            # ⭐ 表情位置：先只算位置，不挑图。
-            #   挑图会调一次模型（可能几秒到几十秒），放在发文字之前
-            #   会把第一句话拖住 —— 实测出现过第一句等了 50 秒。
-            #   所以：前置才提前挑；后置等文字发完再挑（那时慢也没人察觉）。
             _t_pick0 = time.time()
             _sticker_mood = self._current_mood()
             sticker_pos = self._sticker_pos_hint(reply, _sticker_mood)
             sticker_path = ""
-            if sticker_pos == "before":
-                try:
-                    sticker_path, _pos = self._pick_sticker(
-                        msg, body, reply, mood=_sticker_mood)
-                except Exception as exc:
-                    self._log(f"[表情] 挑选失败：{exc}", "err")
-                if sticker_path:
-                    self._send_sticker(msg, sticker_path, remember_sent)
+            # ⭐ 表情在**生成阶段**挑好，投递阶段只负责发。
+            #
+            # 以前后置挑图放在"发完文字之后"，而且是串行的：调一次模型
+            # 0~40 秒，整条引擎就停在那儿 —— 别的会话全被堵住。
+            # 归到生成阶段以后，挑图只耽误这一条进 outbox 的时间。
+            if sticker_pos in ("before", "after"):
+                # 挑图也要调模型。这一轮已经用掉大半预算时直接跳过 ——
+                # 表情是附加品，文字先出去更重要。
+                if time.time() - _t_turn0 > _turn_timeout * 0.6:
+                    self._log("[表情] 这一轮已经用掉大半预算，跳过挑图", "think")
+                    sticker_pos = "none"
                     sticker_path = ""
-
-            _t_send0 = time.time()
-            sent_any = False
-            try:
-                for _i, _part in enumerate(parts):
-                    if _i > 0:
-                        # 条间停顿：像在打字，不是一口气刷屏
-                        time.sleep(gaps[_i] if _i < len(gaps) else 0.8)
-                    # ⭐ 先记账，再发送。
-                    #
-                    #   以前是发完才 remember_sent —— 而「UIA 按回车」到
-                    #   「微信写库」是异步的：行可能先落库，账还没记上，
-                    #   watcher 恰好在那一刻轮询，这条就被当成对方说的。
-                    #   1.2 秒一轮，单个窗口很窄，但聊一晚上必然撞上；
-                    #   撞上一次就进入自问自答（线上真发生了）。
-                    #   顺序反过来就没有窗口：库里出现的那一刻，账早就记好了。
-                    remember_sent(_part, msg.chat_id)
+                else:
+                    _t_pick = time.time()
                     try:
-                        _r = self.sender.send(msg.chat_name, _part)
-                        _verdict = _sending.classify(result=_r)
-                    except Exception as _exc:          # noqa: BLE001
-                        _verdict = _sending.classify(error=_exc)
-
-                    if not _verdict.sent:
-                        if _verdict.failed:
-                            # 确定没发出去，这笔账必须撤 —— 留着会让对方
-                            # 原样说一句同样的话时被误判成回环。
-                            forget_sent(_part, msg.chat_id)
-                        # 未知：账本**保留**（它可能已经发出去了，读回来要认得出），
-                        # 而且绝不重发 —— 那会让对方收到两遍。
-                        self._log(
-                            f"[发] {'✗' if _verdict.failed else '?'} "
-                            f"{_verdict.detail}", "err")
-                        if _verdict.unknown:
-                            self._log(
-                                "消息结果未知 —— 可能已经发出去了，所以不会重发。"
-                                "如果对方说没收到，是这一条。", "err")
-                        break
-                    sent_any = True
-                if sent_any:
-                    self._last_reply_at = time.time()
-                    self._replies_since_after += 1
-                    if _after_text:
-                        self._maybe_queue_after(
-                            text=_after_text, main=reply, parts=parts,
-                            chat_id=msg.chat_id, chat_name=msg.chat_name)
-                    # ⚠ 只有真的发出去了才写进对话历史。
-                    #   以前这行在发送之前，于是「打开会话失败」那轮也被记成
-                    #   「我说过」，下一轮 prompt 里带着一句她从没发出去的话 ——
-                    #   用户看到的"幻觉"就是这么来的。
-                    hist.append((self.soul.address or "我", reply))
-                try:
-                    from bigfish import history as _H3
-
-                    _H3.append(msg.chat_id, self.soul.address or "我", reply)
-                except Exception:
-                    pass
-                    self.reply_count += 1
-                    # 聊天也累：累计到下一次 tick，作为精力消耗的一部分
-                    self._talk_turns += 1
-                    # 「刚看到」那句已经带出去了，pending 用掉 ——
-                    # 否则下次说话她会再说一遍"昨晚你发过消息"
-                    if _wake_brief:
-                        try:
-                            from bigfish import life as _life_mod
-
-                            _life_mod.take_pending(self._life, msg.chat_id)
-                            _life_mod.save(self._life)
-                        except Exception:
-                            pass
-                    # 整段回复也记一笔（分条时每条已经记过；这里记的是拼起来的样子，
-                    # 因为读回来可能被合并成一条）。必须带会话 ——
-                    # 不带就会变成"全局账"，别的会话里出现同样文字会被误否决。
-                    remember_sent(reply, msg.chat_id)
-                    last_reply_at.setdefault(msg.chat_id, []).append(time.time())
-
-                    # 闸门 L3：轮级熔断。一轮自动回复 = 一次。
-                    # 中间只要夹了一条对方的消息，guard.admit 已经清零了。
-                    if guard.note_reply(msg.chat_id):
-                        self._log(
-                            f"[自环熔断] {msg.chat_name} 连续 {guard.trip} 轮"
-                            f"自动回复、中间一条对方消息都没有 —— "
-                            f"判定她在自问自答，该会话静音 {int(guard.mute)}s。"
-                            f"检查 allow_self 与回环识别。", "err")
-
-                    self.stats.emit(self.recv_count, self.reply_count)
-                    self._log(f"[发] {reply[:60]}", "out")
-                    # 耗时拆开看一眼。「聊几句之后突然安静几十秒」这种问题，
-                    # 光看 [想]/[发] 之间的空白是查不出来的 —— 必须知道
-                    # 是挑图、还是 UIA 发送吃的。超过 3 秒才打，免得刷屏。
-                    _seg = (("切条", _t_pick0 - _t_plan0),
-                            ("挑图", _t_send0 - _t_pick0),
-                            ("发送", time.time() - _t_send0))
-                    if max(v for _n, v in _seg) >= 3.0:
-                        self._log("[耗时] " + " / ".join(
-                            f"{n} {v:.1f}s" for n, v in _seg), "think")
-                    self.chat_event.emit(msg.chat_name, reply[:60], "out")
-
-                    # ⭐ 发完文字，再挑表情包。
-                    #   失败只记日志，不影响这一轮 —— 对方已经从文字里
-                    #   读到内容了，表情是附加品，丢了不算聊崩。
-                    if sticker_pos == "after":
-                        # ⚠ 这一段是**串行**的：挑图要调一次模型，
-                        #   跑完引擎才回去收下一条消息。花 40 秒的话，
-                        #   用户看到的就是"聊几句之后突然安静"。
-                        #   所以它必须单独记时 —— 它发生在 [发] 之后，
-                        #   上面那条汇总日志覆盖不到。
-                        _t_after = time.time()
-                        try:
+                        with _sticker_lock:
                             sticker_path, _pos = self._pick_sticker(
                                 msg, body, reply, mood=_sticker_mood)
-                        except Exception as exc:
-                            self._log(f"[表情] 挑选失败：{exc}", "err")
-                        _cost = time.time() - _t_after
-                        if _cost >= 3.0:
+                    except Exception as exc:
+                        self._log(f"[表情] 挑选失败：{exc}", "err")
+                    _cost = time.time() - _t_pick
+                    if _cost >= 3.0:
+                        self._log(
+                            f"[耗时] {'前置' if sticker_pos == 'before' else '后置'}"
+                            f"挑图 {_cost:.1f}s（只耽误这一条，不堵别的会话）",
+                            "think")
+
+            # ── 生成完了，交给投递线程 ──
+            #
+            # 这里不再自己发：生成与投递分开之后，两个会话可以同时"想"，
+            # 但终究只有一个窗口能"说"。同一会话的下一批会被 per-chat 锁
+            # 挡在这条投递完成之前，保证上下文不打架。
+            return {
+                "msg": msg, "body": body, "reply": reply,
+                "parts": parts, "gaps": gaps,
+                "sticker_pos": sticker_pos, "sticker_path": sticker_path,
+                "after_text": _after_text, "wake_brief": _wake_brief,
+                "owner": _owner, "tier": _tier,
+                "origin": _origin, "group_owner": _group_owner,
+                "t_plan0": _t_plan0, "t_pick0": _t_pick0,
+                "t_gen0": _t_turn0, "t_gen1": time.time(), "t_recv": _t_recv,
+            }
+
+        def _deliver(entry: dict) -> None:
+            """把一轮生成结果发出去。**整台机器上唯一碰 UIA 的线程**在跑它。
+
+            ⚠ 发送必须串行：一个微信窗口、一个输入框、一个剪贴板。
+              生成可以在两个 worker 里并行，投递不行 —— 两个线程同时写
+              会互相踩，发错人。
+            """
+            msg = entry["msg"]
+            body = entry["body"]
+            reply = entry["reply"]
+            parts = entry["parts"]
+            gaps = entry["gaps"]
+            _after_text = entry.get("after_text") or ""
+            _wake_brief = bool(entry.get("wake_brief"))
+            _owner = entry.get("owner") or ""
+            _tier = entry.get("tier") or ""
+            _origin = entry.get("origin") or ""
+            _group_owner = entry.get("group_owner") or ""
+            _t_plan0 = float(entry.get("t_plan0") or 0.0)
+            _t_pick0 = float(entry.get("t_pick0") or 0.0)
+            _lock = entry.get("lock")
+            # 这一轮的观测字段（写完进 data/turns.jsonl）
+            _t_send_start = time.time()
+            _gen0 = float(entry.get("t_gen0") or 0.0)
+            _gen1 = float(entry.get("t_gen1") or 0.0)
+            _recv = float(entry.get("t_recv") or 0.0)
+            _fin = {"outcome": "not_sent"}
+            try:
+                if self.sender is None:
+                    self._ensure_sender()
+                if self.sender is None:
+                    # 内容不丢：写进日志，用户把窗口弄好之后能看见她本来想说什么
+                    self._log(
+                        f"[未发送] UIA 仍未就绪，这条没能发出去：{reply[:60]}",
+                        "err")
+                    return
+
+                _t_send0 = time.time()
+                sent_any = False
+                # 这一轮有没有"结果未知"的条。未知**不等于**没发出去 ——
+                # 说错一句话的代价，是用户拿着手机里收到的消息来对账，
+                # 然后这一整份日志都不再可信。
+                _unknown_any = False
+                try:
+                    for _i, _part in enumerate(parts):
+                        if _i > 0:
+                            # 条间停顿：像在打字，不是一口气刷屏
+                            time.sleep(gaps[_i] if _i < len(gaps) else 0.8)
+                        # ⭐ 先记账，再发送。
+                        #
+                        #   以前是发完才 remember_sent —— 而「UIA 按回车」到
+                        #   「微信写库」是异步的：行可能先落库，账还没记上，
+                        #   watcher 恰好在那一刻轮询，这条就被当成对方说的。
+                        #   1.2 秒一轮，单个窗口很窄，但聊一晚上必然撞上；
+                        #   撞上一次就进入自问自答（线上真发生了）。
+                        #   顺序反过来就没有窗口：库里出现的那一刻，账早就记好了。
+                        remember_sent(_part, msg.chat_id)
+                        try:
+                            _r = self.sender.send(msg.chat_name, _part)
+                            _verdict = _sending.classify(result=_r)
+                        except Exception as _exc:          # noqa: BLE001
+                            _verdict = _sending.classify(error=_exc)
+
+                        if not _verdict.sent:
+                            if _verdict.failed:
+                                # 确定没发出去，这笔账必须撤 —— 留着会让对方
+                                # 原样说一句同样的话时被误判成回环。
+                                forget_sent(_part, msg.chat_id)
+                            # 未知：账本**保留**（它可能已经发出去了，读回来要认得出），
+                            # 而且绝不重发 —— 那会让对方收到两遍。
                             self._log(
-                                f"[耗时] 后置挑图 {_cost:.1f}s"
-                                f"（这段时间引擎不接新消息）"
-                                f"{'，挑中一张' if sticker_path else '，结果没挑'}"
-                                , "think")
-                        if sticker_path:
-                            self._send_sticker(msg, sticker_path, remember_sent)
+                                f"[发] {'✗' if _verdict.failed else '?'} "
+                                f"{_verdict.detail}", "err")
+                            if _verdict.unknown:
+                                _unknown_any = True
+                                self._log(
+                                    "消息结果未知 —— 可能已经发出去了，所以不会重发。"
+                                    "如果对方说没收到，是这一条。", "err")
+                            break
+                        sent_any = True
+                    if sent_any:
+                        _fin["outcome"] = "sent"
+                        self._last_reply_at = time.time()
+                        _reply_mono[msg.chat_id] = time.monotonic()
+                        self._replies_since_after += 1
+                        if _after_text:
+                            self._maybe_queue_after(
+                                text=_after_text, main=reply, parts=parts,
+                                chat_id=msg.chat_id, chat_name=msg.chat_name)
+                        # ⚠ 只有真的发出去了才写进对话历史。
+                        #   以前这行在发送之前，于是「打开会话失败」那轮也被记成
+                        #   「我说过」，下一轮 prompt 里带着一句她从没发出去的话 ——
+                        #   用户看到的"幻觉"就是这么来的。
+                        # 记忆里存的是「她真正说出口的话」：分条标记和换行
+                        # 不该留在正文里 —— 下一轮 prompt 会把它们原样带回去。
+                        import re as _re
+                        _clean_reply = _re.sub(r"\s+", " ",
+                                               reply.replace("{{split}}", " ")).strip()
+                        hist.append(("我", reply))
+                        # 短期历史落盘（重启后"接着刚才说"靠它）。
+                        # ⚠ 必须留在 if sent_any 里面：
+                        #   放在外面时，发送失败那轮也会被记成"她说过"，
+                        #   下一轮 prompt 里带着一句对方从没收到的话。
+                        #
+                        # ⚠ 署名必须是「我」，不是 soul.address。
+                        #   address 是**她对主人的称呼**（配的是「爸」），
+                        #   用它署名时 history 里她的每句话都变成「爸: 矮宝？…」，
+                        #   下一轮 prompt 把这句话当成**对方说过的**。
+                        try:
+                            from bigfish import history as _H3
 
-                    # ⭐ 把这一问一答写进记忆库。
-                    #   以前完全没有这一步 —— 聊一晚上记忆里一条都没有，
-                    #   她永远想不起微信里说过什么。这是设计缺口，不是 bug。
-                    #   放在"发送成功之后"：没发出去的话不算对话发生过。
-                    # 记忆里存的是「她真正说出口的话」：分条标记不该留在正文里
-                    import re as _re
-                    _clean_reply = _re.sub(r"\s+", " ",
-                                           reply.replace("{{split}}", " ")).strip()
+                            _H3.append(msg.chat_id, "我", _clean_reply)
+                        except Exception:
+                            pass
+                        self.reply_count += 1
+                        # 聊天也累：累计到下一次 tick，作为精力消耗的一部分
+                        self._talk_turns += 1
+                        # 「刚看到」那句已经带出去了，pending 用掉 ——
+                        # 否则下次说话她会再说一遍"昨晚你发过消息"
+                        if _wake_brief:
+                            try:
+                                from bigfish import life as _life_mod
+
+                                _life_mod.take_pending(self._life, msg.chat_id)
+                                _life_mod.save(self._life)
+                            except Exception:
+                                pass
+                        # 整段回复也记一笔（分条时每条已经记过；这里记的是拼起来的样子，
+                        # 因为读回来可能被合并成一条）。必须带会话 ——
+                        # 不带就会变成"全局账"，别的会话里出现同样文字会被误否决。
+                        remember_sent(reply, msg.chat_id)
+                        last_reply_at.setdefault(msg.chat_id, []).append(time.time())
+
+                        # 闸门 L3：轮级熔断。一轮自动回复 = 一次。
+                        # 中间只要夹了一条对方的消息，guard.admit 已经清零了。
+                        if guard.note_reply(msg.chat_id):
+                            self._log(
+                                f"[自环熔断] {msg.chat_name} 连续 {guard.trip} 轮"
+                                f"自动回复、中间一条对方消息都没有 —— "
+                                f"判定她在自问自答，该会话静音 {int(guard.mute)}s。"
+                                f"检查 allow_self 与回环识别。", "err")
+
+                        self.stats.emit(self.recv_count, self.reply_count)
+                        # 用分段后的样子记：{{split}} 留在正文里看不懂，
+                        # 而且用户想核对"她到底发了几条、每条什么"。
+                        self._log(
+                            f"[发] {' / '.join(p for p in (parts or [reply]) if p)[:80]}",
+                            "out")
+                        # 耗时拆开看一眼。「聊几句之后突然安静几十秒」这种问题，
+                        # 光看 [想]/[发] 之间的空白是查不出来的 —— 必须知道
+                        # 是挑图、还是 UIA 发送吃的。超过 3 秒才打，免得刷屏。
+                        _seg = (("切条", _t_pick0 - _t_plan0),
+                                ("挑图", _t_send0 - _t_pick0),
+                                ("发送", time.time() - _t_send0))
+                        if max(v for _n, v in _seg) >= 3.0:
+                            self._log("[耗时] " + " / ".join(
+                                f"{n} {v:.1f}s" for n, v in _seg), "think")
+                        self.chat_event.emit(msg.chat_name, reply[:60], "out")
+
+                        # ⭐ 发完文字，再挑表情包。
+                        #   失败只记日志，不影响这一轮 —— 对方已经从文字里
+                        #   读到内容了，表情是附加品，丢了不算聊崩。
+                        # 表情是生成阶段挑好的，这里只发 —— 投递线程不做模型调用
+                        if entry.get("sticker_pos") == "after" and entry.get("sticker_path"):
+                            self._send_sticker(msg, entry["sticker_path"], remember_sent)
+
+                        # ⭐ 把这一问一答写进记忆库。
+                        #   以前完全没有这一步 —— 聊一晚上记忆里一条都没有，
+                        #   她永远想不起微信里说过什么。这是设计缺口，不是 bug。
+                        #   放在"发送成功之后"：没发出去的话不算对话发生过。
+                        try:
+                            from bigfish import vault as _vault
+                            n = _vault.record_exchange(
+                                chat_id=msg.chat_id,
+                                chat_name=msg.chat_name,
+                                user_text=body,
+                                reply_text=_clean_reply,
+                                user_local_id=getattr(msg, "local_id", None),
+                                source_time=_source_ms(msg),
+                            )
+                            if n:
+                                self._log(f"[记] 记忆库 +{n} 条", "")
+                        except Exception as exc:
+                            # 记不进去不该影响聊天，但要让她知道
+                            self._log(f"[记] 写入记忆失败：{exc}", "err")
+
+                        # ⭐ 判断心情并落盘。
+                        #   以前这块也是空的 —— 心情页永远 0，因为她从来没被"判断"过。
+                        #   判断本身要调一次模型（1~2 秒），所以放后台线程，
+                        #   不能卡住下一条消息的回复。
+                        self._judge_mood_async(body, reply, msg)
+                        # ⭐ 顺带把这一轮的原文沉淀成「事实」。
+                        #   和心情一样放后台：它要调一次模型，且带限频闸门，
+                        #   绝不阻塞下一轮回复。
+                        self._reflect_async(msg.chat_id, msg, _owner, _tier,
+                                            origin=_origin, group_owner=_group_owner)
+
+                        # ⭐ 记一次习惯观察。这一步很便宜（一次 UPSERT），
+                        #   所以每轮都做；"够不够格"由跨天数判定，不在这里判。
+                        try:
+                            if body:
+                                # ⚠ 必须在这里 import `memory`。
+                                #   以前写的是 `_M.observe_habit(...)`，而 `_M`
+                                #   在这个作用域**根本没有定义** → NameError →
+                                #   被下面的 `except Exception: pass` 吞掉。
+                                #   于是习惯层从来没有过任何一条观察：
+                                #   `habits` 表恒空、score 永不衰减、
+                                #   「对方反复说过的事」那一段永远不出现。
+                                #   这类 bug 不会报错、不会进日志，只会让一个功能
+                                #   安静地不存在 —— 比崩溃难查十倍。
+                                from bigfish import memory as _M
+                                from bigfish import vault as _v2
+
+                                _M.observe_habit(_v2.memory_db_path(), "dafeiyu",
+                                                 _owner, body,
+                                                 at=_source_ms(msg))
+                        except Exception as exc:
+                            self._log(f"[习] 观察失败：{exc}", "")
+                    else:
+                        # 失败原因在循环里已经逐条记过（`[发] ✗/?` + 记账回滚）。
+                        # 这里以前是 `f"[发送失败] {r.detail}"`，而 `r` 在
+                        # 这个作用域不存在 —— 第一条就发失败时它会抛 NameError，
+                        # 而外层只 `except SendError`，捕获不到，
+                        # 会一直冒到 watcher 的线程里。现在只留一句结论。
+                        if _unknown_any:
+                            # 有"结果未知"的条：它可能已经到了对方手机上。
+                            # 这种时候说"一条都没发出去"，就是上一版被用户
+                            # 拿截图打脸的那句 —— 换句话说，结论必须比事实弱。
+                            self._log("[发] 这一轮没有确认成功的条"
+                                      "（有结果未知的，可能已到达，见上）", "err")
+                        else:
+                            self._log("[发] 这一轮一条都没发出去", "err")
+                        _fin["outcome"] = "unknown" if _unknown_any else "failed"
+                except SendError as exc:
+                    self._log(f"[发送失败] {exc}", "err")
+                    self.failed.emit(str(exc))
+            finally:
+                # 每轮一条结构化记录：她到底等了多久、想了多久、排了多久、
+                # 发了多久。排查"她为什么慢"不用再从中文日志里数时间。
+                try:
+                    from bigfish import turns as _turns
+
+                    _turns.record(
+                        chat=msg.chat_id, chat_name=msg.chat_name,
+                        outcome=_fin["outcome"],
+                        wait_ms=(int(max(0.0, _gen0 - _recv) * 1000)
+                                 if _gen0 and _recv else None),
+                        gen_ms=(int(max(0.0, _gen1 - _gen0) * 1000)
+                                if _gen0 and _gen1 else None),
+                        queue_ms=(int(max(0.0, _t_send_start - _gen1) * 1000)
+                                  if _gen1 else None),
+                        send_ms=int((time.time() - _t_send_start) * 1000),
+                        parts=len(parts),
+                        sticker=entry.get("sticker_pos") or "none",
+                    )
+                except Exception:
+                    pass
+                # 同会话的下一批在等这把锁 —— 投递失败也必须放行
+                if _lock is not None:
                     try:
-                        from bigfish import vault as _vault
-                        n = _vault.record_exchange(
-                            chat_id=msg.chat_id,
-                            chat_name=msg.chat_name,
-                            user_text=body,
-                            reply_text=_clean_reply,
-                            user_local_id=getattr(msg, "local_id", None),
-                            source_time=_source_ms(msg),
-                        )
-                        if n:
-                            self._log(f"[记] 记忆库 +{n} 条", "")
-                    except Exception as exc:
-                        # 记不进去不该影响聊天，但要让她知道
-                        self._log(f"[记] 写入记忆失败：{exc}", "err")
-
-                    # ⭐ 判断心情并落盘。
-                    #   以前这块也是空的 —— 心情页永远 0，因为她从来没被"判断"过。
-                    #   判断本身要调一次模型（1~2 秒），所以放后台线程，
-                    #   不能卡住下一条消息的回复。
-                    self._judge_mood_async(body, reply, msg)
-                    # ⭐ 顺带把这一轮的原文沉淀成「事实」。
-                    #   和心情一样放后台：它要调一次模型，且带限频闸门，
-                    #   绝不阻塞下一轮回复。
-                    self._reflect_async(msg.chat_id, msg, _owner, _tier,
-                                        origin=_origin, group_owner=_group_owner)
-
-                    # ⭐ 记一次习惯观察。这一步很便宜（一次 UPSERT），
-                    #   所以每轮都做；"够不够格"由跨天数判定，不在这里判。
-                    try:
-                        if body:
-                            # ⚠ 必须在这里 import `memory`。
-                            #   以前写的是 `_M.observe_habit(...)`，而 `_M`
-                            #   在这个作用域**根本没有定义** → NameError →
-                            #   被下面的 `except Exception: pass` 吞掉。
-                            #   于是习惯层从来没有过任何一条观察：
-                            #   `habits` 表恒空、score 永不衰减、
-                            #   「对方反复说过的事」那一段永远不出现。
-                            #   这类 bug 不会报错、不会进日志，只会让一个功能
-                            #   安静地不存在 —— 比崩溃难查十倍。
-                            from bigfish import memory as _M
-                            from bigfish import vault as _v2
-
-                            _M.observe_habit(_v2.memory_db_path(), "dafeiyu",
-                                             _owner, body,
-                                             at=_source_ms(msg))
-                    except Exception as exc:
-                        self._log(f"[习] 观察失败：{exc}", "")
-                else:
-                    # 失败原因在循环里已经逐条记过（`[发] ✗/?` + 记账回滚）。
-                    # 这里以前是 `f"[发送失败] {r.detail}"`，而 `r` 在
-                    # 这个作用域不存在 —— 第一条就发失败时它会抛 NameError，
-                    # 而外层只 `except SendError`，捕获不到，
-                    # 会一直冒到 watcher 的线程里。现在只留一句结论。
-                    self._log("[发] 这一轮一条都没发出去", "err")
-            except SendError as exc:
-                self._log(f"[发送失败] {exc}", "err")
-                self.failed.emit(str(exc))
+                        _lock.release()
+                    except Exception:
+                        pass
 
         # ── 倾听层：等对方说完，再回 ──
         #
@@ -2516,6 +2878,63 @@ class EngineWorker(QThread):
 
         batcher = L.MessageBatcher(L.ListenPolicy())
 
+        # ── 并发：生成并行，投递串行 ──
+        #
+        # 以前是一条 bigfish-batch 线程从防抖一直干到发送：两个会话同时说话，
+        # 第二个要等第一个"想完 + 说完 + 挑完图"，最坏 30~50 秒。
+        #
+        # 现在三段：
+        #   防抖（batch 线程）→ 生成（2 个 gen worker）→ 投递（1 个 send worker）
+        #
+        # 为什么生成要 2 个：模型调用是同步 HTTP，一个会话在想的时候，
+        # 另一个会话可以同时在另一线程里想。为什么投递只有 1 个：见 _deliver。
+        import queue as _queue
+
+        _gen_queue: "_queue.Queue" = _queue.Queue(maxsize=64)
+        _outbox: "_queue.Queue" = _queue.Queue()
+        _chat_locks: dict = {}
+        _chat_locks_guard = threading.Lock()
+        _sticker_lock = threading.Lock()
+
+        def _lock_for(chat_id: str):
+            with _chat_locks_guard:
+                lk = _chat_locks.get(chat_id)
+                if lk is None:
+                    lk = threading.Lock()
+                    _chat_locks[chat_id] = lk
+                return lk
+
+        def _gen_worker() -> None:
+            """生成阶段：调模型、切条、挑图。两个实例并行跑。"""
+            while True:
+                incoming = _gen_queue.get()
+                if incoming is None:
+                    break
+                lock = _lock_for(incoming.chat_id)
+                lock.acquire()
+                entry = None
+                try:
+                    entry = handle(incoming)
+                except Exception as exc:          # noqa: BLE001
+                    self._log(f"[生成] 异常：{exc}", "err")
+                if entry is None:
+                    # 静默 / 生成失败 / 预演 / 不回：这一轮没有要发的东西
+                    lock.release()
+                    continue
+                entry["lock"] = lock
+                _outbox.put(entry)
+
+        def _send_worker() -> None:
+            """投递阶段：唯一碰 UIA 的线程。"""
+            while True:
+                entry = _outbox.get()
+                if entry is None:
+                    break
+                try:
+                    _deliver(entry)
+                except Exception as exc:          # noqa: BLE001
+                    self._log(f"[投递] 异常：{exc}", "err")
+
         def enqueue(msg) -> None:
             """watcher 回调：只入批，立刻返回。
 
@@ -2536,7 +2955,7 @@ class EngineWorker(QThread):
                     at_bot=False,
                     is_self=bool(getattr(msg, "is_self", False)),
                     received_at=time.monotonic(),
-                ))
+                ), replied_at=_reply_mono.get(msg.chat_id))
             except Exception as exc:
                 self._log(f"[倾听] 入批失败：{exc}", "err")
 
@@ -2573,22 +2992,31 @@ class EngineWorker(QThread):
                     except Exception:
                         pass
 
-            handle(Incoming(
-                chat_id=last.chat_id,
-                chat_name=last.chat_name,
-                local_id=int(last.local_id or 0),
-                sort_seq=0,
-                timestamp=int(time.time()),
-                msg_type=last.msg_type,
-                sender_id=None,
-                sender_name=last.author,
-                text=body,
-                is_self=bool(last.is_self),
-                # 进批的只有对方说的话（feed 会丢掉 is_self）
-                identity="peer",
-                identity_rule="batch",
-                raw_content=body,
-            ))
+            # 不在这里直接生成 —— 丢给 gen worker。
+            # batch 线程只做防抖，一秒都不能被模型占住。
+            #
+            # ⚠ 用 put_nowait：队列满时**不能**阻塞 batch 线程，
+            #   否则防抖停摆、watcher 也跟着堵。宁可丢这一批并记一笔。
+            try:
+                _gen_queue.put_nowait(Incoming(
+                    chat_id=last.chat_id,
+                    chat_name=last.chat_name,
+                    local_id=int(last.local_id or 0),
+                    sort_seq=0,
+                    timestamp=int(time.time()),
+                    msg_type=last.msg_type,
+                    sender_id=None,
+                    sender_name=last.author,
+                    text=body,
+                    is_self=bool(last.is_self),
+                    # 进批的只有对方说的话（feed 会丢掉 is_self）
+                    identity="peer",
+                    identity_rule="batch",
+                    raw_content=body,
+                ))
+            except _queue.Full:
+                self._log("[并发] 生成队列已满（64），丢弃这一批 —— "
+                          "她在前面的会话里还没想完", "err")
 
         def _batch_loop() -> None:
             """每 200ms 看一眼有没有该封的批。
@@ -2612,6 +3040,13 @@ class EngineWorker(QThread):
                 pass
 
         threading.Thread(target=_batch_loop, name="bigfish-batch",
+                         daemon=True).start()
+        # 生成 2 条、投递 1 条。数字不放大是刻意的：单个微信窗口只能一个
+        # 一个发，生成再多也只是把 outbox 堆长。
+        for _gi in range(2):
+            threading.Thread(target=_gen_worker, name=f"bigfish-gen{_gi + 1}",
+                             daemon=True).start()
+        threading.Thread(target=_send_worker, name="bigfish-send",
                          daemon=True).start()
 
         self.watcher.on_message = enqueue
@@ -2981,9 +3416,32 @@ class Backend(QObject):
             self.account = self._peek_account()
 
         diag = self._diagnose_items()
+        # 发送通道没就绪时，每 20 秒在后台补试一次。
+        #
+        # 为什么放在 get_status 里：用户盯着「运行中 · 发不出去」的红字，
+        # 点刷新只是重新读一遍状态，什么都解决不了。以前重试只发生在
+        # 「下一条消息来了」的时候 —— 没消息就一直红着，看起来像坏了。
+        if running and not getattr(self.worker, "dry", False) \
+                and getattr(self.worker, "sender", None) is None:
+            _now = time.time()
+            if _now - float(getattr(self, "_uia_retry_at", 0.0)) >= 20:
+                self._uia_retry_at = _now
+                try:
+                    import threading
+
+                    threading.Thread(
+                        target=self.worker._ensure_sender,
+                        kwargs={"quiet": True},
+                        daemon=True, name="bigfish-uia-retry").start()
+                except Exception:
+                    pass
         return json.dumps({
             "running": running,
             "error": self.last_error,
+            # 发送通道是否可用。running 但 sender=False = 只监听不发送，
+            # 界面要当场说清楚 —— 否则用户以为启动成功了，等她回话等到天亮。
+            "sender": bool(getattr(self.worker, "sender", None)) if running else None,
+            "dry": bool(getattr(self.worker, "dry", False)) if running else False,
             "uptime": up,
             "recv": self.recv_count,
             "reply": self.reply_count,
@@ -3158,6 +3616,7 @@ class Backend(QObject):
         """
         try:
             lst = [str(x) for x in json.loads(usernames_json)]
+            prev = list(self.watching)
             self.watching = lst
             c = load_json_config()
             ar = c.setdefault("auto_reply", {})
@@ -3166,10 +3625,44 @@ class Backend(QObject):
             if acc:
                 c.setdefault("per_account", {}).setdefault(acc, {})["chats"] = lst
             save_json_config(c)
+            # 运行中就把变化同步给 watcher，别让用户重启引擎。
+            hot = self._sync_watching_hot(prev, lst)
             return json.dumps({"ok": True, "count": len(self.watching),
-                               "account": acc}, ensure_ascii=False)
+                               "account": acc, "hot": hot}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    def _sync_watching_hot(self, old: list, new: list) -> bool:
+        """把监听列表的增删同步给正在跑的 watcher。
+
+        ⚠ 以前 ``set_watching`` 只改内存 + 存盘：引擎已经在跑时，新加的会话
+          永远收不到消息 —— ``watcher._chats`` 在启动那一刻就定死了，
+          日志里连一行「监听：xxx」都没有。用户看到的是
+          「加了监控、对方说话了、程序没反应、日志也没有」（2026-11-08 现场）。
+        """
+        worker = getattr(self, "worker", None)
+        if worker is None or not worker.isRunning():
+            return False
+        watcher = getattr(worker, "watcher", None)
+        if watcher is None:
+            return False
+        added = [x for x in new if x not in old]
+        removed = [x for x in old if x not in new]
+        if not added and not removed:
+            return False
+        try:
+            for uid in added:
+                got = watcher.watch(uid)
+                worker._log(f"监听：{uid} -> {got}（运行中新增，从现在开始收）",
+                            "in")
+            for uid in removed:
+                if watcher.unwatch(uid):
+                    worker._log(f"取消监听：{uid}", "in")
+            return True
+        except Exception as exc:
+            worker._log(f"[监听] 运行中更新失败（重启引擎才会生效）：{exc}",
+                        "err")
+            return False
 
     # ── 会话级配置（C-1 作用域） ──
     #
@@ -5200,23 +5693,25 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
-    @Slot()
-    def open_wechat(self) -> None:
-        """尝试把微信窗口带到前台。"""
+    @Slot(result=str)
+    def open_wechat(self) -> str:
+        """确保微信**进程**在跑（不负责把窗口拽到前台）。
+
+        ⚠ 以前这里是 ``FindWindowW + ShowWindow`` —— 拽出来的是残留窗口：
+          微信收在托盘后主窗的 HWND 还在，但 Qt 那头已经不处理输入，
+          于是"窗口出现了，点它没反应、X 也关不掉"（2026-11-08 用户实测）。
+          真要恢复只能靠微信自己的托盘图标；程序能做的是把没跑的进程拉起来。
+        """
         try:
-            import ctypes
-            u = ctypes.windll.user32
-            hwnd = u.FindWindowW("Qt51514QWindowIcon", None)
-            if not hwnd:
-                hwnd = u.FindWindowW(None, "微信")
-            if hwnd:
-                u.ShowWindow(hwnd, 9)      # SW_RESTORE
-                u.SetForegroundWindow(hwnd)
-                self.log_message.emit("已把微信窗口带到前台", "in")
-            else:
-                self.log_message.emit("找不到微信窗口", "err")
+            from bigfish.wechat_sender import start_weixin_process
+
+            ok, msg = start_weixin_process()
+            self.log_message.emit(msg, "in" if ok else "err")
+            return json.dumps({"ok": ok, "msg": msg}, ensure_ascii=False)
         except Exception as exc:
-            self.log_message.emit(f"打开微信失败: {exc}", "err")
+            msg = f"打开微信失败: {exc}"
+            self.log_message.emit(msg, "err")
+            return json.dumps({"ok": False, "msg": msg}, ensure_ascii=False)
 
     # ── 自动更新 ──
     @Slot(result=str)
