@@ -57,6 +57,23 @@
 
 自检结论：`pyflakes` 未定义名 0、`compileall` 通过、50 个模块 import 全成功。
 
+### 打包态自检：源码 23/23，exe 20+1skip+1fail
+
+`python tools/selftest.py` → **23 通过 / 0 失败 / 1 跳过**。
+`dist/BigFish/BigFish.exe --selftest` → **20 通过 / 1 失败 / 1 跳过**。
+
+差的这一项是 `灵魂`，报 `数据目录不可写：[Errno 13] Permission denied`。
+**实测同目录同用户下 python 调 `vault.probe_writable` 返回 True** ——
+也就是目录本身可写，是**新编译出来的 exe** 被安全软件拦了写盘。
+这不是代码问题，但会让人第一次装完就以为坏了，所以：
+
+- 打包版自检补了 SKIP（非管理员时 UIA 不再算失败）
+- 写探针失败时多给一句排查方向（加白名单 / 管理员运行）
+
+**下次接手要注意**：如果打包态还报这一项，先别改代码 ——
+用 python 跑一次 `vault.probe_writable(r"D:\大肥鱼\soul.json")`，
+返回 True 就说明是环境拦截，不是程序坏了。
+
 ## 历史：v0.10.3 —— 她有了自己的本子
 
 0.10.0 把器官接成了回路（被无视 → 情绪 → 余韵 → 预算）。

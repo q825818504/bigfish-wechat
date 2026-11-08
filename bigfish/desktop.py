@@ -5737,6 +5737,15 @@ def _run_selftest_inner() -> int:
     HR = "=" * 66
     results = []
 
+    class SkipItem(Exception):
+        """这一项在当前环境里测不了（例如没提权）。不算失败。
+
+        源码版的 `tools/selftest.py` 早就有 SKIP，打包版一直没有 ——
+        于是同一次自检，源码版 23 全绿、打包版「20 通过 / 2 失败」，
+        用户看到的第一印象是「装完就是坏的」。
+        测不了 ≠ 坏了，这个区分必须显示出来。
+        """
+
     def item(name, fn):
         t0 = time.time()
         try:
@@ -5747,6 +5756,13 @@ def _run_selftest_inner() -> int:
             if detail:
                 for line in str(detail).splitlines():
                     print(f"         {line}")
+            return True
+        except SkipItem as exc:
+            dt = time.time() - t0
+            results.append((name, "SKIP", str(exc), dt))
+            print(f"  [SKIP] {name}  ({dt:.2f}s)")
+            if str(exc):
+                print(f"         -> {exc}")
             return True
         except Exception as exc:
             dt = time.time() - t0
@@ -5781,7 +5797,15 @@ def _run_selftest_inner() -> int:
         #   其实只是"还没初始化"。先确保初始化，再验。
         boot = vault.ensure_data_root()
         if boot.get("error"):
-            raise RuntimeError(boot["error"])
+            msg = str(boot["error"])
+            if "不可写" in msg:
+                # 「不可写」最容易被误读成"程序坏了"，实际最常见的是
+                # 安全软件拦了**刚编译出来的 exe** 写盘（同一个目录
+                # 用 python 跑是能写的，我们实测过）。给一条能动手的建议，
+                # 比只报 errno 有用。
+                msg += ("｜若是刚更新过程序：安全软件可能拦了新 exe 写盘，"
+                        "把 BigFish.exe 加进白名单，或右键以管理员身份运行再试一次")
+            raise RuntimeError(msg)
 
         s = load_soul()
         p = s.render_persona()
@@ -6140,7 +6164,8 @@ def _run_selftest_inner() -> int:
     # 7. UIA
     def t_uia():
         if not is_admin():
-            raise RuntimeError("非管理员，UIA 需要提权")
+            # 测不了，不是坏了 —— 记 SKIP，别让用户以为装失败了。
+            raise SkipItem("非管理员，UIA 需要提权（右键 → 以管理员身份运行）")
         from bigfish.wechat_sender import UiaSender
         s = UiaSender()
         s.wake()
@@ -6497,16 +6522,18 @@ def _run_selftest_inner() -> int:
     # 汇总
     nok = sum(1 for r in results if r[1] == "OK")
     nfail = sum(1 for r in results if r[1] == "FAIL")
+    nskip = sum(1 for r in results if r[1] == "SKIP")
     print()
     print(HR)
-    print(f"  通过 {nok} / 失败 {nfail}")
+    print(f"  通过 {nok} / 失败 {nfail}"
+          + (f" / 跳过 {nskip}" if nskip else ""))
     if nfail:
         for name, st, detail, dt in results:
             if st == "FAIL":
                 print(f"    {name}: {detail}")
         print("  ✗ 有失败项")
         return 1
-    print("  ✓ 全部通过")
+    print("  ✓ 全部通过" + ("（有跳过项，见上文 ->）" if nskip else ""))
     print(HR)
     return 0
 
