@@ -890,6 +890,51 @@ class EngineWorker(QThread):
         if ctx.mood and ctx.mood.injected_text.strip():
             _sections.append((900, "\n## 这会儿的状态\n\n"
                                    + ctx.mood.injected_text.strip()))
+
+        # ── 此刻的表达预算（p0-2）──
+        #
+        # 心情和精力以前只进提示词当"背景"。于是她说"心情 38"，
+        # 回你的话还是四条、每段 40 字 —— 状态被描述了，没被使用。
+        #
+        # 这里把它翻成四个数（条数 / 字数 / 不接许可 / 强制回阈值），
+        # 再叠上余韵的修正：还堵着的时候，话更短、更容易不接。
+        #
+        # 只改预算，不改内容 —— 说什么仍然由她自己决定。
+        # 代码永远不替她掷"不回"的骰子：不回必须是她输出 `-` 的选择，
+        # 否则用户看到的是"她明明想了却没发"，那是 bug 的味道。
+        _turn_policy = None
+        try:
+            from bigfish import policy as _policy
+
+            _mood_v = getattr(ctx.mood, "value", None) if ctx.mood else None
+            _mood_dims = getattr(ctx.mood, "dims", None) if ctx.mood else None
+            _energy = (getattr(self._life, "energy", None)
+                       if self._life is not None else None)
+            _turn_policy = _policy.response_policy(
+                mood=_mood_v, dims=_mood_dims, energy=_energy,
+                now=time.time())
+
+            from bigfish import afterglow as _afterglow
+
+            _turn_policy = _policy.apply_afterglow(
+                _turn_policy, _afterglow.current_effect(now=time.time()))
+        except Exception as _exc:
+            _turn_policy = None
+            self._log(f"[预算] 计算失败（按默认走）：{_exc}", "")
+        self._policy = _turn_policy
+        if _turn_policy is not None:
+            try:
+                from bigfish import policy as _policy2
+
+                _bits = [_turn_policy.tone_line,
+                         _policy2.silence_hint(_turn_policy.silence_bias)]
+                _bits = [b for b in _bits if b]
+                if _bits:
+                    _sections.append(
+                        (905, "\n## 这一轮的说话方式\n\n" + "\n".join(_bits)))
+            except Exception:
+                pass
+
         try:
             from bigfish import plugins as _P
 
@@ -1045,6 +1090,25 @@ class EngineWorker(QThread):
                 "## 可以告诉别人的事\n\n" + open_said
                 + "\n\n（这些是主人同意对外说的。只有对方问起的相关话题才提，"
                   "不要主动一股脑报出来。）")
+
+        # ── 她注意到的（p1-7）──
+        #
+        # 天气 / 日子 / 你提过但还没到的事。**只读缓存，不联网** ——
+        # 这里跑在引擎线程上，一次 4 秒超时就是"她突然不说话了"。
+        # 联网在 world 的后台线程里做（每 30 分钟一次）。
+        #
+        # 放在"你认定的事"之后、"我可以说的"之前：
+        # 它和事实同级，都是"背景"，不是"这一轮的任务"。
+        try:
+            from bigfish import senses as _senses
+
+            _notice = _senses.render(
+                now=time.time(),
+                facts=(facts or "").split("\n") if facts else None)
+            if _notice:
+                user_parts.append(_notice)
+        except Exception:
+            pass
 
         # 习惯层：说够三次的原话样本（只给样本，不给结论）
         habit_lines = _habits_block(_owner, _tier)
@@ -1275,10 +1339,14 @@ class EngineWorker(QThread):
             pass
         self._log(f"[接话] 补一句：{text}", "out")
 
-    def _say_plan(self, reply: str):
+    def _say_plan(self, reply: str, policy=None):
         """按「说法」插件的参数切条 + 算节奏。插件坏了就整段发。
 
         每轮现读插件配置：面板里改完，下一条就生效，不用重启。
+
+        `policy` 显式传入时用它：主动消息是在后台线程里 `_compose` 的，
+        而 `self._policy` 是引擎线程最后一次设置的那份 —— 两个会话
+        同时进行时会串味（私聊的预算套到主动消息上）。
         """
         try:
             from bigfish import plugins as _P
@@ -1287,8 +1355,16 @@ class EngineWorker(QThread):
             _P.ensure_loaded()
             on = _P.is_enabled("say")
             cfg = _P.config_of("say") if on else {}
+            _max_parts = int(cfg.get("max_parts", 4))
+            # 状态预算在这里生效：心情/精力/余韵算出来的条数上限，
+            # 比面板配得更严时以状态为准 —— 面板配的是"上限的上限"。
+            # 关掉说法插件也照样生效：她心情差时话少，
+            # 不该取决于用户有没有装一个"分条"插件。
+            _pol = policy if policy is not None else getattr(self, "_policy", None)
+            if _pol is not None:
+                _max_parts = _pol.clamp_parts(_max_parts)
             policy = SplitPolicy(
-                max_parts=int(cfg.get("max_parts", 4)),
+                max_parts=_max_parts,
                 part_max_chars=int(cfg.get("part_max_chars", 50)),
                 protect_quotes=bool(cfg.get("quote_protect", True)))
             parts = split_reply(reply, policy) or [reply]
@@ -1365,10 +1441,19 @@ class EngineWorker(QThread):
 
         self_name = getattr(self.soul, "name", "") or ""
         owner = getattr(self.soul, "address", "") or "对方"
+        chat_id = str(getattr(msg, "chat_id", "") or "")
 
         def work() -> None:
             try:
-                from bigfish import mood_judge
+                from bigfish import afterglow, mood_judge
+
+                # 判定前先记住此刻。余韵的判据是**真实差值**，
+                # 不是模型自报的 moodDelta（那个已经除过 3、还夹过界）。
+                before: Dict[str, Any] = {}
+                try:
+                    before = mood_judge.read_mood_state_now() or {}
+                except Exception:
+                    before = {}
 
                 r = mood_judge.judge_and_apply(
                     user_text=user_text, reply=reply,
@@ -1384,6 +1469,37 @@ class EngineWorker(QThread):
                     f"[心情] {cur if cur is not None else '?'}"
                     f"（判定 {delta:+d}，可信 {v.get('confidence')}）"
                     f" {reason}", "")
+
+                # ── 余韵（p0-3）──
+                #
+                # 放在这里而不是发送成功时：只有判完心情才有 before/after，
+                # 而"她带着这个情绪回你"的时机就是下一轮。
+                try:
+                    after = mood_judge.read_mood_state_now() or {}
+                    b_dims = (before.get("dims")
+                              if isinstance(before.get("dims"), dict) else {})
+                    a_dims = (after.get("dims")
+                              if isinstance(after.get("dims"), dict) else {})
+                    dims_delta = {}
+                    for k in ("happy", "calm", "sweet", "heartache",
+                              "worry", "sad", "jealous"):
+                        try:
+                            dims_delta[k] = (float(a_dims.get(k) or 0)
+                                             - float(b_dims.get(k) or 0))
+                        except (TypeError, ValueError):
+                            dims_delta[k] = 0.0
+                    item = afterglow.from_turn(
+                        chat_id=chat_id, user_text=user_text, reply=reply,
+                        mood_before=before.get("mood"),
+                        mood_after=after.get("mood"),
+                        dims_delta=dims_delta,
+                        judged_delta=delta / 3.0)
+                    if item:
+                        self._log(
+                            f"[余韵] {item.get('kind')}：{item.get('residue')}",
+                            "think")
+                except Exception as exc:
+                    self._log(f"[余韵] 写入失败：{exc}", "")
             except Exception as exc:
                 self._log(f"[心情] 判断异常：{exc}", "err")
 
@@ -1897,6 +2013,17 @@ class EngineWorker(QThread):
                 self._log(f"[触发] {msg.chat_name} / "
                           f"{msg.sender_name}: {t.reason}", "in")
 
+            # 对方道歉 / 示好 → 余韵软消（p0-3）。
+            # 放在入历史之前：这一轮她自己就该感觉到"他哄了一句"，
+            # 否则要等下一轮才软下来，节奏会慢半拍。
+            try:
+                from bigfish import afterglow as _ag_repair
+
+                if _ag_repair.note_repair(body or text, now=time.time()):
+                    self._log("[余韵] 他哄了一句，气消了一半", "think")
+            except Exception:
+                pass
+
             hist.append((who, body))
             if len(hist) > 16:
                 del hist[:-16]
@@ -2033,7 +2160,10 @@ class EngineWorker(QThread):
             # ---- 组装上下文 ----
             # 连着两轮"不值得接"之后，第三次强制回 ——
             # 不然你连着说三句她一声不吭，和程序坏了没区别。
-            _must_reply = self._silent_streak >= 2
+            _policy_now = getattr(self, "_policy", None)
+            _force_after = (_policy_now.must_reply_after
+                            if _policy_now is not None else 2)
+            _must_reply = self._silent_streak >= _force_after
             _turn = self._compose(
                 chat_id=msg.chat_id, chat_name=msg.chat_name,
                 sender_name=msg.sender_name or "", incoming=body or "",
@@ -2102,9 +2232,16 @@ class EngineWorker(QThread):
                 self._silent_streak = 0
             reply = _main
 
+            # 硬上限兜底。policy 的字数是"提示词里的目标"，模型不配合时
+            # 这里再兜一层；但下限给 18 字 —— 14 字的目标配硬切会把一句话
+            # 切成半句，那不像人，像被截断的日志。
             _max_chars = int(scope_of("max_reply_chars", msg.chat_id) or 0)
+            _policy_now = getattr(self, "_policy", None)
+            if _policy_now is not None:
+                _max_chars = min(_max_chars or 10 ** 6,
+                                 max(18, _policy_now.max_chars))
             if _max_chars > 0 and len(reply) > _max_chars:
-                reply = reply[:_max_chars] + "…"
+                reply = reply[:_max_chars].rstrip("，,、 ") + "…"
 
             self._log(f"[想] {dt:.1f}s  {len(reply)}字", "think")
 

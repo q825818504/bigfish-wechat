@@ -163,8 +163,14 @@ def main() -> int:
         check("life 同时是 prompt 和 gate",
               set(P._REGISTRY["life"].get("scopes") or []) == {"prompt", "gate"},
               str(P._REGISTRY["life"].get("scopes")))
-        for gone in ("clock", "sleep-gate", "journal", "bond"):
+        # v0.9.1 撤掉的是「叙事」那个 journal（睡前写三行、次日注入），
+        # 因为它和记忆重复。v0.10.1 重建的 journal 是**另一件事**：
+        # 写本地 Markdown 文件，不进提示词。同名不同物，所以这里只对账
+        # 真正被取消的 clock / sleep-gate / bond。
+        for gone in ("clock", "sleep-gate", "bond"):
             check(f"{gone} 不再是独立插件", gone not in ids)
+        check("journal 是独立插件（v0.10.1 重建，写文件不注入）",
+              "journal" in ids)
     except Exception as exc:
         check("插件系统能起来", False, str(exc))
 
@@ -188,13 +194,19 @@ def main() -> int:
 
     # ── 6. 删掉的东西真删了 ──
     print("\n[删除] 被合并/取消的模块文件不在了")
-    for name in ("clock.py", "sleep_gate.py", "journal.py", "bond.py"):
+    for name in ("clock.py", "sleep_gate.py", "bond.py"):
         check(f"plugins/{name} 已删",
               not _exists("bigfish", "plugins", name))
-    check("bigfish/journal.py 已删", not _exists("bigfish", "journal.py"))
-    check("_load_builtins 不再 import 它们",
+    # journal 在 v0.9.1 删过一版（叙事），v0.10.1 以**不同语义**重建：
+    # 写 journal/YYYY-MM-DD.md，不进提示词、不占座位。
+    # 这条断言从"必须没有"反转成"必须有"，反转的理由写在模块说明里。
+    check("plugins/journal.py 存在（v0.10.1 重建）",
+          _exists("bigfish", "plugins", "journal.py"))
+    check("bigfish/journal.py 存在（v0.10.1 重建）",
+          _exists("bigfish", "journal.py"))
+    check("_load_builtins 不 import clock，但 import journal",
           "import clock" not in _read("bigfish", "plugins", "__init__.py")
-          and "import journal" not in _read("bigfish", "plugins", "__init__.py"))
+          and "import journal" in _read("bigfish", "plugins", "__init__.py"))
 
     # ── 7. JS 引用的 id 都在 HTML 里 ──
     print("\n[对账] 印象页引用的 id 都存在")

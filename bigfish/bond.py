@@ -59,11 +59,35 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 KIND_ADDRESS = "address"     # 称呼
 KIND_UNSAID = "unsaid"       # 未说出口的话
-KINDS = (KIND_ADDRESS, KIND_UNSAID)
+#: p1-6：关系阶段。它不是"一条认识"，是"我们现在处在哪儿"。
+#: 存进 bonds 表是为了复用同一套 status/updated_at/revision，
+#: 但它不进「印象」的渲染顺序，单独一段。
+KIND_STAGE = "stage"
+KINDS = (KIND_ADDRESS, KIND_UNSAID, KIND_STAGE)
 
 KIND_LABELS = {
     KIND_ADDRESS: "称呼",
     KIND_UNSAID: "没说出口的",
+    KIND_STAGE: "现在的关系",
+}
+
+#: 关系事件的种类。和 bonds 分开存（见 bond_events 表）：
+#: 事件不需要"原话子串"证据 —— "第一次一起看电影"本来就没有一句原话，
+#: 硬套 bonds 的 evidence 约束，只会逼模型编一句来凑。
+EVENT_WARM = "warm"          # 靠近：她主动说了平时不说的话、被暖到
+EVENT_CONFLICT = "conflict"  # 摩擦：拌嘴、被推开、没说开的别扭
+EVENT_PROMISE = "promise"    # 约定：谁答应了谁什么
+EVENT_FIRST = "first"        # 第一次：第一次一起做某件事
+EVENT_REPAIR = "repair"      # 修复：道歉、和好、把话说开
+EVENT_KINDS = (EVENT_WARM, EVENT_CONFLICT, EVENT_PROMISE, EVENT_FIRST,
+               EVENT_REPAIR)
+
+EVENT_LABELS = {
+    EVENT_WARM: "靠近",
+    EVENT_CONFLICT: "摩擦",
+    EVENT_PROMISE: "约定",
+    EVENT_FIRST: "第一次",
+    EVENT_REPAIR: "和好",
 }
 
 STATUS_ACTIVE = "active"
@@ -100,6 +124,24 @@ CREATE UNIQUE INDEX IF NOT EXISTS bonds_uniq
     ON bonds(bank, owner, kind, text);
 CREATE INDEX IF NOT EXISTS bonds_lookup
     ON bonds(bank, owner, status);
+
+-- p1-6：关系事件。和 bonds 分开，因为它的证据要求不同 ——
+-- "第一次一起看电影"没有一句原话可以子串匹配。
+-- evidence 允许为空，但写入方（narrative）尽量从当天的原话里取一段。
+CREATE TABLE IF NOT EXISTS bond_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bank        TEXT NOT NULL,
+    owner       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    what        TEXT NOT NULL,
+    evidence    TEXT NOT NULL DEFAULT '',
+    at          INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'active'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS bond_events_uniq
+    ON bond_events(bank, owner, kind, what);
+CREATE INDEX IF NOT EXISTS bond_events_lookup
+    ON bond_events(bank, owner, at DESC);
 """
 
 
@@ -225,6 +267,160 @@ def upsert_bond(db: str, bank: str, owner: str, *, kind: str, text: str,
             pass
 
 
+def append_event(db: str, bank: str, owner: str, *, kind: str,
+                 what: str, evidence: str = "",
+                 at: Optional[float] = None) -> Tuple[bool, str]:
+    """记一条关系事件（p1-6）。返回 (是否新增, 原因)。
+
+    和 `upsert_bond` 的区别：
+    · 不需要原话子串证据 —— 事件往往是"一起做了什么"，没有一句原话；
+    · 不去重内容、只按 (kind, what) 去重：同一件事被复述两次不该记两条；
+    · 不覆盖，只追加：关系是时间线，不是一张当前状态卡。
+
+    为什么不让模型写"他说他爱我"这种总结：那是**判断**，不是事件。
+    这里只收"发生了什么"，判断留给关系卡和印象。
+    """
+    kind = str(kind or "").strip()
+    what = " ".join(str(what or "").split())
+    evidence = " ".join(str(evidence or "").split())
+    if kind not in EVENT_KINDS:
+        return False, f"unknown kind: {kind}"
+    if not what or len(what) > 120:
+        return False, "what missing or too long"
+    if not db:
+        return False, "no db"
+    ensure_schema(db)
+    stamp = int((at if at is not None else time.time()) * 1000)
+    try:
+        from bigfish.memory import connect
+
+        conn = connect(db)
+    except Exception as exc:
+        return False, f"db unavailable: {exc}"
+    try:
+        row = conn.execute(
+            "SELECT id FROM bond_events WHERE bank=? AND owner=? AND kind=? AND what=?",
+            (bank, owner, kind, what)).fetchone()
+        if row:
+            return False, "exists"
+        conn.execute(
+            "INSERT INTO bond_events(bank,owner,kind,what,evidence,at,status) "
+            "VALUES(?,?,?,?,?,?,'active')",
+            (bank, owner, kind, what, evidence[:500], stamp))
+        conn.commit()
+        return True, "added"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def list_events(db: str, bank: str, owner: str, *,
+                limit: int = 20) -> List[Dict[str, Any]]:
+    """最近的关系事件，新的在前。"""
+    if not db:
+        return []
+    try:
+        from bigfish.memory import connect
+
+        conn = connect(db, read_only=True)
+    except Exception:
+        try:
+            from bigfish.memory import connect as _c
+
+            conn = _c(db)
+        except Exception:
+            return []
+    try:
+        rows = conn.execute(
+            "SELECT * FROM bond_events WHERE bank=? AND owner=? AND status='active' "
+            "ORDER BY at DESC LIMIT ?", (bank, owner, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def events_for_prompt(db: str, bank: str, owner: str, *,
+                      limit: int = 6, max_chars: int = 500) -> str:
+    """把关系事件拼成一小段。没有就返回空串。"""
+    rows = list_events(db, bank, owner, limit=limit)
+    if not rows:
+        return ""
+    lines: List[str] = []
+    for row in rows:
+        label = EVENT_LABELS.get(str(row.get("kind")), "事件")
+        try:
+            when = time.strftime("%m-%d", time.localtime(
+                int(row.get("at") or 0) / 1000))
+        except Exception:
+            when = ""
+        line = f"- {when} {row.get('what')}".replace("  ", " ")
+        if label == EVENT_PROMISE:
+            line += "（说好的）"
+        lines.append(line)
+    body = "### 你们之间发生过的\n\n" + "\n".join(lines)
+    if len(body) > max_chars:
+        body = body[:max_chars].rstrip() + "…"
+    return body
+
+
+def set_stage(db: str, bank: str, owner: str, stage: str,
+              why: str = "") -> Tuple[bool, str]:
+    """换关系阶段。同一天重复写同一个阶段是幂等的。
+
+    阶段不是"好感度"，是一句描述：刚认识 / 熟了 / 有点依赖 /
+    闹过别扭 / 和好了。它只影响称呼和分寸，不影响任何权限。
+    """
+    stage = " ".join(str(stage or "").split())
+    why = " ".join(str(why or "").split())
+    if not stage or len(stage) > 40:
+        return False, "stage missing or too long"
+    if not db:
+        return False, "no db"
+    ensure_schema(db)
+    now = _now_ms()
+    try:
+        from bigfish.memory import connect
+
+        conn = connect(db)
+    except Exception as exc:
+        return False, f"db unavailable: {exc}"
+    try:
+        conn.execute(
+            "UPDATE bonds SET status='retired', updated_at=? "
+            "WHERE bank=? AND owner=? AND kind=? AND status='active'",
+            (now, bank, owner, KIND_STAGE))
+        conn.execute(
+            "INSERT OR REPLACE INTO bonds(bank,owner,kind,text,evidence,"
+            "source_owner,status,confidence,used_count,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,'', 'active',70,0,?,?)",
+            (bank, owner, KIND_STAGE, stage,
+             why or "阶段变化", now, now))
+        conn.commit()
+        return True, "saved"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_stage(db: str, bank: str, owner: str) -> str:
+    """当前关系阶段。没有返回空串。"""
+    rows = list_bonds(db, bank, owner, kind=KIND_STAGE, limit=1)
+    return str(rows[0].get("text") or "") if rows else ""
+
+
 def set_status(db: str, bond_id: int, status: str) -> bool:
     if status not in (STATUS_ACTIVE, STATUS_RETIRED, STATUS_REJECTED):
         return False
@@ -295,14 +491,22 @@ def render_for_prompt(db: str, bank: str, owner: str,
 
     address = [r for r in rows if r.get("kind") == KIND_ADDRESS]
     unsaid = [r for r in rows if r.get("kind") == KIND_UNSAID]
+    stage = [r for r in rows if r.get("kind") == KIND_STAGE]
 
     # 用三级标题：这一段现在是「## 你印象里的他」下面的子段。
     # 还写二级的话，模型会把它当成与「印象」并列的另一个来源，
     # 于是「我叫他老爸」和「他是个嘴硬心软的人」在它眼里就不是一回事了。
     parts: List[str] = []
+    # p1-6：先给"我们现在处在哪儿"，再给细节。
+    # 顺序反了的话，模型会拿一条三年前的称呼去解释今天的关系。
+    if stage:
+        parts.append("### 我们现在\n\n- " + str(stage[0]["text"]))
     if address:
         parts.append("### 我们之间怎么叫\n\n"
                      + "\n".join(f"- {r['text']}" for r in address[:6]))
+    events = events_for_prompt(db, bank, owner, limit=5)
+    if events:
+        parts.append(events)
     if unsaid:
         parts.append("### 当时没说出口的\n\n"
                      + "\n".join(f"- {r['text']}" for r in unsaid[:6]))

@@ -421,6 +421,14 @@ item("主动节奏", lambda: _run_unit("selftest_pace.py"))
 # 这两套 prompt 一旦分头演化，她"主动说的那句"就不像她了 ——
 # 而这种漂移不报错，只会让人觉得这个功能有点假。
 item("拼装一致", lambda: _run_unit("selftest_compose.py"))
+# 内在状态：表达预算 / 余韵 / 被无视。
+# 这三块是同一个回路（被无视 → 情绪掉 → 余韵留下 → 预算收紧），
+# 断任何一环的症状都一样：她不报错，只是回得像没事发生。
+item("内在状态", lambda: _run_unit("selftest_inner.py"))
+# 长大体检：日程 / 睡前复盘 / 关系事件 / 感知。
+# 这四块的共同风险是"编"——编日程、编成长、编事件、编天气。
+# 所以那一份以"不许"为主：不许编、不许填满、不许覆盖手写。
+item("长大", lambda: _run_unit("selftest_growth.py"))
 # 接话体检：不接 / 补一句 / 以及它们和"对方说话了""她睡了"的冲突。
 # 这类冲突不会报错，只会让她说出一句莫名其妙的话。
 item("接话与补一句", lambda: _run_unit("selftest_afterthought.py"))

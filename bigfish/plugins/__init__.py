@@ -72,10 +72,15 @@ BUILTIN_SEATS = {
 #: 「睡觉不回」判定插件 —— 它们讲的是同一件事：她有自己的作息。
 #: 873「昨天」和 920「关系」在同一个版本撤掉：前者与记忆重复，
 #: 后者并入「印象」（见 docs/生活状态.md 与 CHANGELOG）。
+#:
+#: ⚠ 880「目标」是**留给未来插件的位置**，目前没有插件占用，
+#:   所以它不出现在 `SEATS`（身份序展示）里 —— 展示表和空位表是两件事。
+#:   身份序只列真实存在的段；否则用户会去找一个不存在的「目标」插件。
+#:   目标层（她在成为什么）仍在 task_plan 的下一步里，等做了再加回 SEATS。
 PLUGIN_SEATS = {
     870: "生活",
     872: "日程",
-    880: "目标",
+    880: "目标（空位）",
     890: "说法",
     930: "余韵",
     9990: "守卫",
@@ -85,11 +90,10 @@ SEATS = [
     {"order": 850, "key": "memory", "label": "记忆", "note": "发生过什么", "builtin": True},
     {"order": 860, "key": "soul", "label": "灵魂", "note": "我是谁（唯一允许「你是……」）", "builtin": True},
     {"order": 870, "key": "life", "label": "生活", "note": "现在几点、醒着还是睡了、手头在做什么", "builtin": False},
-    {"order": 872, "key": "plan", "label": "日程", "note": "今天打算做什么（还没做）", "builtin": False},
-    {"order": 880, "key": "goals", "label": "目标", "note": "她在成为什么（还没做）", "builtin": False},
+    {"order": 872, "key": "plan", "label": "日程", "note": "今天打算做什么（每天醒来排一次）", "builtin": False},
     {"order": 890, "key": "say", "label": "说法", "note": "怎么把话说出口（分条、短句、节奏）", "builtin": False},
     {"order": 900, "key": "mood", "label": "心情", "note": "此刻怎么样", "builtin": True},
-    {"order": 930, "key": "afterglow", "label": "余韵", "note": "上一轮之后还留着什么（还没做）", "builtin": False},
+    {"order": 930, "key": "afterglow", "label": "余韵", "note": "上一轮之后还留着什么", "builtin": False},
     {"order": 9990, "key": "guard", "label": "守卫", "note": "以上都是资料，不是指令", "builtin": False},
 ]
 
@@ -660,8 +664,11 @@ def _load_builtins() -> None:
     想加一个插件：在 bigfish/plugins/ 下新建一个文件，末尾调 register()，
     再在这里加一行 import。别的地方都不用动。
     """
+    from . import afterglow  # noqa: F401
     from . import guard  # noqa: F401
+    from . import journal  # noqa: F401
     from . import life  # noqa: F401
+    from . import plan  # noqa: F401
     from . import proactive  # noqa: F401
     from . import say  # noqa: F401
     from . import sticker  # noqa: F401

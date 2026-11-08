@@ -111,6 +111,26 @@ hiddenimports = [
     # 表现成"她不回话了"，看不出是缺模块。
     "bigfish.loopguard",
     "bigfish.plugins.say",
+    # v0.10.0 内在状态三块 + 日程/复盘/感知。
+    # 这七个模块全部是**函数体内 import**（和 memory / life 同一个理由：
+    # 读失败不能拖垮启动）。漏一个的症状不是启动失败，而是：
+    #   · policy 漏了 → 她不报错，只是心情不再影响说话长短；
+    #   · afterglow 漏了 → 拌完嘴下一句当没发生（异常被 try 吞掉）；
+    #   · plan 漏了 → 她的一天退回静态池，看起来"功能没做完"；
+    #   · narrative 漏了 → 睡前复盘静默跳过，灵魂永远不变；
+    #   · senses 漏了 → 她不提天气，像没配城市。
+    # 全都是"不报错、只让她变笨"的类型，所以显式列出。
+    "bigfish.policy",
+    "bigfish.afterglow",
+    "bigfish.plan",
+    "bigfish.narrative",
+    "bigfish.senses",
+    # v0.10.1 每日日志：写本地 Markdown，不进提示词。
+    # 漏了它的症状：睡前什么都不发生，也不报错 —— 看起来像"没到点"。
+    "bigfish.journal",
+    "bigfish.plugins.afterglow",
+    "bigfish.plugins.plan",
+    "bigfish.plugins.journal",
     "wechatauto",
     "wechatauto.db",
     "wechatauto.uia_driver",

@@ -280,6 +280,27 @@ class LifeState:
     last_tick: float = 0.0
     #: 睡着期间收到的消息：{chat_id: {"count","first_at","last_at","preview"}}
     pending: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: 今天打算做的事（p1-4）。空 = 还没生成，`doing` 退回 DOING_SLOTS 取样。
+    #: 每项 {at:"14:00", what:"去趟超市", done:False, shareable:True, from:"fact"}
+    #:
+    #: 为什么放在 life.json 而不是新文件：日程和 doing 是同一个问题的两级精度
+    #: —— doing 是"此刻在做什么"，plan 是"今天打算做什么"。
+    #: 分成两份状态，迟早会漂（她说在看书，日程里却在超市）。
+    plan: List[Dict[str, Any]] = field(default_factory=list)
+    #: plan 是哪一天生成的。跨天不自动清，但生成失败时旧的 plan 不能当今天用。
+    plan_day: str = ""
+    #: 睡前复盘（p1-5/p1-6）跑过哪一天。一天只跑一次 ——
+    #: 它要调一次模型，重复跑只会让她每天多写几条一样的"我觉得"。
+    narrative_day: str = ""
+    #: 今天的日记写到哪一天了。一天一篇，重写同一天会覆盖。
+    journal_day: str = ""
+    #: 今天做过的事（按时段记，最多 12 条）。
+    #:
+    #: 为什么需要：日记要写"今天我是怎么过的"，只有一个当前 `doing`
+    #: 根本不够 —— 实测过，素材只有"在沙发上看书"时，模型自己编出了
+    #: 煮面、泡茶、楼下小孩、整理柜子。它不是在撒谎，是**没材料**。
+    #: 把一天里 doing 的变化记下来，它就有真实的锚点可写。
+    day_trace: List[Dict[str, Any]] = field(default_factory=list)
     #: 上次写盘的时刻与指纹（避免无变化写盘）
     saved_at: float = 0.0
     saved_fingerprint: str = ""
@@ -320,7 +341,14 @@ def _fingerprint(state: LifeState) -> str:
          # ⚠ 这里必须序列化**整个 pending**，不能只取键。
          #   只取键的话，同一个会话连发三条消息时指纹不变，
          #   save() 会以为"没变化"而跳过 —— count 永远停在 1。
-         json.dumps(state.pending, ensure_ascii=False, sort_keys=True)],
+         json.dumps(state.pending, ensure_ascii=False, sort_keys=True),
+         # 日程变化也要落盘：生成之后如果指纹不变，save() 会跳过，
+         # 内存里有 plan、磁盘上没有，重启就丢了一天。
+         json.dumps(state.plan, ensure_ascii=False, sort_keys=True),
+         state.plan_day,
+         state.narrative_day,
+         state.journal_day,
+         json.dumps(state.day_trace, ensure_ascii=False, sort_keys=True)],
         ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -360,6 +388,18 @@ def load(root: Optional[str] = None) -> LifeState:
             setattr(state, name, 0.0)
     if not isinstance(state.pending, dict):
         state.pending = {}
+    if not isinstance(state.plan, list):
+        state.plan = []
+    state.plan = [x for x in state.plan if isinstance(x, dict)]
+    if not isinstance(state.plan_day, str):
+        state.plan_day = ""
+    if not isinstance(state.narrative_day, str):
+        state.narrative_day = ""
+    if not isinstance(state.journal_day, str):
+        state.journal_day = ""
+    if not isinstance(state.day_trace, list):
+        state.day_trace = []
+    state.day_trace = [x for x in state.day_trace if isinstance(x, dict)][-12:]
     if not isinstance(state.day, str):
         state.day = ""
     if not isinstance(state.doing, str):
@@ -477,6 +517,8 @@ def plan_day(state: LifeState, now: float, *, waking: bool = False) -> None:
     state.extended_at = 0.0
     state.napped = False
     state.napping = False
+    # 新的一天，昨天的轨迹清掉 —— 日记只写今天。
+    state.day_trace = []
 
     if waking:
         # 老债已经兑现成"今天醒得晚"，现在衰减；不清零是因为欠债是累积的。
@@ -589,17 +631,203 @@ def _pick_doing(day: str, label: str, items: Tuple[Tuple[str, int], ...]) -> str
     return items[-1][0]
 
 
+def _plan_minutes(item: Dict[str, Any]) -> int:
+    """日程项的 HH:MM → 一天中的分钟。解析不出来返回 -1。"""
+    try:
+        hh, mm = str(item.get("at") or "").strip().split(":")
+        return int(hh) * 60 + int(mm)
+    except (TypeError, ValueError):
+        return -1
+
+
+def current_plan_item(state: LifeState, now: float) -> str:
+    """此刻应该在做的那件"计划里的事"。没有就空串。
+
+    取法：开始时间 ≤ 现在的最后一条。全是未来的话用第一条
+    （刚醒来时第一条通常就是"洗漱/吃早饭"，用第一条比空着更像人）。
+    """
+    entries = []
+    for item in state.plan or []:
+        if not isinstance(item, dict):
+            continue
+        m = _plan_minutes(item)
+        what = str(item.get("what") or "").strip()
+        if m < 0 or not what:
+            continue
+        entries.append((m, what, item))
+    if not entries:
+        return ""
+    entries.sort(key=lambda x: x[0])
+    minute = _minutes_of_day(now)
+    chosen = None
+    for m, what, item in entries:
+        if m <= minute:
+            chosen = what
+        else:
+            break
+    return chosen or entries[0][1]
+
+
+def mark_plan_done(state: LifeState, what: str, *, now: float) -> bool:
+    """标记某条日程做完了。按原文匹配，不做模糊 —— 宁可标不上，不要标错。"""
+    for item in state.plan or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("what") or "").strip() == str(what or "").strip():
+            if item.get("done"):
+                return False
+            item["done"] = True
+            item["done_at"] = float(now)
+            return True
+    return False
+
+
+def set_plan(state: LifeState, items: List[Dict[str, Any]], *,
+             day: str) -> None:
+    """换掉今天的日程。字段在这里统一夹一遍，不信模型给的形状。"""
+    clean: List[Dict[str, Any]] = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        what = " ".join(str(item.get("what") or "").split())[:40]
+        if not what:
+            continue
+        at = str(item.get("at") or "").strip()
+        if _plan_minutes({"at": at}) < 0:
+            continue
+        clean.append({
+            "at": at,
+            "what": what,
+            "done": bool(item.get("done")),
+            "shareable": item.get("shareable") is not False,
+            "from": str(item.get("from") or "self")[:12],
+        })
+    clean.sort(key=_plan_minutes)
+    state.plan = clean[:6]
+    state.plan_day = str(day or "")
+
+
+def plan_for_prompt(state: LifeState, *, now: float,
+                    limit: int = 4) -> str:
+    """给提示词的一段：今天打算做什么。
+
+    和 `doing` 分开写：doing 回答"你在干嘛"，这里回答"你今天还打算做什么"。
+    合在一起的话，模型会把"打算"当成"正在"，说出一句"我在去超市的路上"
+    而其实还没到点。
+    """
+    entries = [x for x in (state.plan or []) if isinstance(x, dict)]
+    if not entries:
+        return ""
+    entries = entries[:limit]
+    lines = []
+    for item in entries:
+        mark = "（做完了）" if item.get("done") else ""
+        lines.append(f"- {item.get('at')} {item.get('what')}{mark}")
+    if not lines:
+        return ""
+    return ("## 你今天打算做的\n\n" + "\n".join(lines)
+            + "\n\n（这是你自己排的。已经过去又没做的就过去了，"
+              "不用解释、不用补做；还没到的别提前说成正在做。）")
+
+
+def goodnight_due(state: LifeState, now: float, last_touch: float, *,
+                  before: float = 20 * 60,
+                  quiet: float = 40 * 60) -> bool:
+    """该不该道别（"我先睡啦"）。
+
+    纯函数，注入 now / last_touch 便于离线测。三道闸：
+
+      1. 醒着，且落在入睡前 `before` 秒内；
+      2. 最近 `quiet` 秒内有过互动（对方说话或她回话）；
+      3. 还没说过 —— 由调用方记 `goodnight_day`，这里只看状态。
+
+    为什么要有第 2 条：对空气说"我先睡啦"不是温柔，是诡异。
+    她只在你还在的时候道别；你早就不说话了，她默默去睡。
+    """
+    if state is None:
+        return False
+    try:
+        if bool(getattr(state, "asleep", False)):
+            return False
+        bedtime = float(getattr(state, "bedtime", 0) or 0)
+        if bedtime <= 0:
+            return False
+        if not (bedtime - float(before) <= now < bedtime):
+            return False
+        if not last_touch:
+            return False
+        return (now - float(last_touch)) <= float(quiet)
+    except (TypeError, ValueError):
+        return False
+
+
+#: 日记：入睡前多久开始写（秒）。
+JOURNAL_BEFORE = 20 * 60
+#: 日记：睡后多久还允许补写（秒）。
+#:
+#: 她可能提前困倒（精力耗尽直接睡），也可能写的时候程序没开。
+#: 补写一篇"今天"的日记仍然合理 —— 回忆今天，不是撒谎。
+JOURNAL_GRACE = 2 * 3600
+
+
+def journal_due(state: LifeState, now: float, *,
+                before: int = JOURNAL_BEFORE,
+                grace: int = JOURNAL_GRACE) -> bool:
+    """该不该写今天的日记。
+
+    窗口：`[bedtime - before, bedtime + grace)`。
+
+    为什么跟着 `bedtime` 而不是固定 23:00：她的入睡点每天在抖
+    （23:20 ± 42 分钟），熬夜还会往后推。写死的钟点会和她真正的
+    作息错位 —— 她 00:02 才睡，日志 23:00 就写完了，等于提前交卷。
+
+    为什么睡后还留 grace：
+    · 她可能提前困倒，`asleep` 已经 True；
+    · 也可能那个点程序没开。
+    这两种情况补写都合理。
+
+    为什么不能无限补：第二天醒来 `plan_day` 会清空 `day_trace`，
+    再补昨天的日记只剩空壳，或者靠编。
+
+    ⚠ 这里**故意不看 `asleep`**：睡后 grace 内仍然可写。
+      真正决定"今天过完没有"的是 `journal_day`，由调用方判。
+    """
+    if state is None:
+        return False
+    try:
+        bedtime = float(getattr(state, "bedtime", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if bedtime <= 0:
+        return False
+    return bedtime - float(before) <= now < bedtime + float(grace)
+
+
 def refresh_doing(state: LifeState, now: float) -> bool:
     """跨时段才换事。返回是否变了。
 
     种子用 `day_key(now)` 而不是 `state.day`：跨过午夜还醒着时，
     "深夜"这一档也该按新的一天重新取样，否则她会连着两晚做同一件事。
+
+    p1-4：今天有日程时，此刻在做什么**以日程为准**。
+    静态池降级成"日程没生成时的兜底" —— 不这样，她的一天永远是
+    那几件模板事，第 20 次说"我在收拾屋子"，用户会听出来。
     """
     label, items = _slot_for(now)
     if state.doing_slot == label and state.doing:
         return False
     state.doing_slot = label
-    state.doing = _pick_doing(day_key(now), label, items)
+    state.doing = (current_plan_item(state, now)
+                   or _pick_doing(day_key(now), label, items))
+    # 记进今天的轨迹：日记要"今天我是怎么过的"，只有一个当前 doing
+    # 不够。同一条事不重复记（跨时段可能抽到同一句）。
+    try:
+        trace = [x for x in (state.day_trace or []) if isinstance(x, dict)]
+        if not trace or str(trace[-1].get("doing")) != state.doing:
+            trace.append({"at": float(now), "doing": state.doing})
+        state.day_trace = trace[-12:]
+    except Exception:
+        pass
     return True
 
 

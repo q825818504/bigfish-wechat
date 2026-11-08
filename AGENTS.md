@@ -41,7 +41,7 @@ python tools/setup-git-token.py
 | `.planning/architecture.md` | 模块职责、分层理由 |
 | `.planning/git-push.md` | 推送凭证怎么配的 |
 | `CHANGELOG.md` | 每个版本改了什么（**用户视角**） |
-| `docs/` | 功能说明（生活状态 / 主动与关系 / 接话与补一句 / 部署验证） |
+| `docs/` | 功能说明（生活状态 / 内在状态 / 日程与复盘 / 日志 / 主动与关系 / 接话与补一句 / 部署验证） |
 
 ---
 
@@ -55,7 +55,7 @@ python tools/setup-git-token.py
 - **改完跑自检**：
 
 ```bash
-python tools/selftest.py                        # 源码全套（21 项）
+python tools/selftest.py                        # 源码全套（23 项）
 dist/BigFish/BigFish.exe --selftest             # 打包版（要管理员）
 ```
 

@@ -34,6 +34,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -716,6 +717,100 @@ def trait_sentence(key: str, value: Any) -> str:
     v = _norm_trait(value, DEFAULT_TRAITS.get(key, 50))
     desc = doc["low"] if v <= 40 else (doc["high"] if v >= 60 else doc["mid"])
     return f"{doc['label']}：{desc}。"
+
+
+#: 她自己长出来的条目长这样：`（11-08）关于他：以前……，现在……。`
+#: 前缀只用来区分"谁写的"，不影响渲染 —— selfNotes 是同一段注入。
+EVOLVED_PREFIX = re.compile(r"\A（\d{2}-\d{2}）")
+
+#: 自动条目最多留几条。超了删最旧的。
+#:
+#: 为什么是 12：selfNotes 会整段进 system。20 条之后它就变成
+#: 一段"她的自我陈述"，占掉本该给对话的空间，而且老条目会和新条目打架。
+MAX_EVOLVED_NOTES = 12
+
+
+def evolve_soul(changed_views: Any, summary: str = "", *,
+                path: Optional[str] = None) -> Tuple[bool, int, str]:
+    """让灵魂因为今天的经历长一点（p1-5）。
+
+    写进 `selfNotes`（她自己知道的事），带 `（MM-DD）` 前缀，
+    并往 `history` 追加一条演化记录。**不新开文件、不新开字段** ——
+    用户明确要求"融入到灵魂那里"。
+
+    三条约束：
+    1. 只追加，不覆盖用户手写的条目；
+    2. 自动条目上限 `MAX_EVOLVED_NOTES`，超了删最旧的自动条目
+       （用户手写的永远不删，因为它们没有前缀）；
+    3. `locked` 不适用 —— selfNotes 本来就没有锁定态。
+
+    返回 (是否写入, 写入条数, 错误)。
+    """
+    if not isinstance(changed_views, list) or not changed_views:
+        return False, 0, "no changed views"
+    target = path or soul_path()
+    if not target:
+        return False, 0, "范围未确定，无法保存"
+
+    soul, _exists, err = read_soul_file(target)
+    if err:
+        # 读失败就不要写：半份灵魂比不写更糟。
+        return False, 0, err
+    soul = normalize_soul(soul)
+
+    notes = list(soul.get("selfNotes") or [])
+    history = list(soul.get("history") or [])[:200]
+    now = int(time.time() * 1000)
+    day = time.strftime("%m-%d", time.localtime())
+
+    added = 0
+    for item in changed_views:
+        if not isinstance(item, dict):
+            continue
+        about = " ".join(str(item.get("about") or "").split())[:8]
+        before = " ".join(str(item.get("from") or "").split())[:40]
+        after = " ".join(str(item.get("to") or "").split())[:60]
+        why = " ".join(str(item.get("why") or "").split())[:60]
+        if not after:
+            continue
+        # 已经这么认为了，就不重复记 —— 每天写一遍同样的话，
+        # 那不是演化，是复读。
+        if any(after in str(n) for n in notes):
+            continue
+        line = f"（{day}）"
+        if about:
+            line += f"关于{about}："
+        if before:
+            line += f"以前{before}，现在{after}。"
+        else:
+            line += f"{after}。"
+        if len(line) > 200:
+            line = line[:200]
+        notes.append(line)
+        history.append({
+            "at": now, "kind": "evolved", "day": day,
+            "about": about, "from": before, "to": after, "why": why,
+        })
+        added += 1
+
+    if not added:
+        return False, 0, "nothing new"
+
+    # 超限：只砍自动条目，从最旧的开始。
+    evolved_idx = [i for i, n in enumerate(notes)
+                   if isinstance(n, str) and EVOLVED_PREFIX.match(n)]
+    if len(evolved_idx) > MAX_EVOLVED_NOTES:
+        drop = set(evolved_idx[:len(evolved_idx) - MAX_EVOLVED_NOTES])
+        notes = [n for i, n in enumerate(notes) if i not in drop]
+
+    if summary:
+        history.append({"at": now, "kind": "day_summary",
+                        "day": day, "text": " ".join(str(summary).split())[:120]})
+
+    soul["selfNotes"] = notes
+    soul["history"] = history[-200:]
+    ok, _normalized, werr = write_soul_file(target, soul)
+    return ok, added if ok else 0, werr
 
 
 # ══════════════════════════════════════════════════════════════════════════

@@ -123,7 +123,9 @@ def main() -> int:
     check("两个都默认开启", plife["enabled"] and guard["enabled"])
     # 合并后的「生活」把时间精度、时段语气、状态、欠债、只对主人安静、
     # 日志报醒来时间放在一起 —— 数量变了，但都是同一件事的参数。
-    check("life 有 6 个可调参数", len(plife["configFields"]) == 6,
+    # v0.10.0 又多了一个 weather_city：它和"现在几点"同属"她所处的环境"，
+    # 所以没开新页，而是挂在这里（感知层读它去查天气）。
+    check("life 有 7 个可调参数", len(plife["configFields"]) == 7,
           str([f["key"] for f in plife["configFields"]]))
     check("life 同时是注入类和判定类",
           set(plife.get("scopes") or []) == {"prompt", "gate"},

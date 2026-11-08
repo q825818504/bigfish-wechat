@@ -214,6 +214,27 @@ FOLLOWUP_BASE_PROBABILITY = 0.38
 #: 追问概率上限
 FOLLOWUP_MAX_PROBABILITY = 0.62
 
+# ── 被无视（p0-1）──────────────────────────────────────────────────
+#
+# 以前"发了没人回"只记进 dropped，没有任何代码读它 ——
+# 于是她发十条没人回，第十一条的分数、概率、语气一模一样。
+# 真人有这个回路：没回应 → 收敛 → 换方式 → 再没回应 → 干脆不问。
+#
+# 这几个数决定"多久算被无视、收敛多重、什么时候开口问一句"。
+#: 主动消息发出后多久没回，算一次"被无视"（小时）。
+#: 比追问的 6 小时宽容：追问是"她还想说"，被无视是"她承认没接上"。
+NEGLECT_AFTER_HOURS = 8.0
+#: 被无视的累计上限。到 3 就是"她基本不再主动找你了"，只剩追问和 check_in。
+NEGLECT_MAX = 3
+#: 每次被无视，主动分数乘多少（1 级 / 2 级 / 3 级）。
+NEGLECT_PENALTY = (1.0, 0.75, 0.50, 0.30)
+#: 惩罚至少持续多久（小时）。不设这个，一次"他回来了"就把气全消了。
+NEGLECT_PENALTY_HOURS = 6.0
+#: 第几级开始允许问"你最近很忙吗"。2 = 连着两批没回之后。
+CHECK_IN_MIN_LEVEL = 2
+#: 同一个问题多久之内只问一次（小时）。
+CHECK_IN_COOLDOWN_HOURS = 24.0
+
 #: 状态里留多少条发送记录
 KEEP_RECENT = 60
 KEEP_DROPPED = 40
@@ -266,6 +287,15 @@ class ProactiveState:
     miss_streak: int = 0
     #: 上次**掷骰**的时刻（中没中都算）。没有它，引擎每分钟都会重掷。
     last_roll_at: float = 0.0
+    # ── 被无视（p0-1）──
+    #: 0~3。每有一批主动消息被彻底放下就 +1，对方出现一次就 -1。
+    #: 它只压缩**主动开口**的分数与频率，不影响回复 ——
+    #: 她不会因为被无视就不回你，那是两件事。
+    neglect_level: int = 0
+    #: 惩罚至少持续到什么时候（epoch 秒）。过点之前不接受"他回来了"的赎回。
+    penalty_until: float = 0.0
+    #: 上一次问"你最近很忙吗"的时刻。同一个问题一晚只问一次。
+    last_check_in_at: float = 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -796,6 +826,9 @@ def collect(st: ProactiveState, *, chat_id: str, now: float, me: str,
     add(candidate_whim, st, chat_id=chat_id, now=now, life_state=life_state)
     add(candidate_recall, st, chat_id=chat_id, now=now, owner=owner,
         tier=tier, db_path=db_path)
+    # p0-1：连着两批没回之后的那句"你最近很忙吗"。
+    # 它排在最后 add，但分数 78 会自己排上去。
+    add(candidate_check_in, st, chat_id=chat_id, now=now)
 
     out.sort(key=lambda c: -c.score)
     return out
@@ -1118,11 +1151,21 @@ def note_dry(st: ProactiveState, *, chat_id: str, source: str, text: str,
 
 
 def note_peer_replied(st: ProactiveState, *, chat_id: str, now: float) -> bool:
-    """对方回来了。清掉待追问状态。"""
-    item = st.awaiting.pop(chat_id, None)
-    if item is None:
-        return False
-    return True
+    """对方回来了。清掉待追问，并让"被无视"的等级回落一级。
+
+    回落是一级一级的：他出现一次，她从"基本不主动"回到"还会试试"，
+    但不会立刻满血 —— 连着两次没回，一句"在吗"消不完。
+
+    `penalty_until` 之前不赎回：她还在那个劲儿里，不会因为一条消息翻篇。
+    这就是余韵（管语气）和这里（管主动频率）分工的地方。
+    """
+    had = st.awaiting.pop(chat_id, None) is not None
+    level = int(getattr(st, "neglect_level", 0) or 0)
+    if level > 0:
+        if now >= float(getattr(st, "penalty_until", 0) or 0):
+            st.neglect_level = level - 1
+        return True
+    return had
 
 
 def mark_followed_up(st: ProactiveState, *, chat_id: str, now: float,
@@ -1140,7 +1183,12 @@ def mark_followed_up(st: ProactiveState, *, chat_id: str, now: float,
 
 
 def mark_forgotten(st: ProactiveState, *, chat_id: str, now: float) -> None:
-    """她忘了。记进 dropped，但不主动提。"""
+    """她忘了。记进 dropped，但不主动提。
+
+    `reacted=False` 是 p0-1 加的：这条记录会先被情绪层消费一次
+    （她心里沉一下、主动收敛），消费完才置 True。
+    以前没有任何代码读 dropped，所以"发了没人回"对她没有任何影响。
+    """
     item = st.awaiting.pop(chat_id, None)
     if not isinstance(item, dict):
         return
@@ -1148,7 +1196,97 @@ def mark_forgotten(st: ProactiveState, *, chat_id: str, now: float) -> None:
         "at": now, "chat_id": chat_id,
         "source": str(item.get("source") or ""),
         "text": str(item.get("text") or "")[:80],
+        "reacted": False,
     })
+
+
+def expire_neglect(st: ProactiveState, *, now: float,
+                   hours: float = NEGLECT_AFTER_HOURS) -> int:
+    """超过 NEGLECT_AFTER_HOURS 还没回、也没追问的，转成"被无视"。
+
+    为什么比 FOLLOWUP_GIVE_UP_HOURS（30h）短这么多：
+    追问是"她还想说"，等 30 小时是为了给足对方出现的窗口；
+    被无视是"她承认这次没接上"，8 小时已经足够一个白天了。
+    两个判据分开，才不会出现"她等了一个整天还装作没事"。
+    """
+    n = 0
+    for chat_id in list(st.awaiting):
+        item = st.awaiting.get(chat_id)
+        if not isinstance(item, dict):
+            st.awaiting.pop(chat_id, None)
+            n += 1
+            continue
+        if _hours_since(float(item.get("sent_at") or 0), now) >= hours:
+            mark_forgotten(st, chat_id=chat_id, now=now)
+            n += 1
+    return n
+
+
+def unreacted_dropped(st: ProactiveState) -> List[Dict[str, Any]]:
+    """还没被情绪层消费过的"没回"记录。"""
+    out = []
+    for item in st.dropped or []:
+        if isinstance(item, dict) and not item.get("reacted"):
+            out.append(item)
+    return out
+
+
+def note_neglect_reacted(st: ProactiveState, items: List[Dict[str, Any]], *,
+                         now: float) -> int:
+    """消费掉这批"没回"，并让被无视的等级 +1。返回新等级。"""
+    for item in items:
+        if isinstance(item, dict):
+            item["reacted"] = True
+    level = min(NEGLECT_MAX, int(getattr(st, "neglect_level", 0) or 0) + 1)
+    st.neglect_level = level
+    st.penalty_until = max(float(getattr(st, "penalty_until", 0) or 0),
+                           now + NEGLECT_PENALTY_HOURS * 3600)
+    return level
+
+
+def penalty(st: ProactiveState, *, now: float) -> float:
+    """主动开口的分数系数。1.0 = 没有惩罚。
+
+    为什么乘在分数上、而不是直接不给候选：
+    乘分数会同时降命中率和排序位次，但**不会把话说死** ——
+    哪天真有很重的事（重要日期、未完话头），分数够高还是能穿过去。
+    如果直接返回空候选，她会连"你上次说要体检"都不提了，
+    那不是收敛，那是坏掉。
+    """
+    level = int(getattr(st, "neglect_level", 0) or 0)
+    if level <= 0:
+        return 1.0
+    idx = max(0, min(len(NEGLECT_PENALTY) - 1, level))
+    return float(NEGLECT_PENALTY[idx])
+
+
+def candidate_check_in(st: ProactiveState, *, chat_id: str,
+                       now: float) -> Optional[Candidate]:
+    """连着两批没回之后，她可能会开口问一句"你最近是不是很忙"。
+
+    这是 p0-1 里唯一一次"她要一个答案"的主动。语气克制：
+    不是质问、不是撒娇、不是最后通牒 —— 是试探。
+    真人第三次被放鸽子才会开口问，前两次只会自己往回收。
+
+    分数给 78：高到能穿过日常竞争，但低于重要日期（88），
+    所以她不会因为你生日那天也先问"你忙吗"。
+    """
+    level = int(getattr(st, "neglect_level", 0) or 0)
+    if level < CHECK_IN_MIN_LEVEL:
+        return None
+    last = float(getattr(st, "last_check_in_at", 0) or 0)
+    if last and (now - last) < CHECK_IN_COOLDOWN_HOURS * 3600:
+        return None
+    recent = st.dropped[-1] if st.dropped else {}
+    silent = _hours_since(float(recent.get("at") or 0), now) if recent else 0.0
+    reason = (f"你前面主动说了 {level + 1} 次，他一次都没接。"
+              f"你不是在质问，是想确认一下他最近是不是真的很忙。")
+    return Candidate(
+        source="check_in", chat_id=chat_id, score=78.0, reason=reason,
+        layer="tone",
+        tone_text="你有点拿不准他是不是不想理你了，但还是愿意先问一句",
+        material={"neglect_level": level, "silent_hours": round(silent, 1)},
+        anchor_at=float(recent.get("at") or 0))
 
 
 def expire_awaiting(st: ProactiveState, *, now: float) -> int:
