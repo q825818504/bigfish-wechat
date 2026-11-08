@@ -1727,3 +1727,18 @@ Qt 找不到匹配的槽，调用静默失败。犯过两次
 
 **教训**：发布审计不能只看 `build_portable.py` 的“已知敏感文件”列表；
 必须用 zip 名单反查 `config|data|keys|credentials|sqlite|wav`，并以实际产物为准。
+
+
+## 2026-11-08 22:25 — v0.11.0 已发布
+
+- 主分支提交：`a08945a v0.11.0：接入声音插件与语音气泡，重写 README 并加固发布包`
+- 标签：`v0.11.0`（annotated，指向 a08945a）
+- Release：https://github.com/q825818504/bigfish-wechat/releases/tag/v0.11.0
+- 附件：
+  - `BigFish-0.11.0-portable.zip` 200.4 MB，SHA-256 `f637edb8c8a4b087f0564cd6c3310b9a743a8e7506d738f8c4194602ab42b561`
+  - `BigFish-0.11.0-manifest.json`
+- 远端 manifest：343 文件；excluded 已写明 `data/`、`wechatauto_db/`、
+  `voice/`、config/settings/plugins、keys、sqlite/wav/mp3/log。
+- 发布后核验：Release API 200；附件大小与 manifest 一致；远端 main 与 tag 已推送。
+- 发布后补了一行 manifest 的 `excluded` 元数据，提交在 main 上；tag 仍指向
+  a08945a，不影响已上传的 zip（zip 内容的实际排除逻辑在 tag 内）。

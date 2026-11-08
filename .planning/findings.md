@@ -38,3 +38,13 @@
 - 示例音色 ID 为 `YOUR_VOICE_ID`，示例 Key 为空；
 - 目录中的 `data-backup/`、`dist/`、`release/`、`.tmp/`、`.secrets/`
   均被忽略，不能进入提交。
+
+
+## 发布结果
+
+- Release URL: https://github.com/q825818504/bigfish-wechat/releases/tag/v0.11.0
+- Tag object: `84876780560b2be1677e84c1b6849c8a6b499073`
+- Tag peeled commit: `a08945ae9d03189935f7d86655bb63297141d7f6`
+- Zip SHA-256: `f637edb8c8a4b087f0564cd6c3310b9a743a8e7506d738f8c4194602ab42b561`
+- Zip 343 files / 210,170,682 bytes
+- 远端 manifest 已包含 `wechatauto_db/`、`keys.json` 等排除项。

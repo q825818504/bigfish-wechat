@@ -87,7 +87,11 @@ manifest = {
     'archive_bytes': size,
     'archive_sha256': h.hexdigest(),
     'file_count': len(files),
-    'excluded': ['data/', 'config.json', 'settings.json', 'plugins.json'],
+    'excluded': [
+        'data/', 'wechatauto_db/', 'voice/', 'config.json',
+        'settings.json', 'plugins.json', 'keys.json', 'keys.json.bak',
+        'image_keys.json', 'credentials.json', '*.sqlite3', '*.wav', '*.mp3', '*.log',
+    ],
     'note': '便携版：解压到任意目录，双击 BigFish.exe。需要管理员权限（UIA 发送）。',
 }
 mp = os.path.join(OUT, f'BigFish-{VERSION}-manifest.json')
