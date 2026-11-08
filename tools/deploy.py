@@ -218,6 +218,15 @@ def deploy() -> None:
 
     if internal_old.exists():
         shutil.rmtree(internal_old, ignore_errors=True)
+
+    # 外部文档/示例配置也要跟着新包走。只更新 _internal 的话，
+    # 用户打开 exe 旁边那份 config.example.json 会看到几个月前的字段，
+    # 误以为新功能没打包进来。
+    for name in ("config.example.json", "README.md"):
+        src = ROOT / name
+        if src.is_file():
+            shutil.copy2(src, DIST / name)
+
     log("程序文件已覆盖（data / config 未动）")
 
 

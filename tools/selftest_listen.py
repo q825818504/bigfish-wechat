@@ -171,6 +171,16 @@ def test_listen() -> None:
     check("is_self 返回 None", b.feed(msg("c1", "我", "我说的话", at=0.0, is_self=True)) is None, "not None")
     check("is_self 不建桶", b.pending() == {}, f"{b.pending()}")
 
+    # 8.1) allow_self 明确放行的会话要进批（filehelper 自测通道）
+    b2 = L.MessageBatcher(clock=clock,
+                          allow_self_for=lambda c: c == "filehelper")
+    b2.feed(msg("filehelper", "我", "自己发的测试", at=1.0, is_self=True))
+    check("allow_self 放行后进批", "filehelper" in b2.pending(), f"{b2.pending()}")
+    b3 = L.MessageBatcher(clock=clock,
+                          allow_self_for=lambda c: c == "filehelper")
+    b3.feed(msg("c1", "我", "别的会话", at=1.0, is_self=True))
+    check("allow_self 只放行指定会话", b3.pending() == {}, f"{b3.pending()}")
+
     # 9) 多会话互不干扰
     #    这里用固定窗口（adaptive=False）：测的是"两个会话不是同一个桶"，
     #    不该被自适应的秒数变化牵着走。

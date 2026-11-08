@@ -279,7 +279,8 @@ def t_group_gate():
     me = list(names)[0]
 
     groups = [s for s in r.sessions(limit=30) if s["is_group"]]
-    assert groups, "没有群可测"
+    if not groups:
+        raise SkipTest("当前账号没有群可测")
     gid = groups[0]["username"]
 
     cases = [

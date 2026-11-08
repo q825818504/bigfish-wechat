@@ -196,9 +196,13 @@ class MessageBatcher:
         policy: Optional[ListenPolicy] = None,
         *,
         clock: Callable[[], float] = time.monotonic,
+        allow_self_for: Optional[Callable[[str], bool]] = None,
+        on_log: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.policy = policy or ListenPolicy()
         self._clock = clock
+        self._allow_self_for = allow_self_for
+        self._on_log = on_log
         self._lock = threading.Lock()
         self._buckets: Dict[str, _Bucket] = {}
 
@@ -211,7 +215,15 @@ class MessageBatcher:
         传进来才会启用回复后冷却（见 ListenPolicy.post_reply_grace）。
         """
         if msg.is_self:
-            return None
+            # 自己的消息默认不进批（否则她会回自己）。只有 allow_self
+            # 明确放行的会话（filehelper 自测通道）才继续。
+            allowed = bool(self._allow_self_for
+                           and self._allow_self_for(msg.chat_id))
+            if not allowed:
+                if self._on_log:
+                    self._on_log(f"[跳过] {msg.chat_name or msg.chat_id}："
+                                 "自己发的消息；allow_self 没对这个会话开")
+                return None
         now = self._clock()
         at = msg.received_at or now
 

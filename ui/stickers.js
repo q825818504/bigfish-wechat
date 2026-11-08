@@ -28,9 +28,16 @@ async function syncPluginNav() {
     const on = !!S.plugEnabled.sticker;
     if (nav) nav.hidden = !on;
 
-    // 插件刚被关掉，而用户正停在表情包页 → 跳走
+    // 声音也是插件：勾上才出现侧栏入口。声音页自己负责 API/Key 配置，
+    // 这里只同步可见性，不碰任何数据。
+    const voiceNav = document.querySelector('.nav-item[data-page="voice"]');
+    const voiceOn = !!S.plugEnabled.voice;
+    if (voiceNav) voiceNav.hidden = !voiceOn;
+
+    // 插件刚被关掉，而用户正停在那个页 → 跳走
     const cur = document.querySelector('.page.is-active');
-    if (!on && cur && cur.dataset.page === 'stickers') {
+    if ((!on && cur && cur.dataset.page === 'stickers') ||
+        (!voiceOn && cur && cur.dataset.page === 'voice')) {
       go('plugins');
     }
   } catch (e) {

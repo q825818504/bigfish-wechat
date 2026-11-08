@@ -739,6 +739,8 @@ def candidate_date(st: ProactiveState, *, chat_id: str, now: float,
 def candidate_silence(st: ProactiveState, *, chat_id: str, now: float,
                       last_peer_at: float) -> Optional[Candidate]:
     """好久没说话。一周最多两次。"""
+    if not last_peer_at:
+        return None
     hours = _hours_since(last_peer_at, now)
     if hours < SILENCE_MIN_HOURS:
         return None
@@ -996,16 +998,18 @@ def hit_probability(*, score: float, now: float, last_sent_at: float,
     base = _base_rate(score)
 
     since_sent = (now - last_sent_at) / 60.0 if last_sent_at else 1e9
-    since_peer = (now - last_peer_at) / 60.0 if last_peer_at else 1e9
+    # None = 还没有对话记录。不能拿 1e9 当分钟数再除 60：
+    # 那会算出「16666667 小时没说话」，启动时日志直接变成笑话。
+    since_peer = (now - last_peer_at) / 60.0 if last_peer_at else None
 
     factor, why = 1.0, ""
     if since_sent < TIMING_JUST_SENT_MINUTES:
         factor, why = TIMING_JUST_SENT_FACTOR, "刚发过"
     elif since_sent < TIMING_RECENT_SENT_MINUTES:
         factor, why = TIMING_RECENT_SENT_FACTOR, "刚发过不久"
-    elif since_peer < TIMING_CHATTING_MINUTES:
+    elif since_peer is not None and since_peer < TIMING_CHATTING_MINUTES:
         factor, why = TIMING_CHATTING_FACTOR, "你正在聊"
-    elif since_peer > TIMING_COLD_HOURS * 60:
+    elif since_peer is not None and since_peer > TIMING_COLD_HOURS * 60:
         factor, why = TIMING_COLD_FACTOR, f"已经 {since_peer / 60:.0f} 小时没说话"
 
     bonus = min(MISS_BONUS_CAP, max(0, int(miss_streak or 0)) * MISS_BONUS_STEP)

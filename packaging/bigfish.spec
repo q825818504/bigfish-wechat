@@ -32,6 +32,10 @@ datas = []
 # 界面
 datas.append((os.path.join(ROOT, "ui"), "ui"))
 
+# 语音气泡：官方 VB-CABLE Pack45 + 31 文件哈希清单
+datas.append((os.path.join(ROOT, "vendor", "vb-cable"), "vb-cable"))
+datas.append((os.path.join(ROOT, "vendor", "vb-cable-pack45.json"), "."))
+
 # Node 桥接（作为外部脚本被 node 调用，不打进 exe）
 datas.append((os.path.join(ROOT, "bridge"), "bridge"))
 
@@ -105,6 +109,17 @@ hiddenimports = [
     # 三个都属于「漏了不会启动失败，只在真聊天时才炸」的类型。
     "bigfish.say",
     "bigfish.listen",
+    # 声音层：desktop 的声音页槽、后续 _compose 都是函数体内 import。
+    # 漏了它的症状和 say 一样 —— 启动正常，点「声音」或真出声时才 ImportError。
+    "bigfish.voice",
+    "bigfish.voice_audio",
+    "bigfish.voice_director",
+    "bigfish.voice_policy",
+    "bigfish.voice_text",
+    "bigfish.voice_audio_out",
+    "bigfish.voice_bubble",
+    "bigfish.voice_driver",
+    "bigfish.plugins.voice",
     # 自环防护：LoopGuard 在 EngineWorker._run() 里局部 import。
     # 漏了它的后果很隐蔽 —— 程序照常启动、界面照常打开，只有真正开始
     # 收消息时才 ImportError，而且那个异常会被 handle 的 try 吞掉，

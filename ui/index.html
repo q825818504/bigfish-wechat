@@ -54,6 +54,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="5"/><path d="M8.5 10h.01M15.5 10h.01" stroke-linecap="round"/><path d="M8.5 14.5c1 1.2 2.1 1.8 3.5 1.8s2.5-.6 3.5-1.8" stroke-linecap="round"/></svg>
         <span>表情包</span>
       </button>
+      <button class="nav-item" data-page="voice" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4a3 3 0 013 3v5a3 3 0 01-6 0V7a3 3 0 013-3z"/><path d="M5 11a7 7 0 0014 0M12 18v2"/></svg>
+        <span>声音</span>
+      </button>
       <button class="nav-item" data-page="data">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>
         <span>数据目录</span>
@@ -830,6 +834,239 @@
         </div>
       </section>
 
+      <!-- ═══════ 声音（插件启用后才出现在侧栏） ═══════ -->
+      <section class="page" data-page="voice">
+        <div class="page-heading">
+          <div>
+            <h1>声音</h1>
+            <p>她自己的声音。接入参数和情绪参数都在这一页，改完点保存。</p>
+          </div>
+          <div class="heading-side" id="voiceState">—</div>
+        </div>
+
+        <div class="card" id="voiceDriverCard">
+          <div class="card-head">
+            <h2>语音气泡准备</h2>
+            <span class="tag" id="voiceDriverTag">检测中</span>
+          </div>
+          <div class="card-desc" style="margin-bottom:10px">
+            发微信语音气泡需要 <b>VB-CABLE</b> 虚拟声卡：本程序播放到
+            <b>CABLE Input</b>，微信麦克风选 <b>CABLE Output</b>。
+            驱动包已内置并做过 SHA256 校验，点一次安装即可，不用去官网找。
+          </div>
+          <div class="test-row">
+            <button class="btn btn-sm btn-primary" id="btnInstallVbCable" type="button">一键安装 VB-CABLE</button>
+            <button class="btn btn-sm" id="btnRefreshVoiceDevices" type="button">刷新声卡</button>
+            <button class="btn btn-sm" id="btnOpenSoundSettings" type="button">打开声音设置</button>
+            <span id="voiceDriverHint" class="test-result">正在检测…</span>
+          </div>
+          <small style="display:block;margin-top:8px;color:var(--muted);line-height:1.7">
+            安装会弹 Windows UAC；装完可能需要重启电脑/微信。VB-CABLE 是
+            VB-Audio Donationware，内置包保留官方 readme。
+          </small>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>模型接入</h2>
+            <span class="tag" id="voiceTag">未配置</span>
+          </div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field full">
+                <label>接口地址</label>
+                <input type="text" id="voiceBaseUrl" placeholder="https://api.breeze.blue">
+                <small>Breeze 固定是 <code>https://api.breeze.blue</code>；换别家时改这里和模型。</small>
+              </div>
+              <div class="field full">
+                <label>API Key</label>
+                <div class="key-row">
+                  <input type="password" id="voiceApiKey" placeholder="brz_…" autocomplete="off">
+                  <a href="https://breezeblue.ai/app/developer/api-keys" target="_blank" rel="noreferrer">去哪拿？</a>
+                </div>
+                <small>Key 只存本机 <code>config.json</code>，不会进插件配置导出。</small>
+              </div>
+              <div class="field">
+                <label>模型</label>
+                <select id="voiceModel">
+                  <option value="breeze-tts-2-multilingual">Breeze TTS 2 Multilingual</option>
+                  <option value="breeze-tts-2">Breeze TTS 2</option>
+                </select>
+                <small>多语言版支持 51 种语言，中文也在内。</small>
+              </div>
+              <div class="field">
+                <label>音色 ID</label>
+                <input type="text" id="voiceVoice" placeholder="voc_…">
+                <small>在 Breeze 控制台克隆/挑选后填这里；音色是身份，别每轮换。</small>
+              </div>
+              <div class="field">
+                <label>语言</label>
+                <input type="text" id="voiceLanguage" placeholder="zh" maxlength="2">
+                <small>中文填 <code>zh</code>。</small>
+              </div>
+              <div class="field">
+                <label>音色基线</label>
+                <select id="voiceProfile"></select>
+                <small>薄荷是明亮少女音：低落时不逼它压低嗓子，而是收住亮度。</small>
+              </div>
+              <div class="test-row">
+                <button class="btn btn-sm" id="btnVoiceTest" type="button">测试连接</button>
+                <span id="voiceTestResult" class="test-result">只查模型列表，不合成、不消耗积分。</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>表达参数</h2></div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field">
+                <label>语速</label>
+                <input type="number" id="voiceSpeed" step="0.01" min="0.5" max="2">
+                <small>固定 1.00；情绪靠 instructions 和停顿，不用它快进/慢放。</small>
+              </div>
+              <div class="field">
+                <label>Guidance</label>
+                <input type="number" id="voiceGuidance" step="0.1" min="1" max="10">
+                <small>越高越贴情境指令。情绪戏 1–3；日常 1–2。</small>
+              </div>
+              <div class="field">
+                <label>音量</label>
+                <input type="number" id="voiceVolume" step="0.01" min="0.01" max="2">
+                <small>保持 1.0；超过 1 可能削波。</small>
+              </div>
+              <div class="field">
+                <label>最长一轮（字）</label>
+                <input type="number" id="voiceMaxChars" step="10" min="20" max="1000">
+                <small>超过就只发文字，避免念成播报。</small>
+              </div>
+              <div class="field">
+                <label>缓存上限（MB）</label>
+                <input type="number" id="voiceCacheMb" step="10" min="0" max="5000">
+                <small>同一句不重复合成；超了按最旧清。</small>
+              </div>
+              <div class="field">
+                <label>超时（秒）</label>
+                <input type="number" id="voiceTimeout" step="1" min="5" max="180">
+                <small>超时不会自动重试，避免重复扣积分。</small>
+              </div>
+            </div>
+            <div class="test-row">
+              <button class="btn btn-sm" id="btnVoiceClearCache" type="button">清空声音缓存</button>
+              <span id="voiceCacheInfo" class="test-result">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>什么时候出声</h2></div>
+          <div class="form">
+            <div class="form-grid">
+              <div class="field">
+                <label>策略</label>
+                <select id="voiceStrategy">
+                  <option value="off">关闭：只发文字</option>
+                  <option value="request">只在我要求时</option>
+                  <option value="auto">自动判断（模型标记 + 概率）</option>
+                  <option value="probability">按概率</option>
+                  <option value="always">每条都发（测试）</option>
+                  <option value="preview">预演：只记日志，不出声</option>
+                </select>
+                <small>默认预演。命中语音后只发语音，不会再发同内容文字。</small>
+              </div>
+              <div class="field">
+                <label>发送形式</label>
+                <select id="voiceSendAs">
+                  <option value="file">音频文件（稳，推荐先跑）</option>
+                  <option value="bubble">微信语音气泡（实验性，需 VB-CABLE）</option>
+                </select>
+                <small>气泡会按住微信录音键 + 把音频播进 CABLE Input；文件不需要虚拟声卡。</small>
+              </div>
+              <div class="field">
+                <label>虚拟声卡播放端</label>
+                <select id="voiceDevice"><option value="">— 未选择 —</option></select>
+                <small id="voiceDeviceHint">选 <b>CABLE Input</b>；微信麦克风要选 <b>CABLE Output</b>。只在气泡模式用。</small>
+              </div>
+              <div class="field">
+                <label>微信录音快捷键</label>
+                <input type="text" id="voiceHotkey" placeholder="Ctrl+Alt" autocomplete="off">
+                <small>必须和微信「设置 → 快捷键 → 发语音」完全一致；程序负责按住和松开。</small>
+              </div>
+              <div class="field">
+                <label>自动判断的命中率</label>
+                <input type="number" id="voiceProbability" step="0.05" min="0" max="1">
+                <small>0.2 = 五次里大约一次。模型明确写 [[voice]] 时不受它限制。</small>
+              </div>
+              <div class="field">
+                <label>冷却（秒）</label>
+                <input type="number" id="voiceCooldown" step="30" min="0" max="86400">
+                <small>同一会话两条语音之间至少隔多久。0 = 不冷却。</small>
+              </div>
+              <div class="field">
+                <label>每天上限（条）</label>
+                <input type="number" id="voiceDailyLimit" step="1" min="0" max="999">
+                <small>0 = 不限。控制积分消耗的最后一道闸。</small>
+              </div>
+              <div class="field">
+                <label>连续语音上限（条）</label>
+                <input type="number" id="voiceConsecutive" step="1" min="0" max="20">
+                <small>连着几条语音后强制换文字。0 = 不限。</small>
+              </div>
+              <div class="field">
+                <label>语音最长字数</label>
+                <input type="number" id="voicePolicyMaxChars" step="10" min="10" max="400">
+                <small>默认 220 字，约 45–50 秒；合成后超过 50 秒也会自动改文字。</small>
+              </div>
+              <div class="field full">
+                <label>场景</label>
+                <div class="voice-checks">
+                  <label><input type="checkbox" class="voice-scene" data-scenes="sweet,warm,missing,comfort">亲密 / 撒娇 / 想念 / 安慰</label>
+                  <label><input type="checkbox" class="voice-scene" data-scenes="low,hurt,tired,worry,neglected">低落 / 受伤 / 累 / 担心</label>
+                  <label><input type="checkbox" class="voice-scene" data-scenes="happy,good_news">开心 / 好消息</label>
+                  <label><input type="checkbox" class="voice-scene" data-scenes="neutral,apology,proactive,guest">日常 / 道歉 / 主动</label>
+                  <label><input type="checkbox" class="voice-scene" data-scenes="late_night,morning_wake">深夜 / 刚醒</label>
+                  <label><input type="checkbox" class="voice-scene" data-scenes="conflict">拌嘴 / 冲突</label>
+                </div>
+                <small>没勾的场景一律发文字。拌嘴默认不勾：文字更稳，也不容易把气话念成撒娇。</small>
+              </div>
+              <div class="field full">
+                <label>内容过滤</label>
+                <div class="voice-checks">
+                  <label><input type="checkbox" id="voiceFilterUrl">含链接 → 文字</label>
+                  <label><input type="checkbox" id="voiceFilterCode">含代码 → 文字</label>
+                  <label><input type="checkbox" id="voiceFilterTable">表格 → 文字</label>
+                  <label><input type="checkbox" id="voiceFilterList">清单 → 文字</label>
+                  <label><input type="checkbox" id="voiceTagOverride">允许模型写 [[voice]] / [[text]]</label>
+                  <label><input type="checkbox" id="voiceFallback">语音失败补文字</label>
+                </div>
+                <small>代码、网址、表格念出来没有意义；模型标记不会被对方看到。</small>
+              </div>
+              <div class="field full">
+                <label>范围</label>
+                <div class="voice-checks">
+                  <label><input type="checkbox" id="voiceGroup">群里也发语音</label>
+                  <label><input type="checkbox" id="voiceOwnerOnly">只对主人发</label>
+                </div>
+                <small>群聊默认关闭。群里语音文件没有 @ 关系，别人也不知道在念给谁。</small>
+              </div>
+            </div>
+            <p class="voice-note">
+              <b>只要命中语音，就只发语音，不再发同内容文字</b>；语音上限 50 秒
+              （微信上限 60 秒，留 10 秒容错）。<br>
+              当前发送形式是 <b>音频文件</b>，不是微信原生语音气泡。个人微信协议不支持
+              发语音消息；要做语音气泡得用虚拟声卡 + UIA 录音，链路另开。
+              所以默认「先文字，再语音」：对方不点文件也能看懂内容。
+            </p>
+          </div>
+        </div>
+
+        <div class="save-bar">
+          <span class="save-hint" id="voiceSaveHint"></span>
+          <button class="btn btn-primary" id="btnVoiceSave">保存声音设置</button>
+        </div>
+      </section>
+
       <!-- ═══════ 数据目录 ═══════ -->
       <section class="page" data-page="data">
         <div class="page-heading">
@@ -1378,5 +1615,6 @@
 <script src="qwebchannel.js"></script>
 <script src="app.js"></script>
 <script src="stickers.js"></script>
+<script src="voice.js"></script>
 </body>
 </html>

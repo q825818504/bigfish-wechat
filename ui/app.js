@@ -20,7 +20,7 @@ window.S = S;
 const PAGE_TITLES = {
   overview: '概览', chats: '会话', soul: '灵魂',
   mood: '心情', memory: '记忆', impression: '印象',
-  stickers: '表情包', data: '数据目录',
+  stickers: '表情包', voice: '声音', data: '数据目录',
   plugins: '插件', settings: '设置', logs: '日志',
 };
 
@@ -59,6 +59,8 @@ function setText(sel, v) {
 /* ────────── 导航 ────────── */
 
 function go(page) {
+  const pagesEl = $('#pages');
+  if (pagesEl) pagesEl.scrollTop = 0;
   $$('.nav-item').forEach((b) => b.classList.toggle('is-active', b.dataset.page === page));
   $$('.page').forEach((p) => p.classList.toggle('is-active', p.dataset.page === page));
   setText('#breadcrumb', PAGE_TITLES[page] || page);
@@ -75,6 +77,14 @@ function go(page) {
       return;
     }
     loadStickers();
+  }
+  if (page === 'voice') {
+    if (!S.plugEnabled || !S.plugEnabled.voice) {
+      toast('先在插件页启用「声音」');
+      go('plugins');
+      return;
+    }
+    loadVoice();
   }
   if (page === 'data') loadDataRoot();
   if (page === 'plugins') { closePlugin(); loadPlugins(); }

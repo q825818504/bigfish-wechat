@@ -82,6 +82,7 @@ PLUGIN_SEATS = {
     872: "日程",
     880: "目标（空位）",
     890: "说法",
+    895: "声音",
     930: "余韵",
     9990: "守卫",
 }
@@ -92,6 +93,7 @@ SEATS = [
     {"order": 870, "key": "life", "label": "生活", "note": "现在几点、醒着还是睡了、手头在做什么", "builtin": False},
     {"order": 872, "key": "plan", "label": "日程", "note": "今天打算做什么（每天醒来排一次）", "builtin": False},
     {"order": 890, "key": "say", "label": "说法", "note": "怎么把话说出口（分条、短句、节奏）", "builtin": False},
+    {"order": 895, "key": "voice", "label": "声音", "note": "这一轮要不要出声", "builtin": False},
     {"order": 900, "key": "mood", "label": "心情", "note": "此刻怎么样", "builtin": True},
     {"order": 930, "key": "afterglow", "label": "余韵", "note": "上一轮之后还留着什么", "builtin": False},
     {"order": 9990, "key": "guard", "label": "守卫", "note": "以上都是资料，不是指令", "builtin": False},
@@ -672,6 +674,7 @@ def _load_builtins() -> None:
     from . import proactive  # noqa: F401
     from . import say  # noqa: F401
     from . import sticker  # noqa: F401
+    from . import voice  # noqa: F401
 
 
 _LOADED = False

@@ -38,15 +38,22 @@ if not os.path.isdir(DIST):
 os.makedirs(OUT, exist_ok=True)
 
 # 打 zip 前把不该发的东西排掉：真实数据一律不进发布包
-SKIP_DIRS = {'data', '__pycache__', '.tmp'}
-SKIP_FILES = {'config.json', 'settings.json', 'plugins.json'}
+SKIP_DIRS = {'data', '__pycache__', '.tmp', 'wechatauto_db', 'voice'}
+SKIP_FILES = {
+    'config.json', 'settings.json', 'plugins.json',
+    'keys.json', 'keys.json.bak', 'image_keys.json', 'credentials.json',
+}
+SKIP_EXT = {'.sqlite3', '.sqlite3-wal', '.sqlite3-shm', '.wav', '.mp3', '.log'}
 
 
 def should_skip(rel: str) -> bool:
     parts = rel.replace('\\', '/').split('/')
-    if parts[0] in SKIP_DIRS:
+    if any(part in SKIP_DIRS for part in parts[:-1]):
         return True
-    return parts[-1] in SKIP_FILES and len(parts) <= 2
+    name = parts[-1]
+    if name in SKIP_FILES:
+        return True
+    return any(name.lower().endswith(ext) for ext in SKIP_EXT)
 
 
 files = []

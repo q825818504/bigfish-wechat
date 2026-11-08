@@ -407,3 +407,48 @@ exe 自检 16/17（UIA 需管理员）。
 - 让模型修改 visibility —— 它一定会被诱导
 - 数据根跨目录自动共享 —— 见 decisions D-55
 - 为 0.4.1 单独发版 —— 见本文开头「发布策略」
+
+
+---
+
+## v0.11.0：声音插件收口、README 重写与 GitHub 发布
+
+> 2026-11-08 22:xx 新开阶段。目标不是再加功能，而是把已经在真机上跑通的
+> 声音链路收成一个可以公开的版本，并把个人数据挡在发布之外。
+
+### 目标
+
+1. 版本从 `0.10.6` 提升到 `0.11.0`，补 CHANGELOG 与 README。
+2. README 重写为面向新用户的通用说明，不出现任何个人会话、昵称、Key、音色 ID。
+3. 发布前做敏感面审计：`config.json`、`data/`、`data-backup/`、`.tmp/`、
+   `dist/`、`release/`、令牌文件都不进 Git / Release。
+4. 提交、打 tag、push、创建 GitHub Release，上传便携包与 manifest。
+5. 发布后验证 Release 附件清单，确认没有 `config.json` / `data/`。
+
+### 阶段
+
+- [x] 盘点代码、版本、远端、规划文件
+- [x] 清理示例中的真实音色 ID / 个人内容
+- [x] 重写 README（通用、可照做）
+- [x] 升版本 + CHANGELOG
+- [x] 跑自检与打包
+- [x] 生成 portable zip + manifest
+- [x] 审计 zip 内容（无配置/密钥/数据）
+- [ ] commit + tag + push
+- [ ] GitHub Release + 附件
+- [ ] 发布后核验
+
+### 发布硬门
+
+| 门 | 判定 |
+|---|---|
+| 真实 API Key | 仓库与 zip 中零出现；只允许 `YOUR_...` / `sk-...` 示例 |
+| 个人音色 ID | 配置示例与 README 用占位符 |
+| 聊天数据 | `data/`、`data-backup/`、`*.sqlite3`、`config.json` 不提交 |
+| 驱动包 | 只提交校验过的官方 VB-CABLE Pack45 与 manifest；官方 readme 保留 |
+| 附件 | zip 内不含 `config.json`、`settings.json`、`plugins.json`、`data/` |
+
+### 回滚
+
+- 提交前保留工作区改动；发布失败不强制推送。
+- 若 Release 附件误含敏感文件，立即删除附件与 Release，再修脚本重发。

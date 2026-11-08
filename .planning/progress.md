@@ -1689,3 +1689,41 @@ Qt 找不到匹配的槽，调用静默失败。犯过两次
 2. **`--selftest` 不跑引擎启动流程**，所以抓不到"一启动就崩"。
    现在打包前会跑 `pyflakes`，把未定义名挡在前面。
 3. **强杀进程前先备份数据**：SQLite WAL 会自动恢复，但备份是零成本的保险。
+
+
+## 2026-11-08 22:xx — v0.11.0 发布准备
+
+- 版本真源 `bigfish/__init__.py` 仍为 0.10.6，本轮升 0.11.0。
+- 远端 `origin` = github.com/q825818504/bigfish-wechat；凭证 helper 已配置。
+- `gh` CLI 不在 PATH；Release 走 `tools/make_release.py` 的 GitHub API。
+- 发现 `data-backup/config.json` 含真实模型/语音 Key，已被 `.gitignore` 忽略；
+  发布时只做显式 `git add`，不执行 `git add -A`。
+- 发现 `config.example.json` 与 `docs/声音.md` 含真实音色 ID；
+  改为 `YOUR_VOICE_ID`。
+- `vendor/vb-cable/` 已按官方 Pack45 的 31 文件 SHA256 清单校验；
+  `vendor/vb-cable-pack45.zip` 是重复下载缓存，加入忽略，不进仓库。
+- 下一步：重写 README、升版本、打包、审计 zip、提交/发布。
+
+
+### 2026-11-08 22:1x — 发布前审计抓到一次严重漏包
+
+`tools/build_portable.py` 第一版只排除了 `data/`、`config.json`、
+`settings.json`、`plugins.json`，**没有排除 `wechatauto_db/`**。
+第一次打出的 zip（已删除，未上传）里有：
+
+    BigFish-0.11.0/wechatauto_db/wxid_.../keys.json
+    BigFish-0.11.0/wechatauto_db/wxid_.../keys.json.bak
+
+这是微信数据库密钥，属于用户数据，绝不能发布。
+
+修复：
+
+- `SKIP_DIRS` 增加 `wechatauto_db`、`voice`；
+- `SKIP_FILES` 增加 `keys.json` / `keys.json.bak` / `image_keys.json` / `credentials.json`；
+- `SKIP_EXT` 增加 sqlite / wav / mp3 / log；
+- `.gitignore` 增加 `wechatauto_db/`；
+- 删除旧 zip，重新生成 343 文件的 0.11.0 包；
+- 复审计：`config.json`、`data/`、`wechatauto_db/`、`keys.json`、`.wav` 均无命中。
+
+**教训**：发布审计不能只看 `build_portable.py` 的“已知敏感文件”列表；
+必须用 zip 名单反查 `config|data|keys|credentials|sqlite|wav`，并以实际产物为准。

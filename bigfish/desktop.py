@@ -18,9 +18,11 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime
+from pathlib import Path
 
 
 def _safe_reconfigure_stdout() -> None:
@@ -718,6 +720,16 @@ def save_json_config(d: dict) -> None:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
 
+def _voice_devices() -> list:
+    """播放设备列表；只读，不打开设备。气泡路线选 CABLE Input。"""
+    try:
+        from bigfish.voice_audio_out import list_output_devices
+
+        return list_output_devices()
+    except Exception:
+        return []
+
+
 # ══════════════════════════════════════════════════════════════════
 #  引擎线程
 # ══════════════════════════════════════════════════════════════════
@@ -776,6 +788,9 @@ class EngineWorker(QThread):
         #: 记账器与账本（_run 里创建后挂上来，主动发送要用同一条账）
         self._guard = None
         self._ledger = None
+        #: 声音：每个会话的冷却/每日/连续计数
+        self._voice_stats: dict = {}
+        self._voice_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
@@ -1514,6 +1529,216 @@ class EngineWorker(QThread):
         except Exception:
             pass
         return True
+
+    # ==================================================================
+    # 声音：什么时候出声 + 生成音频
+    # ==================================================================
+
+    def _voice_settings(self):
+        from bigfish.voice import VoiceSettings
+
+        return VoiceSettings.from_config(path=CONFIG_PATH)
+
+    def _voice_state(self, chat_id: str) -> dict:
+        today = time.strftime("%Y-%m-%d")
+        with self._voice_lock:
+            st = self._voice_stats.setdefault(chat_id, {
+                "day": today, "count": 0, "last": 0.0, "consecutive": 0})
+            if st.get("day") != today:
+                st.update(day=today, count=0, consecutive=0)
+            return dict(st)
+
+    def _note_voice_sent(self, chat_id: str) -> None:
+        today = time.strftime("%Y-%m-%d")
+        with self._voice_lock:
+            st = self._voice_stats.setdefault(chat_id, {
+                "day": today, "count": 0, "last": 0.0, "consecutive": 0})
+            if st.get("day") != today:
+                st.update(day=today, count=0, consecutive=0)
+            st["count"] = int(st.get("count") or 0) + 1
+            st["consecutive"] = int(st.get("consecutive") or 0) + 1
+            st["last"] = time.time()
+
+    def _note_text_sent(self, chat_id: str) -> None:
+        with self._voice_lock:
+            st = self._voice_stats.setdefault(chat_id, {
+                "day": time.strftime("%Y-%m-%d"), "count": 0,
+                "last": 0.0, "consecutive": 0})
+            st["consecutive"] = 0
+
+    def _plan_voice(self, msg, body: str, reply: str, parts: list,
+                    *, is_group: bool, is_owner: bool) -> dict:
+        """判定这一轮要不要出声；要就当场合成（生成阶段，不堵投递线程）。
+
+        返回 {} 表示只发文字。合成失败也返回 {}，文字照发。
+        """
+        try:
+            from bigfish import afterglow as _AG
+            from bigfish import plugins as _P
+            from bigfish import voice_director as _D
+            from bigfish import voice_policy as _VP
+
+            _P.ensure_loaded()
+            if not _P.is_enabled("voice"):
+                return {}
+            settings = self._voice_settings()
+            if not settings.api_key or not settings.voice:
+                return {}
+            policy = _VP.VoicePolicy.from_config(settings.policy)
+            if policy.mode == "off":
+                return {}
+
+            mood = self._current_mood() or {}
+            dims = mood.get("dims") if isinstance(mood.get("dims"), dict) else {}
+            life = self._life
+            energy = float(getattr(life, "energy", 70) or 70)
+            asleep = bool(getattr(life, "asleep", False))
+            doing = str(getattr(life, "doing", "") or "")
+            try:
+                ag_items = _AG.active(_AG.load(), now=time.time())
+                ag_kinds = tuple(str(x.get("kind")) for x in ag_items
+                                 if x.get("kind"))
+            except Exception:
+                ag_kinds = ()
+            hour = time.localtime().tm_hour
+            req = _VP.is_requested(body)
+            plan = _D.from_state(
+                text=reply, user_text=body,
+                mood=float(mood.get("value") or 65), dims=dims,
+                life={"energy": energy, "asleep": asleep, "doing": doing},
+                hour=hour, is_group=is_group, is_owner=is_owner,
+                afterglow=ag_kinds, requested=req,
+                profile=settings.profile)
+            st = self._voice_state(msg.chat_id)
+            decision = _VP.decide(
+                text=reply, chat_id=msg.chat_id, parts=parts, policy=policy,
+                requested=req, is_group=is_group, is_owner=is_owner,
+                scene=plan.scene, last_voice_at=float(st.get("last") or 0),
+                today_count=int(st.get("count") or 0),
+                consecutive=int(st.get("consecutive") or 0))
+
+            where = f"{msg.chat_name}｜场景 {plan.scene}"
+            if decision.preview:
+                self._log(f"[声·预演] {'会发语音' if decision.want else '发文字'}"
+                          f"：{decision.reason}｜{where}", "think")
+                return {}
+            if not decision.want:
+                # 只记一句，不刷屏；概率未中这种最常见的降噪
+                if "未中" not in decision.reason:
+                    self._log(f"[声] 文字：{decision.reason}｜{where}", "think")
+                return {}
+
+            self._log(f"[声] 准备出声：{decision.reason}｜{where}"
+                      f"｜{len(decision.text)}字", "think")
+            if decision.send_as == "bubble" and not settings.device:
+                self._log("[声] 气泡模式还没选虚拟声卡播放端；这一轮改发文字",
+                          "err")
+                return {}
+            from bigfish.voice import VoiceEngine
+
+            # 每轮按当前 config 新建：用户在声音页改了 Key/模型，
+            # 下一条就生效，不用重启。构造只是读路径，不发请求。
+            engine = VoiceEngine(settings)
+            t0 = time.time()
+            res = engine.synthesize_turn(
+                [decision.text], mood=float(mood.get("value") or 65),
+                dims=dims, energy=energy, asleep=asleep, doing=doing,
+                hour=hour, is_group=is_group, is_owner=is_owner,
+                afterglow=ag_kinds, requested=req,
+                profile=settings.profile)
+            if not res.ok:
+                self._log(f"[声] 合成失败，改发文字：{res.error}", "err")
+                return {}
+            # 语音上限 60 秒，留 10 秒容错：超过 50 秒一律改文字。
+            if res.duration > 50.0:
+                self._log(f"[声] 太长（{res.duration:.1f}s），超过 50 秒；"
+                          "这一轮改发文字", "err")
+                return {}
+            if decision.send_as == "bubble" and res.duration < 1.0:
+                self._log(f"[声] 气泡太短（{res.duration:.2f}s），"
+                          "微信可能不认；这一轮改发文字", "err")
+                return {}
+            self._log(f"[声] 好了：{res.summary}｜{os.path.basename(res.path)}",
+                      "think")
+            return {
+                "path": res.path,
+                "delivery": "voice_only",
+                "send_as": decision.send_as,
+                "device": settings.device,
+                "hotkey": settings.hotkey,
+                "reason": decision.reason,
+                "duration": res.duration,
+                "ms": int((time.time() - t0) * 1000),
+                "fallback": bool(policy.fallback_text),
+            }
+        except Exception as exc:  # noqa: BLE001 —— 声音坏了不能影响文字
+            self._log(f"[声] 判定/合成异常，改发文字：{exc}", "err")
+            return {}
+
+    def _send_voice_file(self, msg, path: str) -> bool:
+        """音频文件发送。气泡失败时也走这里，避免同一份音频白合成。"""
+        from bigfish import sending as _sending
+        from bigfish.wechat_sender import classify_media
+
+        try:
+            # 文件发送也先把微信顶到前台：语音气泡和文字都不能赌用户
+            # 刚好停在微信窗口上。
+            from bigfish.wechat_sender import force_show_wechat
+
+            force_show_wechat(wait=0.4)
+            kind = classify_media(path)
+            r = self.sender.send_media(msg.chat_name, path)
+            verdict = _sending.classify(result=r)
+        except Exception as exc:  # noqa: BLE001
+            kind, verdict = "音频", _sending.classify(error=exc)
+        if verdict.sent:
+            self._log(f"[声] 已发 {os.path.basename(path)}（{kind}）", "out")
+            self._note_voice_sent(msg.chat_id)
+            return True
+        self._log(f"[声] 文件发送失败：{verdict.detail}", "err")
+        return False
+
+    def _send_voice(self, msg, path: str, *, send_as: str = "file",
+                    device: str = "", hotkey: str = "Ctrl+Alt"):
+        """发音频。返回 (确认/可能发出, 是否已经按过录音键)。
+
+        文件：`send_media` 发 .wav，失败可安全补文字。
+        气泡：按住微信录音键 + 播到 CABLE Input；一旦按过键，
+        失败就是"可能已经发了一半"，绝不能补文字（whale_girl 的教训）。
+
+        气泡在**按键前**失败（前台、按钮、声卡、快捷键）时，直接把同一份
+        WAV 当音频文件发出去 —— 合成已经花过积分，不能再让用户白花一次。
+        """
+        if self.sender is None and not self._ensure_sender(quiet=True):
+            return False, False
+
+        if send_as == "bubble":
+            from bigfish.voice_bubble import BubbleError, send_bubble
+
+            try:
+                seconds = send_bubble(
+                    sender=self.sender, who=msg.chat_name, wav=path,
+                    device=device, hotkey=hotkey, log=self._log)
+                self._log(f"[声] 语音气泡已录完 {seconds:.2f}s（未确认微信送达）",
+                          "out")
+                self._note_voice_sent(msg.chat_id)
+                return True, True
+            except BubbleError as exc:
+                self._log(f"[声] 气泡失败：{exc}", "err")
+                if exc.started:
+                    self._log("[声] 已经按过录音键，结果不确定 —— "
+                              "不补发文字，避免重复打扰", "err")
+                    return False, True
+                # 还没碰录音键：音频是好的，改走文件，别浪费这份合成。
+                self._log("[声] 气泡没开始录音，改发同一份音频文件", "")
+                return self._send_voice_file(msg, path), False
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[声] 气泡异常：{exc}", "err")
+                self._log("[声] 改发同一份音频文件", "")
+                return self._send_voice_file(msg, path), False
+
+        return self._send_voice_file(msg, path), False
+
 
     def _say_plan(self, reply: str, policy=None):
         """按「说法」插件的参数切条 + 算节奏。插件坏了就整段发。
@@ -2537,12 +2762,27 @@ class EngineWorker(QThread):
                 return
 
             _t_plan0 = time.time()
+            # 模型可能写 [[voice]] / [[text]] 来表态；它们是给系统的标记，
+            # 绝不能出现在对方收到的文字里。但判定层要看到原始标记，
+            # 所以先留一份 raw，再清正文。
+            _voice_reply = reply
+            try:
+                from bigfish.voice_policy import strip_tags as _strip_voice_tags
+
+                reply = _strip_voice_tags(reply)
+            except Exception:
+                pass
             parts, gaps = self._say_plan(reply)
             if is_group and msg.sender_name and parts:
                 # 群里回复时带上 @，只加第一条 —— 每条都 @ 很吵
                 parts[0] = f"@{msg.sender_name} {parts[0]}"
 
             _t_pick0 = time.time()
+            # 声音放在生成阶段：合成 2~4 秒，放在投递线程会堵住整台机器。
+            # 判定/合成失败都只回 {}，文字照发。
+            _voice = self._plan_voice(
+                msg, body or "", _voice_reply, parts,
+                is_group=is_group, is_owner=bool(is_owner_chat))
             _sticker_mood = self._current_mood()
             sticker_pos = self._sticker_pos_hint(reply, _sticker_mood)
             sticker_path = ""
@@ -2580,7 +2820,9 @@ class EngineWorker(QThread):
             # 挡在这条投递完成之前，保证上下文不打架。
             return {
                 "msg": msg, "body": body, "reply": reply,
+                "hist": hist,
                 "parts": parts, "gaps": gaps,
+                "voice": _voice,
                 "sticker_pos": sticker_pos, "sticker_path": sticker_path,
                 "after_text": _after_text, "wake_brief": _wake_brief,
                 "owner": _owner, "tier": _tier,
@@ -2599,6 +2841,16 @@ class EngineWorker(QThread):
             msg = entry["msg"]
             body = entry["body"]
             reply = entry["reply"]
+            # hist 是 handle 的局部变量，_deliver 是 handle 的**兄弟**闭包，
+            # 不能直接引用。显式随 entry 传过来；老 entry 没有就现读。
+            hist = entry.get("hist")
+            if hist is None:
+                try:
+                    from bigfish import history as _H4
+
+                    hist = list(_H4.load(msg.chat_id))
+                except Exception:
+                    hist = []
             parts = entry["parts"]
             gaps = entry["gaps"]
             _after_text = entry.get("after_text") or ""
@@ -2616,6 +2868,12 @@ class EngineWorker(QThread):
             _gen1 = float(entry.get("t_gen1") or 0.0)
             _recv = float(entry.get("t_recv") or 0.0)
             _fin = {"outcome": "not_sent"}
+            _voice = entry.get("voice") or {}
+            # 只要这一轮命中语音，就只发语音；旧配置的 text_then_voice
+            # 也在这里被强制成 voice_only —— 同一内容不允许发两遍。
+            _voice_only = bool(_voice)
+            _voice_sent = False
+            _voice_started = False
             try:
                 if self.sender is None:
                     self._ensure_sender()
@@ -2632,6 +2890,25 @@ class EngineWorker(QThread):
                 # 说错一句话的代价，是用户拿着手机里收到的消息来对账，
                 # 然后这一整份日志都不再可信。
                 _unknown_any = False
+                # 只发语音：先把音频发出去。成功就不再发文字；
+                # 失败且允许补文字，则 parts 保持原样、走下面的文字循环。
+                if _voice_only and _voice.get("path"):
+                    _voice_sent, _voice_started = self._send_voice(
+                        msg, _voice["path"],
+                        send_as=_voice.get("send_as", "file"),
+                        device=_voice.get("device", ""),
+                        hotkey=_voice.get("hotkey", "Ctrl+Alt"))
+                    if _voice_sent:
+                        sent_any = True
+                        parts = []
+                    elif _voice_started:
+                        # 已经按过录音键：可能已经收到半截语音，绝不补文字。
+                        _unknown_any = True
+                        parts = []
+                    elif not _voice.get("fallback", True):
+                        self._log("[声] 语音没发出，且关了补文字 —— 这一轮只有日志",
+                                  "err")
+                        parts = []
                 try:
                     for _i, _part in enumerate(parts):
                         if _i > 0:
@@ -2669,6 +2946,10 @@ class EngineWorker(QThread):
                                     "如果对方说没收到，是这一条。", "err")
                             break
                         sent_any = True
+                    # 只要这一轮发了文字，就把"连续语音"计数清零；
+                    # 只发语音时不 reset，否则连续上限永远不生效。
+                    if sent_any and not (_voice_only and _voice_sent):
+                        self._note_text_sent(msg.chat_id)
                     if sent_any:
                         _fin["outcome"] = "sent"
                         self._last_reply_at = time.time()
@@ -2719,7 +3000,10 @@ class EngineWorker(QThread):
                         # 整段回复也记一笔（分条时每条已经记过；这里记的是拼起来的样子，
                         # 因为读回来可能被合并成一条）。必须带会话 ——
                         # 不带就会变成"全局账"，别的会话里出现同样文字会被误否决。
-                        remember_sent(reply, msg.chat_id)
+                        # 只发语音时没有文字到达对方，不能把这句话记成"发过"，
+                        # 否则对方之后原样说一句会被当成回环。
+                        if not (_voice_only and _voice_sent):
+                            remember_sent(reply, msg.chat_id)
                         last_reply_at.setdefault(msg.chat_id, []).append(time.time())
 
                         # 闸门 L3：轮级熔断。一轮自动回复 = 一次。
@@ -2735,7 +3019,8 @@ class EngineWorker(QThread):
                         # 用分段后的样子记：{{split}} 留在正文里看不懂，
                         # 而且用户想核对"她到底发了几条、每条什么"。
                         self._log(
-                            f"[发] {' / '.join(p for p in (parts or [reply]) if p)[:80]}",
+                            (f"[发] [语音] {reply[:70]}" if _voice_only and _voice_sent
+                             else f"[发] {' / '.join(p for p in (parts or [reply]) if p)[:80]}"),
                             "out")
                         # 耗时拆开看一眼。「聊几句之后突然安静几十秒」这种问题，
                         # 光看 [想]/[发] 之间的空白是查不出来的 —— 必须知道
@@ -2752,7 +3037,9 @@ class EngineWorker(QThread):
                         #   失败只记日志，不影响这一轮 —— 对方已经从文字里
                         #   读到内容了，表情是附加品，丢了不算聊崩。
                         # 表情是生成阶段挑好的，这里只发 —— 投递线程不做模型调用
-                        if entry.get("sticker_pos") == "after" and entry.get("sticker_path"):
+                        if (not (_voice_only and _voice_sent)
+                                and entry.get("sticker_pos") == "after"
+                                and entry.get("sticker_path")):
                             self._send_sticker(msg, entry["sticker_path"], remember_sent)
 
                         # ⭐ 把这一问一答写进记忆库。
@@ -2876,7 +3163,11 @@ class EngineWorker(QThread):
         from bigfish import listen as L
         from bigfish.watcher import Incoming
 
-        batcher = L.MessageBatcher(L.ListenPolicy())
+        batcher = L.MessageBatcher(
+            L.ListenPolicy(),
+            allow_self_for=lambda chat: bool(scope_of("allow_self", chat)),
+            on_log=self._log,
+        )
 
         # ── 并发：生成并行，投递串行 ──
         #
@@ -5913,6 +6204,226 @@ class Backend(QObject):
             return json.dumps({"ok": True})
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    # ── 声音（插件：侧边栏「声音」页） ──
+    #
+    # 开关在 plugins.json（勾选「声音」插件），接入参数在 config.json 的
+    # voice 段。两处分开的理由：开关属于「她要不要这个能力」，Key/地址属于
+    # 「这台机器怎么连」，后者要跟配置一起备份，但不该跟着插件配置导出。
+
+    @Slot(result=str)
+    def get_voice_devices(self) -> str:
+        try:
+            from bigfish import voice_audio_out as _ao
+            from bigfish import voice_driver as _drv
+
+            pkg = _drv.package_status()
+            return json.dumps({
+                "ok": True,
+                "outputs": _ao.list_output_devices(),
+                "inputs": _ao.list_input_devices(),
+                "cable": _ao.cable_installed(),
+                "package": pkg,
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(result=str)
+    def install_vb_cable(self) -> str:
+        try:
+            from bigfish import voice_driver as _drv
+
+            return json.dumps(_drv.install(), ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(result=str)
+    def open_voice_sound_settings(self) -> str:
+        try:
+            from bigfish import voice_driver as _drv
+
+            return json.dumps(_drv.open_sound_settings(), ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(result=str)
+    def get_voice_config(self) -> str:
+        try:
+            from bigfish import plugins
+            from bigfish import vault
+            from bigfish.voice import VoiceSettings
+
+            plugins.ensure_loaded()
+            s = VoiceSettings.from_config(path=CONFIG_PATH)
+            cache = Path(vault.resolve_data_root()) / "voice" / "cache"
+            files = list(cache.glob("*.wav")) if cache.exists() else []
+            return json.dumps({
+                "ok": True,
+                "enabled": plugins.is_enabled("voice"),
+                "settings": {
+                    "engine": s.engine,
+                    "base_url": s.base_url,
+                    "path": s.path,
+                    "api_key": s.api_key,
+                    "model": s.model,
+                    "voice": s.voice,
+                    "language": s.language,
+                    "speed": s.speed,
+                    "guidance": s.guidance,
+                    "volume": s.volume,
+                    "output_format": s.output_format,
+                    "profile": s.profile,
+                    "device": s.device,
+                    "hotkey": s.hotkey,
+                    "timeout": s.timeout,
+                    "cache_mb": s.cache_mb,
+                    "max_turn_chars": s.max_turn_chars,
+                    "policy": s.policy,
+                },
+                "ready": bool(s.api_key and s.voice),
+                "cache": {
+                    "files": len(files),
+                    "mb": round(sum(f.stat().st_size for f in files)
+                                / 1048576, 2),
+                },
+                "models": ["breeze-tts-2-multilingual", "breeze-tts-2"],
+                "devices": _voice_devices(),
+                "profiles": [
+                    {"id": "bright_young", "name": "薄荷（明亮少女音）"},
+                    {"id": "", "name": "通用（不按音色调整）"},
+                ],
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def save_voice_config(self, payload: str) -> str:
+        try:
+            from bigfish.voice import VoiceSettings
+            from bigfish.voice_policy import VoicePolicy
+
+            d = _parse_payload(payload)
+            c = load_json_config()
+            old = c.get("voice") if isinstance(c.get("voice"), dict) else {}
+            s = VoiceSettings.from_config(old)
+            # Key 留空 = 不改。避免用户只改语速时把 Key 清掉。
+            for key in ("engine", "base_url", "path", "model", "voice",
+                        "language", "output_format", "profile", "device",
+                        "hotkey"):
+                if key in d and str(d[key]).strip():
+                    setattr(s, key, str(d[key]).strip())
+            if str(d.get("api_key") or "").strip():
+                s.api_key = str(d["api_key"]).strip()
+            for key in ("speed", "guidance", "volume", "timeout"):
+                if d.get(key) not in (None, ""):
+                    setattr(s, key, float(d[key]))
+            for key in ("cache_mb", "max_turn_chars"):
+                if d.get(key) not in (None, ""):
+                    setattr(s, key, int(d[key]))
+            if not s.voice:
+                return json.dumps({"ok": False, "error": "音色 ID 不能为空"},
+                                  ensure_ascii=False)
+
+            c["voice"] = {
+                "engine": s.engine,
+                "base_url": s.base_url,
+                "path": s.path,
+                "api_key": s.api_key,
+                "model": s.model,
+                "voice": s.voice,
+                "language": s.language,
+                "speed": max(0.5, min(2.0, s.speed)),
+                "guidance": max(1.0, min(10.0, s.guidance)),
+                "volume": max(0.01, min(2.0, s.volume)),
+                "output_format": s.output_format,
+                "profile": s.profile,
+                "device": s.device,
+                "hotkey": s.hotkey,
+                "timeout": max(5.0, min(180.0, s.timeout)),
+                "cache_mb": max(0, min(5000, s.cache_mb)),
+                "max_turn_chars": max(20, min(1000, s.max_turn_chars)),
+                "policy": VoicePolicy.from_config(
+                    d.get("policy") if isinstance(d.get("policy"), dict)
+                    else old.get("policy")).as_dict(),
+            }
+            save_json_config(c)
+            return json.dumps({"ok": True, "settings": c["voice"]},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(str, result=str)
+    def test_voice(self, payload: str) -> str:
+        """测试 Key/地址/模型：只 GET /v1/models，不合成、不花积分。"""
+        import threading
+        import uuid
+
+        try:
+            from bigfish.voice import VoiceEngine, VoiceSettings
+
+            d = _parse_payload(payload)
+            s = VoiceSettings.from_config(path=CONFIG_PATH)
+            for key in ("engine", "base_url", "path", "model", "voice",
+                        "language", "profile"):
+                if d.get(key) not in (None, ""):
+                    setattr(s, key, str(d[key]))
+            if str(d.get("api_key") or "").strip():
+                s.api_key = str(d["api_key"]).strip()
+            s.enabled = True
+            tid = uuid.uuid4().hex[:10]
+            self._tests[tid] = {"done": False, "ok": False,
+                                "text": "正在连接声音模型…"}
+            if len(self._tests) > 20:
+                for k in list(self._tests)[:-20]:
+                    self._tests.pop(k, None)
+
+            def work() -> None:
+                try:
+                    h = VoiceEngine(s).health(timeout=20.0)
+                    ok = bool(h.get("ok") and h.get("model_ok"))
+                    text = ("连接正常" if ok
+                            else str(h.get("reason") or "连接失败"))
+                    if h.get("hint"):
+                        text += "｜" + str(h["hint"])
+                    self._tests[tid] = {"done": True, "ok": ok,
+                                        "text": text,
+                                        "models": h.get("models") or []}
+                except Exception as exc:  # noqa: BLE001
+                    self._tests[tid] = {
+                        "done": True, "ok": False,
+                        "text": f"{type(exc).__name__}: {exc}"}
+
+            threading.Thread(target=work, name="bigfish-voice-test",
+                             daemon=True).start()
+            return json.dumps({"ticket": tid})
+        except Exception as exc:
+            return json.dumps({"done": True, "ok": False, "text": str(exc)},
+                              ensure_ascii=False)
+
+    @Slot(result=str)
+    def clear_voice_cache(self) -> str:
+        try:
+            from bigfish import vault
+
+            cache = Path(vault.resolve_data_root()) / "voice" / "cache"
+            n = 0
+            if cache.exists():
+                for p in list(cache.glob("*.wav")) + list(cache.glob("*.json")):
+                    try:
+                        p.unlink()
+                        n += 1
+                    except OSError:
+                        pass
+            return json.dumps({"ok": True, "deleted": n},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)},
+                              ensure_ascii=False)
 
     # ── 测试连接 / 获取模型列表 ──
     #

@@ -101,8 +101,8 @@ def main() -> int:
     pages = re.findall(r'class="page[^"]*" data-page="([a-z]+)"', html)
     missing = [n for n in navs if n not in pages]
     check("每个导航都有落地页", not missing, f"缺：{missing}")
-    check("导航 11 个", len(navs) == 11, f"{len(navs)} 个：{navs}")
-    check("section 也是 11 个", len(pages) == 11, f"{len(pages)} 个")
+    check("导航 12 个", len(navs) == 12, f"{len(navs)} 个：{navs}")
+    check("section 也是 12 个", len(pages) == 12, f"{len(pages)} 个")
 
     # ── 2. 主动页整页撤干净 ──
     print("\n[清理] 主动页的每一环都不在了")

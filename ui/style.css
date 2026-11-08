@@ -2351,3 +2351,34 @@ button:focus-visible, input:focus-visible, a:focus-visible {
   border-top: 1px solid var(--border-soft);
 }
 .scope-actions { display: flex; gap: 8px; flex: none; }
+
+/* ── 声音：策略多选 ── */
+.voice-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 2px 0 4px;
+}
+.voice-checks label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.voice-checks input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent);
+  flex: none;
+}
+.voice-note {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.8;
+}

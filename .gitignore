@@ -99,3 +99,9 @@ packaging/*.zip
 
 # 发布附件（zip/manifest），从源码重新生成，不进仓库
 /release/
+
+# 部署脚本的本地数据备份（含真实配置/聊天数据）
+data-backup/
+
+# VB-CABLE 解压后的目录进仓库；下载缓存不进
+vendor/vb-cable-pack45.zip
