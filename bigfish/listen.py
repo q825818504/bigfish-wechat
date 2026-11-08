@@ -52,11 +52,80 @@ class ListenPolicy:
     #: 纯图/表情：可能在连发图，多等一会
     quiet_media: float = 4.0
     #: 从第一条算起的硬上限：再吵也要回一句
-    max_wait: float = 8.0
+    max_wait: float = 12.0
     #: 一批最多几条；到顶立即封批
     max_batch: int = 8
     #: 单条最短间隔（同一会话 0.3s 内的重复推送视为同一条）
     min_gap: float = 0.3
+
+    # ── 自适应窗口（v0.5.1）──
+    #
+    # 固定的 quiet_same_author 有个根本问题：**短消息和长消息的"说完程度"不一样**。
+    #
+    #   「在吗」         12 字以内，极可能还有下文 → 该多等
+    #   「我今天去长坂坡了，看到了樱花」  一句话说完 → 不用等
+    #   「那我先去吃饭了」  」结尾没标点 → 大概还有一句
+    #   「嗯。」          句号收尾 → 说完了
+    #
+    # AstrBot 的 private_debounce 就是这么做的（companion_v2/conversation）：
+    # 拿字数当"完整度"的代理，句末标点微调。它的原文：
+    #   "a long message is usually a finished thought, while a very short
+    #    one is often the first bubble of a multi-part message"
+    #
+    #: 短消息/没说完时的等待上限
+    quiet_max: float = 4.0
+    #: 长消息/明确说完时的等待下限
+    quiet_min: float = 1.5
+
+    #: 关掉自适应就退回固定 quiet_same_author（老行为）
+    adaptive: bool = True
+
+
+#: 句末标点：说完了
+_END_COMPLETE = ("。", "！", "？", "!", "?", "\n", "~", "～")
+#: 句中停顿：明显还有下文
+_END_PARTIAL = ("，", ",", "、", "；", ";", "：", ":", "…", "...", "—")
+
+
+def visible_chars(text: str) -> int:
+    """非空白字符数。
+
+    不按 len() 算 —— 空白和纯标点不该让一句「在吗」显得像长句。
+    最少返回 1，避免全空白时除零。
+    """
+    return max(1, sum(1 for c in str(text or "") if not c.isspace()))
+
+
+def adaptive_quiet(text: str, policy: "ListenPolicy") -> float:
+    """这条消息之后该安静等多久。
+
+    算法照 AstrBot 的 `quiet_seconds()`：在 [quiet_min, quiet_max] 里取一个值，
+    字数越多等越短（长句通常是完整想法），再按句尾标点微调。
+
+    ⚠ 不要把它写死成"一律等 4 秒" —— 对方说完整一段话时等 4 秒是呆。
+      也不要一律等 1.5 秒 —— 「在吗」之后那句「吃饭了没」就会被插话。
+    """
+    if not policy.adaptive:
+        return policy.quiet_same_author
+
+    lo, hi = policy.quiet_min, policy.quiet_max
+    if hi <= lo:
+        return lo
+
+    span = hi - lo
+    # 60 字以上算"说完了"：再长也不减了，避免长文回得比短消息还急
+    ratio = min(1.0, visible_chars(text) / 60.0)
+    quiet = hi - span * ratio
+
+    raw = str(text or "").rstrip()
+    if raw.endswith(_END_COMPLETE):
+        quiet -= 0.2          # 句号/问号收尾 → 说完了，少等
+    elif raw.endswith(_END_PARTIAL):
+        quiet += 0.3          # 逗号/省略号收尾 → 还有下文，多等
+    else:
+        quiet += 0.2          # 完全没标点 → 大概率还有一句，多等
+
+    return min(hi, max(lo, quiet))
 
 
 @dataclass
@@ -152,10 +221,15 @@ class MessageBatcher:
             bucket.last_at = at
 
             # 等待时长按「这条消息的性质」决定：
-            #   被 @ → 缩短（对方明确在叫你）
-            #   纯图 → 延长（可能在连发图）
-            # 两者同时出现时以「被叫」优先，因为那是明确的对话请求。
-            quiet = self.policy.quiet_same_author if same_author else self.policy.quiet_different_author
+            #   同一个人继续发 → 自适应窗口（字数 + 句尾标点，见 adaptive_quiet）
+            #   换人说话       → 短等（新话题）
+            #   被 @           → 缩短（对方明确在叫你）
+            #   纯图           → 延长（可能在连发图）
+            # 后两者优先于自适应：那是明确的信号，不该被字数盖过去。
+            if same_author:
+                quiet = adaptive_quiet(msg.text, self.policy)
+            else:
+                quiet = self.policy.quiet_different_author
             if msg.at_bot:
                 quiet = min(quiet, self.policy.quiet_mention)
             elif msg.is_bare_media:

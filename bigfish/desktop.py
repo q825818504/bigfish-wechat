@@ -2491,7 +2491,130 @@ class EngineWorker(QThread):
                 self._log(f"[发送失败] {exc}", "err")
                 self.failed.emit(str(exc))
 
-        self.watcher.on_message = handle
+        # ── 倾听层：等对方说完，再回 ──
+        #
+        # 以前是 `watcher.on_message = handle`：watcher 线程直接调 handle，
+        # 而 handle 里要调模型（2~16 秒）。于是：
+        #
+        #   t=0.0  对方「大肥鱼」
+        #   t=1.2  watcher 读到 → handle → 调模型（线程被占住）
+        #   t=1.5  对方「你在不在」    ← 已写库，但这一秒读不到
+        #   t=1.9  对方「吃饭了没」
+        #   t=3.2  模型返回、发送      ← 这时才看到后面两句
+        #   t=3.4  watcher 恢复 → 逐条再调两次模型 → 又回两次
+        #
+        # 两件事一起坏：**监听线程被模型挡住**，**每条消息各自成一轮**。
+        # 表现就是「别人刚说一句她就开始想，然后插话」。
+        #
+        # 现在：watcher 只把消息丢进 batcher（立即返回），另起一个线程
+        # 按自适应窗口封批，一批只调一次模型。窗口长短看字数与句尾标点
+        # （见 listen.adaptive_quiet —— 短消息等 4 秒，长消息带句号只等 1.5）。
+        import threading
+
+        from bigfish import listen as L
+        from bigfish.watcher import Incoming
+
+        batcher = L.MessageBatcher(L.ListenPolicy())
+
+        def enqueue(msg) -> None:
+            """watcher 回调：只入批，立刻返回。
+
+            ⚠ 这里绝对不许调模型。一旦阻塞，watcher 的轮询就被按住，
+              对方接着发的话读不到 —— 那正是这次要修的东西。
+            """
+            try:
+                batcher.feed(L.BatchMessage(
+                    chat_id=msg.chat_id,
+                    author=(msg.sender_name or msg.chat_name),
+                    text=(msg.text or ""),
+                    chat_name=(msg.chat_name or ""),
+                    local_id=int(getattr(msg, "local_id", 0) or 0),
+                    msg_type=(msg.msg_type or "文本"),
+                    # 群聊 @ 的判定在 handle 里做，这里拿不到触发结论。
+                    # 代价是群里被 @ 也要等满自适应窗口（最多 4 秒）——
+                    # 换来的是一条都不漏，先接受。
+                    at_bot=False,
+                    is_self=bool(getattr(msg, "is_self", False)),
+                    received_at=time.monotonic(),
+                ))
+            except Exception as exc:
+                self._log(f"[倾听] 入批失败：{exc}", "err")
+
+        def handle_batch(batch) -> None:
+            """一批消息 → 合成一条 → 交给原来的 handle。
+
+            私聊里对方连发三句，模型看到的是三行带说话人的文本，
+            而不是三次独立的思考。
+            """
+            msgs = batch.messages
+            if not msgs:
+                return
+            last = msgs[-1]
+
+            if len(msgs) == 1:
+                body = last.text
+            else:
+                body = L.batch_transcript(batch, with_time=False)
+                self._log(f"[倾听] {last.chat_name} 攒了 {len(msgs)} 条"
+                          f"（{batch.reason}，等了 {batch.waited:.1f}s）", "in")
+                # 合并后只用最后一条的 local_id 去记记忆，前面几条要补记，
+                # 否则「他说的那句话」在记忆里根本不存在。
+                # capture_message 按 event_key 幂等，和 handle 里那次重复
+                # 调用不会写成两条。
+                for m in msgs[:-1]:
+                    try:
+                        from bigfish import vault as _v3
+
+                        _v3.capture_message(
+                            f"wechat:{m.chat_id}",
+                            f"wx-u-{m.local_id}" if m.local_id
+                            else f"wx-u-{int(time.time() * 1000)}",
+                            "user", m.text, None)
+                    except Exception:
+                        pass
+
+            handle(Incoming(
+                chat_id=last.chat_id,
+                chat_name=last.chat_name,
+                local_id=int(last.local_id or 0),
+                sort_seq=0,
+                timestamp=int(time.time()),
+                msg_type=last.msg_type,
+                sender_id=None,
+                sender_name=last.author,
+                text=body,
+                is_self=bool(last.is_self),
+                # 进批的只有对方说的话（feed 会丢掉 is_self）
+                identity="peer",
+                identity_rule="batch",
+                raw_content=body,
+            ))
+
+        def _batch_loop() -> None:
+            """每 200ms 看一眼有没有该封的批。
+
+            为什么不复用主循环那个 `msleep(300)`：主循环管的是主动开口和
+            生活状态（5 秒一次就够），而封批精度直接决定「她等多久」。
+            200ms 的误差对 1.5~4 秒的窗口来说可以忽略。
+            """
+            while not self._stop:
+                time.sleep(0.2)
+                try:
+                    for _b in batcher.tick():
+                        handle_batch(_b)
+                except Exception as exc:
+                    self._log(f"[倾听] 封批异常：{exc}", "err")
+            # 退出前把没封的批次冲掉 —— 不然对方最后那几句永远等不到回
+            try:
+                for _b in batcher.flush_all():
+                    handle_batch(_b)
+            except Exception:
+                pass
+
+        threading.Thread(target=_batch_loop, name="bigfish-batch",
+                         daemon=True).start()
+
+        self.watcher.on_message = enqueue
         self.watcher.start()
         # 拟人节流的档位。**必须在真正发送之前设好** ——
         # 默认的 natural 是「120 秒内 6 次」，而一轮就发 2~4 条，

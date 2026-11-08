@@ -78,17 +78,20 @@ def msg(chat: str, author: str, text: str, *, at: float,
 def test_listen() -> None:
     section("攒批")
 
-    # 1) 单条：等满 2.0s
+    # 1) 单条：短消息（「在吗」2 字、没标点）→ 等满自适应上限 4.0s
+    #    ⚠ 这条以前是"等满 2.0s"。改成自适应之后，「在吗」这种极短、
+    #      没标点的消息要等 4 秒 —— 因为它几乎肯定是多条里的第一条。
+    #      这正是要修的 bug：对方断句时被插话。
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "在吗", at=0.0))
-    clock.now = 1.9
-    check("1.9s 还没到期", b.tick() == [], "sealed too early")
-    clock.now = 2.0
+    clock.now = 3.9
+    check("短消息 3.9s 还没到期", b.tick() == [], "sealed too early")
+    clock.now = 4.0
     out = b.tick()
-    check("2.0s 封批", len(out) == 1 and len(out[0].messages) == 1, f"{out}")
+    check("短消息 4.0s 封批", len(out) == 1 and len(out[0].messages) == 1, f"{out}")
     check("reason=quiet", out[0].reason == "quiet", f"got {out[0].reason}")
-    check("waited≈2.0", 1.9 <= out[0].waited <= 2.1, f"got {out[0].waited}")
+    check("waited≈4.0", 3.9 <= out[0].waited <= 4.1, f"got {out[0].waited}")
 
     # 2) 同人连发 3 条：一批只回一次
     clock = Clock()
@@ -98,11 +101,12 @@ def test_listen() -> None:
     b.feed(msg("c1", "小明", "你在不在", at=0.5))
     clock.now = 1.0
     b.feed(msg("c1", "小明", "吃饭了没", at=1.0))
-    clock.now = 2.9
+    clock.now = 4.9
     check("连发期间不封批", b.tick() == [], "sealed early")
-    clock.now = 3.0
+    clock.now = 5.0
     out = b.tick()
-    check("最后一条后 2s 封批", len(out) == 1 and len(out[0].messages) == 3, f"{out}")
+    check("最后一条后 4s 封批",
+          len(out) == 1 and len(out[0].messages) == 3, f"{out}")
     check("批次里三个人称一致", out[0].authors == ["小明"], f"{out[0].authors}")
 
     # 3) 换人：0.8s
@@ -144,9 +148,11 @@ def test_listen() -> None:
     for i in range(10):
         clock.now = float(i)
         b.feed(msg("c1", "小明", f"第{i}句", at=float(i), local_id=i + 1))
-    clock.now = 8.0
+    clock.now = 11.9
+    check("max_wait 前一刻还没封", b.tick() == [], "sealed early")
+    clock.now = 12.0
     out = b.tick()
-    check("max_wait=8s 强制封批", len(out) == 1, f"{out}")
+    check("max_wait=12s 强制封批", len(out) == 1, f"{out}")
     check("reason=max_wait", out[0].reason == "max_wait", f"got {out[0].reason}")
     check("封批时已攒 10 条", len(out[0].messages) == 10, f"got {len(out[0].messages)}")
 
@@ -166,8 +172,10 @@ def test_listen() -> None:
     check("is_self 不建桶", b.pending() == {}, f"{b.pending()}")
 
     # 9) 多会话互不干扰
+    #    这里用固定窗口（adaptive=False）：测的是"两个会话不是同一个桶"，
+    #    不该被自适应的秒数变化牵着走。
     clock = Clock()
-    b = L.MessageBatcher(clock=clock)
+    b = L.MessageBatcher(L.ListenPolicy(adaptive=False), clock=clock)
     b.feed(msg("c1", "小明", "A", at=0.0))
     b.feed(msg("c2", "小红", "B", at=0.0))
     clock.now = 1.5
@@ -179,9 +187,9 @@ def test_listen() -> None:
     out = b.tick()
     check("c2 随后封批", len(out) == 1 and out[0].chat_id == "c2" and len(out[0].messages) == 2, f"{out}")
 
-    # 10) 重复推送不重复入批
+    # 10) 重复推送不重复入批（同样用固定窗口）
     clock = Clock()
-    b = L.MessageBatcher(clock=clock)
+    b = L.MessageBatcher(L.ListenPolicy(adaptive=False), clock=clock)
     b.feed(msg("c1", "小明", "一", at=0.0, local_id=7))
     b.feed(msg("c1", "小明", "一", at=0.1, local_id=7))
     clock.now = 2.0
@@ -208,7 +216,7 @@ def test_transcript() -> None:
     section("时间线")
 
     clock = Clock()
-    b = L.MessageBatcher(clock=clock)
+    b = L.MessageBatcher(L.ListenPolicy(adaptive=False), clock=clock)
     b.feed(msg("c1", "小明", "大肥鱼", at=0.0))
     b.feed(msg("c1", "小明", "你在不在", at=0.5))
     clock.now = 2.5
@@ -218,12 +226,83 @@ def test_transcript() -> None:
     check("两行", len(text.splitlines()) == 2, f"{text!r}")
 
 
+def test_adaptive() -> None:
+    """自适应窗口 —— 这次修的就是这个。
+
+    固定的 2 秒有个根本问题：**短消息和长消息的"说完程度"不一样**。
+
+        「在吗」              → 极可能还有下文，该多等
+        「在吗。」            → 句号收尾，说完了
+        「我今天去长坂坡了，看到了樱花看到了枣树」→ 一段话说完了
+        「那我先去吃饭了，」  → 逗号收尾，明显还有一句
+
+    算法照 AstrBot 的 private_debounce（companion_v2/conversation）：
+    拿字数当完整度的代理，句尾标点微调。
+    """
+    section("自适应窗口")
+    pol = L.ListenPolicy()
+
+    check("【在吗】等最久（≈4.0）",
+          abs(L.adaptive_quiet("在吗", pol) - 4.0) < 0.01,
+          f"{L.adaptive_quiet('在吗', pol)}")
+
+    # 长消息：60 字以上直接到下限
+    long_text = ("我今天去长坂坡了，看到了樱花，还看到了枣树，"
+                 "回来的路上碰到了老王他家的狗" * 2) + "。"
+    check("长消息等最短（1.5）",
+          abs(L.adaptive_quiet(long_text, pol) - 1.5) < 0.01,
+          f"{L.adaptive_quiet(long_text, pol)}")
+
+    # 句尾标点的影响：同样 16 字，句号比逗号早、比没标点早
+    body = "今天下午我们一起去长坂坡看樱花吧"
+    q_none = L.adaptive_quiet(body, pol)
+    q_dot = L.adaptive_quiet(body + "。", pol)
+    q_comma = L.adaptive_quiet(body + "，", pol)
+    check("句号 < 无标点", q_dot < q_none, f"{q_dot} vs {q_none}")
+    check("逗号 > 无标点", q_comma > q_none, f"{q_comma} vs {q_none}")
+    check("逗号 > 句号", q_comma > q_dot, f"{q_comma} vs {q_dot}")
+
+    # 永远落在 [min, max] 里
+    for t in ("", "。", "哈", "a" * 500, "，，，", "  "):
+        v = L.adaptive_quiet(t, pol)
+        check(f"边界被夹住 {t[:6]!r}",
+              pol.quiet_min - 1e-9 <= v <= pol.quiet_max + 1e-9, f"{v}")
+
+    # 关掉自适应 → 退回固定值（老行为，可回退）
+    fixed = L.ListenPolicy(adaptive=False)
+    check("adaptive=False 用 quiet_same_author",
+          L.adaptive_quiet("在吗", fixed) == fixed.quiet_same_author,
+          f"{L.adaptive_quiet('在吗', fixed)}")
+
+    # 可见字数：空白不算，纯标点也不该是 0
+    check("空白不计入", L.visible_chars(" 你 好 ") == 2,
+          str(L.visible_chars(" 你 好 ")))
+    check("全空白兜底为 1", L.visible_chars("   ") == 1,
+          str(L.visible_chars("   ")))
+
+    # 端到端：对方断句三连，攒成一批
+    clock = Clock()
+    b = L.MessageBatcher(clock=clock)
+    b.feed(msg("c1", "小明", "大肥鱼", at=0.0))
+    clock.now = 1.0
+    b.feed(msg("c1", "小明", "你在不在", at=1.0))
+    clock.now = 2.0
+    b.feed(msg("c1", "小明", "吃饭了没", at=2.0))
+    clock.now = 5.5
+    check("断句期间一直不封批", b.tick() == [], "sealed early")
+    clock.now = 6.0
+    out = b.tick()
+    check("三句攒成一批（不再逐条回）",
+          len(out) == 1 and len(out[0].messages) == 3, f"{out}")
+
+
 def main() -> int:
     print("=" * 66)
-    print("倾听层自检（攒批 / 到期 / 硬上限）")
+    print("倾听层自检（攒批 / 到期 / 硬上限 / 自适应窗口）")
     print("=" * 66)
 
     test_listen()
+    test_adaptive()
     test_transcript()
 
     print("\n" + "=" * 66)
