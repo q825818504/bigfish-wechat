@@ -1934,6 +1934,7 @@ function renderImprPanes() {
     // 这是她**自己**从事实归纳的一段话，每轮都会带进提示词。
     // 和下面「你手写的评语」区别：那段她看不见，这段她天天在用。
     buildProfileBlock(p) +
+    buildBondBlock(p) +
 
     '<div class="field full" style="margin-bottom:16px">' +
     '<label>你怎么看这段关系（手写，模型不参与，她也不看）</label>' +
@@ -3516,3 +3517,152 @@ window.addEventListener('DOMContentLoaded', () => {
   pushLog('界面已载入');
   bootBridge();
 });
+
+/* ════════════════════════════════════════════════════════════════════
+   关系卡（印象页里的一栏）
+   ════════════════════════════════════════════════════════════════════
+
+   主动开口没有页面了 —— 它是「插件」页里的一张卡（hook 类）：
+   开关、参数、预览都是插件页现成的，不必再养一套界面。
+
+   关系卡也没有页面 —— 它并进了「印象」。理由和提示词那边一样：
+   「我叫他老爸」和「他是个嘴硬心软的人」都是"我对这个人的认识"，
+   分两个地方摆，用户不知道该改哪个。
+
+   每条都必须能对上原话，所以卡片上一定摆出「依据」——
+   用户可以自己判断这条是不是编的。
+
+   下线 ≠ 删除：
+     下线  她不提了，卡还在（记错了用这个）
+     删除  真删（这件事不该存在才用）
+*/
+
+function buildBondBlock(p) {
+  const bonds = p.bonds || [];
+  const head =
+    '<div class="card-head" style="margin-top:6px">' +
+    '<h2>我们之间</h2>' +
+    '<span class="tag">' + (bonds.length ? bonds.length + ' 条' : '还没有') +
+    '</span></div>';
+
+  const desc =
+    '<div class="card-desc" style="margin-bottom:10px">' +
+    '这些是<b>从原话里长出来的</b>：她怎么称呼这个人、有什么当时没说出口。' +
+    '每一条都对应某一句真实说过的话，对不上的写不进来。' +
+    '她会带着这些跟你说话 —— 措辞不对可以直接改，依据那句原话不会变。' +
+    '</div>';
+
+  if (!bonds.length) {
+    return head + desc +
+      '<div class="empty" style="padding:14px 0"><p>' +
+      '还没有。称呼变过几次、有话说了一半、吵完架又和好——' +
+      '这些会慢慢长出来，不用催。</p></div>';
+  }
+
+  const byKind = {};
+  bonds.forEach((it) => { (byKind[it.kind] = byKind[it.kind] || []).push(it); });
+  const rows = ['address', 'unsaid'].filter((k) => byKind[k]).map((k) =>
+    byKind[k].map((it) => (
+      '<div class="open-item">' +
+      '<div class="open-body">' +
+      '<span class="health-tag">' + esc(it.kindLabel || k) + '</span>' +
+      '<span class="open-text">' + esc(it.text) + '</span>' +
+      '<small class="memory-role">依据：「' + esc(it.evidence) + '」' +
+      '</small>' +
+      '</div>' +
+      '<button class="btn btn-sm" data-bondedit="' + it.id + '">改</button>' +
+      '<button class="btn btn-sm" data-bondretire="' + it.id + '">下线</button>' +
+      '<button class="btn btn-sm" data-bonddel="' + it.id + '">删除</button>' +
+      '</div>')).join('')).join('');
+
+  return head + desc + rows;
+}
+
+function startBondEdit(id, btn) {
+  // 就地编辑：把这一行的文字换成输入框，不动其他行。
+  // 为什么不做弹窗：改一句话不该跳出去，改完立刻能看到上下文对不对。
+  const row = btn.closest('.open-item');
+  if (!row) return;
+  const body = row.querySelector('.open-body');
+  const span = row.querySelector('.open-text');
+  if (!body || !span) return;
+
+  const cur = span.textContent;
+  body.innerHTML =
+    '<input type="text" class="bond-edit-input" value="' + esc(cur) + '" maxlength="200">' +
+    '<small class="memory-role">改动只影响她怎么概括，依据那句原话不会变</small>';
+  const input = body.querySelector('.bond-edit-input');
+  if (!input) return;
+  input.focus();
+  input.select();
+
+  const done = async (save) => {
+    if (save) {
+      const text = input.value.trim();
+      if (!text) { toast('不能改成空的'); return; }
+      try {
+        const r = JSON.parse(await S.bridge.bond_update(JSON.stringify(
+          { id: id, action: 'edit', text: text })));
+        if (r.error) { toast(r.error); return; }
+        toast('已改');
+      } catch (e) { toast('改失败：' + (e.message || e)); return; }
+    }
+    await loadImpression();
+  };
+
+  input.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); done(true); }
+    if (ev.key === 'Escape') { ev.preventDefault(); done(false); }
+  });
+  input.addEventListener('blur', () => {
+    // 失焦不自动保存 —— 改成什么算什么，容易误存
+  });
+
+  // 保存 / 取消两个按钮换到 action 区
+  const actions = row.querySelectorAll('button');
+  actions.forEach((b) => { b.hidden = true; });
+  const box = document.createElement('div');
+  box.style.display = 'flex';
+  box.style.gap = '6px';
+  const ok = document.createElement('button');
+  ok.className = 'btn btn-sm';
+  ok.textContent = '保存';
+  ok.addEventListener('click', () => done(true));
+  const no = document.createElement('button');
+  no.className = 'btn btn-sm';
+  no.textContent = '取消';
+  no.addEventListener('click', () => done(false));
+  box.appendChild(ok);
+  box.appendChild(no);
+  row.appendChild(box);
+}
+
+async function bondAction(id, action) {
+  if (!S.bridge || !S.bridge.bond_update) return;
+  if (action === 'delete' && !confirm('真删？删了就找不回来了。\n如果只是觉得她记错了，用「下线」。')) return;
+  try {
+    const r = JSON.parse(await S.bridge.bond_update(JSON.stringify({ id: id, action: action })));
+    if (r.error) { toast(r.error); return; }
+    toast(action === 'delete' ? '已删除' : '已下线');
+    await loadImpression();
+  } catch (e) { toast('操作失败：' + (e.message || e)); }
+}
+
+/* ── 事件委托：关系卡按钮是动态渲染的，不用逐个绑定 ── */
+document.addEventListener('click', (ev) => {
+  const t = ev.target.closest('[data-bondedit],[data-bondretire],[data-bonddel]');
+  if (!t) return;
+  if (t.dataset.bondedit !== undefined) {
+    startBondEdit(Number(t.dataset.bondedit), t);
+    return;
+  }
+  if (t.dataset.bondretire !== undefined) {
+    bondAction(Number(t.dataset.bondretire), 'retire');
+    return;
+  }
+  if (t.dataset.bonddel !== undefined) {
+    bondAction(Number(t.dataset.bonddel), 'delete');
+    return;
+  }
+});
+

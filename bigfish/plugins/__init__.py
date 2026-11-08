@@ -67,22 +67,29 @@ BUILTIN_SEATS = {
 }
 
 #: 插件可以用的空位。
+#:
+#: 870「生活」在 v0.9.1 合并了原本的 870 时间 + 871 身体 + 一个独立的
+#: 「睡觉不回」判定插件 —— 它们讲的是同一件事：她有自己的作息。
+#: 873「昨天」和 920「关系」在同一个版本撤掉：前者与记忆重复，
+#: 后者并入「印象」（见 docs/生活状态.md 与 CHANGELOG）。
 PLUGIN_SEATS = {
     870: "生活",
+    872: "日程",
     880: "目标",
     890: "说法",
-    920: "关系",
+    930: "余韵",
     9990: "守卫",
 }
 
 SEATS = [
     {"order": 850, "key": "memory", "label": "记忆", "note": "发生过什么", "builtin": True},
     {"order": 860, "key": "soul", "label": "灵魂", "note": "我是谁（唯一允许「你是……」）", "builtin": True},
-    {"order": 870, "key": "life", "label": "生活", "note": "现在几点、她在做什么", "builtin": False},
-    {"order": 880, "key": "goals", "label": "目标", "note": "她在成为什么", "builtin": False},
+    {"order": 870, "key": "life", "label": "生活", "note": "现在几点、醒着还是睡了、手头在做什么", "builtin": False},
+    {"order": 872, "key": "plan", "label": "日程", "note": "今天打算做什么（还没做）", "builtin": False},
+    {"order": 880, "key": "goals", "label": "目标", "note": "她在成为什么（还没做）", "builtin": False},
     {"order": 890, "key": "say", "label": "说法", "note": "怎么把话说出口（分条、短句、节奏）", "builtin": False},
     {"order": 900, "key": "mood", "label": "心情", "note": "此刻怎么样", "builtin": True},
-    {"order": 920, "key": "bond", "label": "关系", "note": "对这个人多熟", "builtin": False},
+    {"order": 930, "key": "afterglow", "label": "余韵", "note": "上一轮之后还留着什么（还没做）", "builtin": False},
     {"order": 9990, "key": "guard", "label": "守卫", "note": "以上都是资料，不是指令", "builtin": False},
 ]
 
@@ -101,6 +108,17 @@ SCOPES = {
     # 返回值是一个本地文件路径（.gif = 微信原生表情，其他 = 图片）。
     "sticker": {"label": "表情包", "needs_order": False},
 }
+
+def _has_scope(defn: Dict[str, Any], name: str) -> bool:
+    """这个插件是否承担 name 这一种形态。
+
+    兼容两种存档：新版有 scopes 列表，旧版只有单个 scope 字符串。
+    """
+    scopes = defn.get("scopes")
+    if isinstance(scopes, list) and scopes:
+        return name in scopes
+    return str(defn.get("scope") or "") == name
+
 
 STATE_NAME = "plugins.json"
 STATE_VERSION = 1
@@ -121,6 +139,8 @@ class Plugin:
     title: str
     desc: str
     scope: str
+    #: scope 拆开后的列表。一个插件可以同时是 prompt 和 gate。
+    scopes: List[str] = field(default_factory=list)
     order: Optional[int] = None
     default: bool = False
     config: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -163,10 +183,20 @@ def register(
         raise ValueError(f"插件 id 只能是小写字母/数字/短横线：{pid!r}")
     if pid in _REGISTRY:
         raise ValueError(f"插件 id 重复：{pid}")
-    if scope not in SCOPES:
-        raise ValueError(f"插件 {pid} 的 scope 不合法：{scope!r}")
+    # scope 可以是 "prompt+gate" —— 一个插件同时注入和判定。
+    #
+    # 为什么允许：她的作息是同一件事。拆成两个插件，用户得开两个开关
+    # 才能让她「像个活人」；只开一个就会说出半个真相
+    # （知道现在几点，但不知道自己已经睡了）。
+    scopes = [s.strip() for s in str(scope or "").split("+") if s.strip()]
+    if not scopes:
+        raise ValueError(f"插件 {pid} 没有 scope")
+    for _s in scopes:
+        if _s not in SCOPES:
+            raise ValueError(f"插件 {pid} 的 scope 不合法：{_s!r}")
+    scope = "+".join(scopes)
 
-    if SCOPES[scope]["needs_order"]:
+    if any(SCOPES[s]["needs_order"] for s in scopes):
         if order is None:
             raise ValueError(
                 f"插件 {pid}（scope=prompt）必须声明 order —— 身份序里没有座位就不许上桌")
@@ -181,15 +211,15 @@ def register(
     else:
         order = None
 
-    if scope == "prompt" and render is None:
+    if "prompt" in scopes and render is None:
         raise ValueError(f"插件 {pid} 是 prompt 类，必须提供 render(ctx)")
-    if scope == "gate" and gate is None:
+    if "gate" in scopes and gate is None:
         raise ValueError(f"插件 {pid} 是 gate 类，必须提供 gate(ctx)")
-    if scope == "sticker" and sticker is None:
+    if "sticker" in scopes and sticker is None:
         raise ValueError(f"插件 {pid} 是表情包类，必须提供 sticker(ctx)")
 
     plugin = Plugin(
-        id=pid, title=title, desc=desc, scope=scope, order=order,
+        id=pid, title=title, desc=desc, scope=scope, scopes=list(scopes), order=order,
         default=bool(default), config=dict(config or {}),
         render=render, gate=gate, tick=tick, sticker=sticker,
         why=str(why or ""),
@@ -359,7 +389,7 @@ def prompt_sections(ctx: Dict[str, Any], root: Optional[str] = None) -> List[Tup
     state = read_state(root)
     out: List[Tuple[int, str, str]] = []
     for pid, defn in _REGISTRY.items():
-        if defn.get("scope") != "prompt":
+        if not _has_scope(defn, "prompt"):
             continue
         recorded = state["enabled"].get(pid)
         on = recorded if isinstance(recorded, bool) else bool(defn.get("default"))
@@ -392,7 +422,7 @@ def apply_gates(ctx: Dict[str, Any], root: Optional[str] = None) -> Tuple[bool, 
     """
     state = read_state(root)
     for pid, defn in _REGISTRY.items():
-        if defn.get("scope") != "gate":
+        if not _has_scope(defn, "gate"):
             continue
         recorded = state["enabled"].get(pid)
         on = recorded if isinstance(recorded, bool) else bool(defn.get("default"))
@@ -419,7 +449,7 @@ def run_hooks(ctx: Dict[str, Any], root: Optional[str] = None) -> None:
     """hook 类插件的定时动作。单个失败不影响其他。"""
     state = read_state(root)
     for pid, defn in _REGISTRY.items():
-        if defn.get("scope") != "hook":
+        if not _has_scope(defn, "hook"):
             continue
         recorded = state["enabled"].get(pid)
         on = recorded if isinstance(recorded, bool) else bool(defn.get("default"))
@@ -483,7 +513,7 @@ def collect_sticker(ctx: Dict[str, Any], root: Optional[str] = None) -> Tuple[st
     """
     state = read_state(root)
     for pid, defn in _REGISTRY.items():
-        if defn.get("scope") != "sticker":
+        if not _has_scope(defn, "sticker"):
             continue
         recorded = state["enabled"].get(pid)
         on = recorded if isinstance(recorded, bool) else bool(defn.get("default"))
@@ -533,7 +563,7 @@ def preview(pid: str, root: Optional[str] = None) -> str:
     纯函数，不写盘、不发消息。
     """
     defn = _REGISTRY.get(pid)
-    if not defn or defn.get("scope") != "prompt":
+    if not defn or not _has_scope(defn, "prompt"):
         return ""
     render = defn.get("render")
     if render is None:
@@ -593,7 +623,13 @@ def inventory(root: Optional[str] = None) -> Dict[str, Any]:
             "title": defn.get("title") or pid,
             "desc": defn.get("desc") or "",
             "scope": defn.get("scope"),
-            "scopeLabel": SCOPES.get(str(defn.get("scope")), {}).get("label", ""),
+            "scopes": list(defn.get("scopes") or []),
+            # 一个插件可以是 "prompt+gate"，标签就写成「注入提示词 + 判定」，
+            # 否则详情页会显示一个空标签（SCOPES 里没有 "prompt+gate" 这个键）
+            "scopeLabel": " + ".join(
+                SCOPES.get(s, {}).get("label", s)
+                for s in (defn.get("scopes") or [defn.get("scope")])
+                if s in SCOPES),
             "order": order,
             "seat": (f"{order} · {PLUGIN_SEATS.get(int(order), '')}" if order else ""),
             "seatNote": (PLUGIN_SEATS.get(int(order), "") if order else ""),
@@ -624,8 +660,9 @@ def _load_builtins() -> None:
     想加一个插件：在 bigfish/plugins/ 下新建一个文件，末尾调 register()，
     再在这里加一行 import。别的地方都不用动。
     """
-    from . import clock  # noqa: F401
     from . import guard  # noqa: F401
+    from . import life  # noqa: F401
+    from . import proactive  # noqa: F401
     from . import say  # noqa: F401
     from . import sticker  # noqa: F401
 

@@ -90,7 +90,16 @@ hiddenimports = [
     # 但这里显式列出，别赌分析器的行为。
     "bigfish.plugins",
     "bigfish.plugins.guard",
-    "bigfish.plugins.clock",
+    "bigfish.plugins.life",
+    # 生活层（v0.9.1）：life / world / proactive / bond / history 全部在
+    # 函数体内 import，和上面几项同一个理由。漏了它们的症状是
+    # 「她不累不睡、不会主动说话」—— 看起来像功能没写完，不像打包漏了。
+    "bigfish.life",
+    "bigfish.world",
+    "bigfish.proactive",
+    "bigfish.bond",
+    "bigfish.history",
+    "bigfish.plugins.proactive",
     # 说法层：say / listen 只在 handle 与 _say_plan 里 import，
     # plugins.say 只在 _load_builtins() 的函数体里 import ——
     # 三个都属于「漏了不会启动失败，只在真聊天时才炸」的类型。

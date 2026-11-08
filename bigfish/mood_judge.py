@@ -338,3 +338,82 @@ def read_mood_state_now() -> Optional[Dict[str, Any]]:
         return None
     key = store.get("lastActive") or next(iter(moods))
     return moods.get(key) or moods.get(next(iter(moods)))
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 独立衰减（v0.9）
+# ══════════════════════════════════════════════════════════════════════
+
+def decay_only(seed: str = "dafeiyu", now_ms: Optional[int] = None) -> bool:
+    """只做自然衰减，不应用任何判定。**不调模型。**
+
+    存在的理由很具体：衰减以前只写在 `judge_and_apply` 里 ——
+    也就是说**只有聊天时才衰减**。
+
+    后果：你三天不说话，她的心情还停在上次那个点。三天里她不会
+    从生气里缓过来，也不会从高兴里平静下来。情绪没有"过去"这个动作，
+    只有"被下一句话覆盖"。
+
+    挂到 life 的 tick 上（每 10 分钟一次）之后，
+    「情绪会自己平复」这条常识第一次真的成立。
+
+    返回是否真的写了盘（无变化就不写）。
+    """
+    import json
+    import math
+    import time as _t
+
+    from bigfish.vault import (
+        MOOD_DIMS_ALL, _DEFAULT_SLOT, _clamp, _atomic_write_json,
+        existing_path, mood_path, read_mood_config,
+    )
+
+    p = existing_path(None, "mood") or mood_path(None)
+    now = int(now_ms if now_ms is not None else _t.time() * 1000)
+
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            store = json.load(f)
+        if not isinstance(store, dict):
+            return False
+    except Exception:
+        return False
+
+    moods = store.get("moods")
+    if not isinstance(moods, dict) or not moods:
+        return False
+    slot_key = store.get("lastActive") or next(iter(moods), _DEFAULT_SLOT)
+    s = moods.get(slot_key)
+    if not isinstance(s, dict):
+        return False
+
+    cfg = read_mood_config()
+    base = float(_clamp(int(cfg["moodBase"]), 0, 100))
+    half = _clamp(int(cfg.get("decayHalfHours") or 12), 1, 168)
+
+    last_decay = int(s.get("lastDecayAt") or now)
+    age_min = max(0.0, (now - last_decay) / 60000.0)
+    if age_min < 1:
+        return False
+
+    km = 1 - math.exp(-(math.log(2) * age_min) / (half * 60))
+    ke = 1 - math.exp(-(math.log(2) * age_min) / DIM_HALF_LIFE_MIN)
+
+    cur = float(s.get("mood", base))
+    new_mood = cur + (base - cur) * km
+    dims_cur = s.get("dims") if isinstance(s.get("dims"), dict) else {}
+    for k in MOOD_DIMS_ALL:
+        dims_cur[k] = max(0.0, float(dims_cur.get(k) or 0) * (1 - ke))
+
+    s["mood"] = round(new_mood, 2)
+    s["dims"] = dims_cur
+    s["lastDecayAt"] = now
+    s["kind"] = "decayed"
+    moods[slot_key] = s
+    store["moods"] = moods
+
+    try:
+        _atomic_write_json(p, store)
+        return True
+    except Exception:
+        return False

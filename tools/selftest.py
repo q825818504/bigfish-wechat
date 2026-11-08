@@ -147,9 +147,17 @@ def t_memory_bridge():
     d = json.loads(raw)
     mem = d.get("memory") or {}
     text = mem.get("text") or ""
-    n = len(json.loads(text)) if text else 0
+    hint = mem.get("diagnostics") or {}
+    ids = mem.get("ids") or []
+    n = int(hint.get("hits") or len(ids) or 0)
     assert n > 0, f"检索「大肥鱼」返回 0 条（text={text[:80]}）"
-    return f"检索到 {n} 条记忆"
+    # 内容坏了但结构对 —— 这正是编码对不上时的样子：条数有、字全是 �。
+    # 只查条数等于放过它，所以这里必须连内容一起看。
+    assert "\ufffd" not in text, (
+        f"检索到 {n} 条，但内容里出现替换字符 U+FFFD —— "
+        f"多半是 Python 子进程的输出编码和 Node 的解码对不上"
+        f"（bridge.mjs 的 localRecall）")
+    return f"检索到 {n} 条记忆，中文正常"
 
 
 item("记忆检索（Node 桥接）", t_memory_bridge)
@@ -161,9 +169,15 @@ def t_memory_stats():
 
     from bigfish.bridge_client import _default_data_root, _pick_scope_dir
     root = _default_data_root()
-    scope = _pick_scope_dir(root)
-    assert scope, "找不到 scope 目录"
+    # 老布局（<root>/ws-*/memory-*.sqlite3）优先；没有就按新布局看根目录。
+    # 以前这里 assert scope 直接断言，导致新布局下必然红 ——
+    # 检查项过时和真的坏了长得一样，是最难查的那种红。
+    scope = _pick_scope_dir(root) or root
     dbs = glob.glob(os.path.join(scope, "memory-*.sqlite3"))
+    if not dbs:
+        flat = os.path.join(scope, "memory.sqlite3")
+        if os.path.isfile(flat):
+            dbs = [flat]
     assert dbs, f"{scope} 下没有记忆库"
 
     import shutil
@@ -393,6 +407,24 @@ def _run_unit(script: str) -> str:
 item("模型重试", lambda: _run_unit("selftest_retry.py"))
 item("请求快照", lambda: _run_unit("selftest_trace.py"))
 item("记忆降级", lambda: _run_unit("selftest_degrade.py"))
+# v0.8：她开始过日子了 —— 状态机 + 接线各一个单元自检
+item("生活状态", lambda: _run_unit("selftest_life.py"))
+item("生活接线", lambda: _run_unit("selftest_life_wiring.py"))
+# v0.9：主动开口 / 追问 / 关系卡提炼
+# （每日叙事与关系卡独立注入在 v0.9.1 撤掉：前者与记忆重复，
+#   后者并进了印象。这里测的是剩下的那部分逻辑。）
+item("主动与追问", lambda: _run_unit("selftest_proactive.py"))
+# 节奏单独一项：它是乘法关系（间隔 × 命中率 × 加成 × 机会数），
+# 改任何一个都只动一点点，乘起来却是"一天一条"和"每天固定三条"的差别。
+item("主动节奏", lambda: _run_unit("selftest_pace.py"))
+# 拼装体检：主动开口和正常回复必须是同一个人的口吻。
+# 这两套 prompt 一旦分头演化，她"主动说的那句"就不像她了 ——
+# 而这种漂移不报错，只会让人觉得这个功能有点假。
+item("拼装一致", lambda: _run_unit("selftest_compose.py"))
+# 接话体检：不接 / 补一句 / 以及它们和"对方说话了""她睡了"的冲突。
+# 这类冲突不会报错，只会让她说出一句莫名其妙的话。
+item("接话与补一句", lambda: _run_unit("selftest_afterthought.py"))
+item("界面契约", lambda: _run_unit("selftest_ui_pages.py"))
 
 # ════════════════════════════════════════════════════════════════
 section("结果汇总")

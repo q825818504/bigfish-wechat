@@ -386,6 +386,24 @@ def probe_writable(target: str) -> Tuple[bool, str]:
         os.remove(probe)
         return True, ""
     except Exception as exc:
+        # 第二种写法：mkstemp。
+        #
+        # 为什么要两条路：2026-11 实测过——同一个目录，命令行 Python 写
+        # 固定名字能成功，打包后的 exe 却报 Permission denied。
+        # 原因是某些安全策略只拦"已知名字"的文件创建（杀软的白名单判据
+        # 是按路径+名字做的），而 mkstemp 走的是临时文件 API，路径随机。
+        #
+        # 也就是说：固定名字探针失败 ≠ 目录不可写。真正的判据是
+        # 「能不能在这个目录里创建出一个文件」，名字不该有影响。
+        try:
+            import tempfile
+
+            fd, alt = tempfile.mkstemp(prefix=".bigfish-probe-", dir=d)
+            os.close(fd)
+            os.remove(alt)
+            return True, ""
+        except Exception:
+            pass
         try:
             if os.path.exists(probe):
                 os.remove(probe)

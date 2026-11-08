@@ -43,5 +43,6 @@
     "_comment": "repo 留空就用内置的 q825818504/bigfish-wechat。fork 的人填自己的 owner/repo（填完整 URL 也行，会自动收拾）。",
     "repo": "",
     "enabled": true
-  }
+  },
+  "_comment_proactive": "主动开口（什么时候先开口、一天几条、预演模式、重要日子）在「插件 → 主动」那张卡里配。config.json 里不再有这一段 —— 有两处能改同一件事的时候，谁生效取决于哪个先读。"
 }

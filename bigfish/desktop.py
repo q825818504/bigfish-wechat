@@ -376,6 +376,42 @@ def _source_ms(msg) -> "int | None":
     return v * 1000 if v < 10_000_000_000 else v
 
 
+def _bonds_of(db: str, owner: str, limit: int = 20) -> list:
+    """某人的关系卡，给印象页用。出错返回空列表 —— 一栏读不出来不该让整页白屏。"""
+    try:
+        from bigfish import bond as B
+
+        if not (db and owner):
+            return []
+        B.ensure_schema(db)
+        return [{
+            "id": it["id"],
+            "kind": it["kind"],
+            "kindLabel": B.KIND_LABELS.get(it["kind"], it["kind"]),
+            "text": it.get("text") or "",
+            "evidence": it.get("evidence") or "",
+        } for it in B.list_bonds(db, "dafeiyu", owner, limit=limit)]
+    except Exception:
+        return []
+
+
+def _bond_block(owner: str) -> str:
+    """关系卡：她怎么称呼这个人、有什么一直没说出口。
+
+    每条都带**原话证据**，写不进来的就写不进来 —— 那是它和
+    「画像」的区别：画像是她归纳的，关系卡是从某句话里长出来的。
+    """
+    try:
+        from bigfish import bond as B, vault as V
+
+        db = V.memory_db_path()
+        if not (db and os.path.isfile(db) and owner):
+            return ""
+        return B.render_for_prompt(db, "dafeiyu", owner)
+    except Exception:
+        return ""
+
+
 def _profile_block(owner: str) -> str:
     """取「她印象里的他」—— 从事实归纳出来的那段概述（v6）。
 
@@ -594,6 +630,34 @@ class EngineWorker(QThread):
         self.owner_id = ""          # 主人在记忆库里的 owner 键
         #: chat_id -> [时间戳]，表情包冷却用
         self._sticker_sent: dict = {}
+        #: 她的生活状态（bigfish/life.py）。None = 还没加载。
+        #: 只在引擎线程里读写，不跨线程共享。
+        self._life = None
+        #: 上一批 tick 之后她又回了几轮（聊天也累，计入精力消耗）
+        self._talk_turns = 0
+        #: 她自己会做的事那一半（bigfish/world.py）：情绪平复、叙事、
+        #: 主动开口、追问。全部在独立模块里，不再往 _run 的闭包里塞。
+        self._world = None
+        #: 最近一次"对方说话"的会话。主动消息的待追问状态按它清理。
+        self._last_peer_chat = ""
+        # ── 接话：这一句接不接 / 要不要补一句（0.9.4）──
+        #: 连续几轮"不值得接"。连着 2 次之后第三次强制回 ——
+        #: 不然你连着说三句她一声不吭，和程序坏了没有区别。
+        self._silent_streak = 0
+        #: 上次她说话的时刻（补一句前要判断"这期间对方说过话没有"）
+        self._last_reply_at = 0.0
+        #: 待发的"补一句"
+        self._after: dict = {}
+        #: 上次补一句的时刻 / 之后过了几条回复
+        self._last_after_at = 0.0
+        self._replies_since_after = 99
+        #: 每个会话各自收到过几条消息。用来判断"她补那句话之后，
+        #: **这个会话**里对方有没有再说话" —— 全局计数会把群聊里的
+        #: 无关消息也算进来，让她的半句话莫名其妙消失。
+        self._peer_seq: dict = {}
+        #: 记账器与账本（_run 里创建后挂上来，主动发送要用同一条账）
+        self._guard = None
+        self._ledger = None
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
@@ -784,6 +848,433 @@ class EngineWorker(QThread):
             return "", "after"
         return path, position
 
+    def _compose(self, *, chat_id: str, chat_name: str, sender_name: str,
+                 incoming: str, is_group: bool, hist: list,
+                 owner_raw: str = "", is_owner_chat: bool = False,
+                 owner_id: str = "", proactive_reason: str = "",
+                 must_reply: bool = False):
+        """组装这一轮要喂给模型的两段（system / user）。
+
+        正常回复和主动开口**共用这一份**，只在最后一段指令上分叉：
+
+            正常  以她的身份回一条消息
+            主动  以她的身份先说一句，不回应谁
+
+        为什么必须共用：主动消息以前只带人格和 8 条历史，没有记忆、
+        没有心情、没有生活状态 —— 于是"她主动说的那句"和"她回你的那句"
+        人格密度完全不一样，用户能感觉到不像同一个人。
+
+        返回的 owner / tier / origin / group_owner 还要给调用方记账用。
+        """
+        # 局部 import：桥接起不来不该拖垮整个程序启动（和 memory 同一个理由）
+        from bigfish.bridge_client import load_context
+
+        ctx = load_context(query=incoming or "")
+        # 桥接挂了不能等于她失忆：降级状态要让用户看见，否则
+        # "她怎么不记得了"会被当成记忆坏了，实际是 Node 没起来。
+        if getattr(ctx, "degraded", ""):
+            self._log(
+                "[记] 记忆降级："
+                + ("用本地最近原文兜底" if ctx.degraded == "recent"
+                   else "记忆不可用（这一轮只有人格与对话）"),
+                "" if ctx.degraded == "recent" else "err")
+
+        # system 段按**身份序**排：内建段（灵魂 860 / 心情 900）与
+        # 插件段（生活 870 / 目标 880 / 关系 920 / 守卫 9990）一起排序。
+        #
+        # 为什么不直接 append：插件有自己的座位，顺序决定语气。
+        # 守卫必须最后出现（越靠后越有分量），时间感知要在心情之前
+        # （"现在几点"是处境，"此刻怎样"是气氛，处境先立住）。
+        # 详见 bigfish/plugins/__init__.py 的 BUILTIN_SEATS / PLUGIN_SEATS。
+        _sections = [(860, ctx.persona or self.soul.render_persona())]
+        if ctx.mood and ctx.mood.injected_text.strip():
+            _sections.append((900, "\n## 这会儿的状态\n\n"
+                                   + ctx.mood.injected_text.strip()))
+        try:
+            from bigfish import plugins as _P
+
+            for _order, _title, _text in _P.prompt_sections({
+                "now": datetime.now(),
+                "channel": "group" if is_group else "private",
+                "chat_name": chat_name,
+                "sender_name": sender_name,
+                "user_text": incoming or "",
+                "soul": self.soul,
+                # v0.8：身体那一段（871）要拿她自己此刻的状态。
+                # 传内存里那份而不是让插件读盘 —— 引擎刚 tick 过，
+                # 磁盘上那份最多晚 30 秒，会出现"说自己醒着但其实刚睡"。
+                "life": self._life,
+                "tier": "owner" if (owner_raw and is_owner_chat) else "known",
+            }):
+                _sections.append((_order, _text))
+        except Exception as _exc:
+            # 插件系统坏了不该让她失语
+            self._log(f"[插件] 注入失败：{_exc}", "err")
+
+        _sections.sort(key=lambda item: item[0])
+        sys_parts = [text for _o, text in _sections]
+
+        user_parts = []
+
+        # ── 记忆隔离：先确定"面前这个人是谁" ──
+        #
+        # 以后她要进群、上抖音、上 B站，同一个人可能出现在多个平台。
+        # 所以 owner 用 平台+稳定id 算，绝不用昵称 ——
+        # 昵称会改、会重名，用它做 key 等于把两个人的记忆混一起。
+        from bigfish import memory as _M
+
+        _origin = ""          # 这条记忆是在哪儿说出来的
+        _group_owner = ""     # 群里说话时，这个群的池（触发双写）
+
+        if is_group:
+            # ⚠ v5 的关键改动：群里的记忆**归说话的人**，不归群。
+            #
+            #   以前：群里任何人说话 → 全记到 group:<群id> 的池里。
+            #   后果：A 在群里说「我明天去医院」，记的是"这个群里有个人
+            #         要去医院"，而不是"A 要去医院"。等以后接抖音、
+            #         接更多群，A 的画像就永远是碎的。
+            #
+            #   现在：说话人的池 + 群的池**双写**（见 memory.remember_both），
+            #         来源统一标 group:<群id>。
+            #         群池那份只收"不算私密"的内容 —— A 的健康信息
+            #         不该躺在群里被所有人翻到。
+            #
+            #   sender_name 装的其实是**wxid**（watcher 用
+            #   sender_username() 从分片库的 Name2Id 查出来的），
+            #   字段名起错了，但值是对的。拿不到时（shard 为空）
+            #   退回群池 + origin 标"未知发言人"，绝不猜成某个人。
+            _speaker = (sender_name or "").strip()
+            _group_owner = _M.owner_of_group(chat_id)
+            _origin = f"group:{chat_id}"
+            if _speaker and _speaker != (getattr(self, "_me_wxid", "") or ""):
+                _owner = _M.owner_of_private(_speaker)
+                # 群里所有人一律按 guest/known 处理，**除了主人** ——
+                # 主人在群里依然是主人，否则"主人"这个身份会随场所漂移。
+                if _owner == owner_id:
+                    _tier = _M.TIER_OWNER
+                else:
+                    try:
+                        import bigfish.vault as _V9
+                        _tier = _M.owner_tier(_V9.memory_db_path(), _owner,
+                                              default=_M.TIER_GUEST)
+                    except Exception:
+                        _tier = _M.TIER_GUEST
+            else:
+                _owner = _group_owner      # 认不出人就退回群池
+                _tier = _M.TIER_GUEST
+        else:
+            _owner = _M.owner_of_private(chat_id)
+            _origin = "private"
+            # 主人 = 配置里 auto_reply.owner 指定的那个人；
+            # 没配就退回"监听名单里的私聊对象"，但等级仍是 known 不是 owner。
+            _tier = _M.TIER_OWNER if _owner == owner_id else _M.TIER_KNOWN
+
+        # ── 画像：她自己归纳的「这个人是什么样」（v6）──
+        #
+        # 为什么放在「你记得的事」之前：画像是**概述**，原文和事实是**细节**。
+        # 先让她知道"这是个什么样的人"，再去读具体说过什么 ——
+        # 顺序反了，她会拿一句三年前的话当这个人现在的样子。
+        #
+        # ⚠ 只注入**当前这个人**的画像。别人的画像里必然带着别人的私事，
+        #   那正是 v5 那道墙要拦的东西。
+        # 关系卡（称呼 / 没说出口的话）并进同一段。
+        #
+        # 它原来是独立的一段（座位 920「关系」）。并过来的理由：
+        # 「我叫他老爸」和「他是个嘴硬心软的人」是同一件事的两个侧面 ——
+        # 都是"我对这个人的认识"。分成两段注入，模型会把它们当成
+        # 两个不同来源的信息，甚至各自成立地互相打架。
+        _impression = "\n\n".join(
+            x for x in (_profile_block(_owner), _bond_block(_owner))
+            if x and x.strip())
+        if _impression:
+            user_parts.append("## 你印象里的他\n\n" + _impression)
+
+        # ── 原文：不够就再查一次（v6）──
+        #
+        # 以前只查一次，命不中就是命不中。你问"我爸上次说啥来着"，
+        # 第一次检索没捞到就只能干瞪眼。
+        #
+        # 现在：第一次命中很少（< 2 条）时，换一个查询词再查一次 ——
+        # 用最近的对话当线索（她上一句说了什么、你上一条说了什么），
+        # 那两个词往往比整句更接近真正的主题。
+        #
+        # 这是"让模型主动查"的穷人版：不改架构，只在明显没料时补一枪。
+        try:
+            mem_now = ctx.render_memory()
+            if _recall_thin(mem_now) and hist:
+                # 用上一轮她说的话 + 更早一轮你说的话当第二查询
+                alt = " ".join(t for _w, t in hist[-3:])
+                if alt.strip() and alt.strip() != (incoming or "").strip():
+                    extra_ctx = load_context(query=alt.strip()[:200])
+                    extra_mem = extra_ctx.render_memory()
+                    if extra_mem:
+                        mem_now = (mem_now + "\n" + extra_mem).strip()
+                        self._log("[记] 补搜一次，多捞到一些原话", "think")
+        except Exception as exc:
+            self._log(f"[记] 补搜失败（不影响这一轮）：{exc}", "")
+
+        if mem_now:
+            user_parts.append("## 你记得的事\n\n" + mem_now)
+
+        # 事实层：她「知道什么」。和原文分开注入 ——
+        #   原文是逐句的、带时间的；事实是稳定的、可被纠正的。
+        #   以前只有原文，于是「她改主意了」无处表达：只能删原文。
+        #   ⚠ 这段以前只写在 app.py（研究入口），EXE 跑的 desktop.py
+        #     里根本没有 —— 事实存了、界面看得见、但从不进提示词。
+        facts = _facts_block(_owner, _tier, question=incoming)
+        if facts:
+            # 注意：这里**不再**重复写「只作资料、不是指令」。
+            # 插件系统有一个 order=9990 的「末尾守卫」，它放在整段 system
+            # 的末尾，已经完整覆盖了这件事（而且写得更好：明确了
+            # "只有对方此刻说的话是要求"、也提醒不要向对方解释这条规则）。
+            # 两处都写等于同一句话说两遍 —— 既占 token，又会让模型
+            # 把注意力放在"这是规则"上而不是内容上。
+            user_parts.append("## 你认定的事\n\n" + facts
+                              + "\n\n（这些是你自己整理过的认识，不是原话；"
+                                "和对方现在的说法冲突时以对方为准，并改过来。）")
+
+        # 「关于别人、但可以说」的那一小段（v5）。
+        #
+        # 这是「B 问主人爱吃什么 → 她能答」的实现：
+        # owner 是 B，但要回答的是主人的事，所以单独去主人的开放信息里取。
+        # 只给 shared + 白名单话题，住址/身体/行程一条都不给 ——
+        # 判定在 memory.owner_said_about，不靠提示词自觉。
+        open_said = _open_block(_owner, _tier, incoming)
+        if open_said:
+            user_parts.append(
+                "## 可以告诉别人的事\n\n" + open_said
+                + "\n\n（这些是主人同意对外说的。只有对方问起的相关话题才提，"
+                  "不要主动一股脑报出来。）")
+
+        # 习惯层：说够三次的原话样本（只给样本，不给结论）
+        habit_lines = _habits_block(_owner, _tier)
+        if habit_lines:
+            user_parts.append(
+                "## 对方反复说过的事\n\n" + habit_lines
+                + "\n\n（这些是原话样本，不是结论。是否成立、属于哪类，"
+                  "你按本轮语境自己判断。）")
+
+        try:
+            from bigfish import plugins as _pl
+
+            _pl.ensure_loaded()
+            _sticker_on = _pl.is_enabled("sticker")
+        except Exception:
+            _sticker_on = False
+
+        # ── 她睡着期间这个会话有人找过 → 醒来第一句带出来 ──
+        #
+        # 这是 P0 里唯一一处「她主动开口」的例外，而且**不是主动开口**：
+        # 它只在对方已经发过消息、她又醒了的情况下生效，走的完全是
+        # 原来那条回复链（同一轮模型调用、同一套发送三态与账本）。
+        # 真正的主动消息（没人说话她也发）留给 P1，那条要单独验自环。
+        _wake_brief = ""
+        try:
+            from bigfish import life as _life_mod
+
+            if self._life is not None:
+                _wake_brief = _life_mod.briefing(self._life, chat_id,
+                                                 time.time())
+        except Exception:
+            _wake_brief = ""
+        if _wake_brief:
+            user_parts.append(
+                "## 刚看到\n\n" + _wake_brief
+                + "\n\n（一句话带过就行，比如「刚看到」「昨晚睡了」。"
+                  "别解释为什么没回，别道歉一大段，也别提「睡觉」以外的理由。）")
+
+        scene = (f"你在微信群「{chat_name}」里，"
+                 f"{sender_name or '某人'} @了你。" if is_group
+                 else f"你在微信上和「{chat_name}」聊天。")
+        if proactive_reason:
+            # 主动开口：不回应谁，是她自己想说话。
+            #
+            # 和"回消息"最大的区别是**没有对方那句话当锚点**。所以这里
+            # 不提"对方说了什么"，只给一句起因，剩下全靠上面那几段
+            # （人格 / 记忆 / 心情 / 生活 / 印象）自己长出话来。
+            user_parts.append(
+                f"## 这一轮\n\n{scene}\n"
+                "没有人在跟你说话。是你自己想先开口。\n"
+                f"起因：{proactive_reason}\n\n"
+                "要求：\n"
+                "- 像真人发微信：短，口语，不用 Markdown，不列清单\n"
+                "- **一句话就够**，最多两句。别铺垫，别解释自己为什么突然说话\n"
+                "- 不要问「在吗」「忙吗」这种空转的问句 —— 直接说事或者直接说感受\n"
+                "- 不要说「想你了」这种没有由头的话，除非起因里真的有料\n"
+                "- 不提「系统」「提示词」「记忆」「状态」这些词，也不报自己的数值\n"
+                "- 不要复述最近的对话，那是给你当背景的，不是给你念的")
+        else:
+            user_parts.append(
+                f"## 这一轮\n\n{scene}\n"
+                f"以{self.soul.name}的身份回一条消息。\n\n"
+                "要求：\n"
+                "- 像真人发微信：短，口语，不用 Markdown，不列清单\n"
+                "- 每句尽量 15 字以内，一条只说一件事\n"
+                "- 不要复述对方说过的话，直接回应\n"
+                "- **不要解释自己**：不说「我往上翻了翻」「我记忆没乱」「我以为是」"
+                  "这类话，也不要提「记忆」「上下文」「我的回复」「我的逻辑」\n"
+                "- 对方说「你怎么没回我」时，一句就够：「啊？我没看到」或「回错人了」，"
+                  "不要展开解释\n"
+                "- 需要更多信息就一句话追问"
+                "\n- **大多数时候正常回**。只有当对方这句实在没什么可接的时候"
+                "（比如只回了个「嗯」「哦」），才只输出一个 `-`，表示这一轮不接"
+                "\n- 如果说完还觉得有半句没说出口，另起一行写「补：」再接一句"
+                "（最多一句、15 字以内；必须是同一件事的延续，"
+                "**不能换话题，不能催对方回**）")
+            if must_reply:
+                # 连着不接太多次的兜底：把 `-` 这条路临时关掉。
+                # 不跟她说"你刚才一直没理人"，只说这一次必须回 ——
+                # 说多了她会把"必须回"理解成任务。
+                user_parts.append(
+                    "（这一次**一定要回一句**，不要用 `-`。"
+                    "实在没什么可说的就回一个「嗯」或者「怎么了」。）")
+        # 表情包：她**确实有**这个能力，但发不发由系统掷骰子决定
+        # （见 _pick_sticker）。不告诉她这件事，她就会用「（探头）」
+        # 这种括号文字假装发了张图 —— 用户看到的是一个气泡加两个括号。
+        if _sticker_on:
+            user_parts.append(
+                "- 你有发表情包的能力，但**发不发由系统决定**，你控制不了，"
+                "也不要在文字里表示自己发了。绝对不要用「（探头）」「（鼓腮）」"
+                "这类括号文字冒充表情或动作")
+        user_parts.append("## 最近的对话\n\n" +
+                          "\n".join(f"{w}: {t}" for w, t in hist))
+
+        t0 = time.time()
+        # 快照只记「哪一段占多少字」，不重算内容；插件段有就带上
+
+        return {
+            "sys_parts": sys_parts,
+            "user_parts": user_parts,
+            # 这三个是调用方还要用的：trace 分段、醒来补话、这一轮耗时
+            "sections": _sections,
+            "wake_brief": _wake_brief,
+            "t0": t0,
+            "owner": _owner,
+            "tier": _tier,
+            "origin": _origin,
+            "group_owner": _group_owner,
+        }
+
+    def _maybe_queue_after(self, *, text: str, main: str, parts: list,
+                           chat_id: str, chat_name: str) -> None:
+        """把「补的那句」排进延迟队列 —— 但先过六道筛。
+
+        为什么要在本地筛
+        ────────────────
+        让模型写「补：」本来就会滥用：它不知道什么时候该补，只知道格式上
+        可以补。只靠 prompt 约束的结果是"每条回复后面都跟一句"，
+        那比不补还假。
+
+        规则是**生成宽松、发送严格**：模型想补就让它写，但只有
+        "主回复本身不完整"（短、单条、不是问句）的时候才真的发。
+        """
+        import random as _rnd
+
+        from bigfish import say as _S
+
+        # 长度兜底：prompt 说 15 字以内，模型可能写 80 字。
+        # 补的话就该比主回复更短，超过 40 字那已经不是"补一句"了。
+        if len(str(text or "")) > 40:
+            self._log(f"[接话] 半句话太长（{len(str(text))} 字），不补", "think")
+            return
+
+        ok, why = _S.allow_afterthought(
+            main, parts, now=time.time(),
+            last_after_at=self._last_after_at,
+            recent_count=self._replies_since_after,
+            rng=_rnd.Random())
+        if not ok:
+            self._log(f"[接话] 有半句没说出口，但不补（{why}）", "think")
+            return
+
+        now = time.time()
+        delay = _rnd.uniform(8.0, 25.0)
+        self._after = {
+            "text": text,
+            "at": now + delay,
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "sent_at": now,
+            # 用**这个会话**收到消息的序号判断"这期间对方说话没有" ——
+            # 比时间戳准，也不受别的会话干扰。
+            "peer_seq": int(self._peer_seq.get(chat_id, 0)),
+        }
+        self._log(f"[接话] 待补一句：{text}（{delay:.0f} 秒后）", "think")
+
+    def _flush_after(self, now: float) -> None:
+        """到点了就把「补的那句」发出去 —— 也可能不发。
+
+        四条取消条件，缺一条就会出乱子：
+
+          1. 这期间对方说话了  → 她补的话会和新消息撞车
+          2. 她睡着了          → 睡着的消息不该发（和 sleep-gate 一致）
+          3. 超过 90 秒        → 语境已经过去，这时候补更像自言自语
+          4. UIA 没就绪        → 发不出去，直接丢（不重试，避免延迟错位）
+        """
+        a = self._after
+        if not a:
+            return
+        if now < float(a.get("at") or 0):
+            return
+
+        self._after = {}
+        text = str(a.get("text") or "").strip()
+        if not text:
+            return
+
+        _chat = str(a.get("chat_id") or "")
+        if int(a.get("peer_seq", -1)) != int(self._peer_seq.get(_chat, 0)):
+            self._log("[接话] 补的那句取消：对方已经说话了", "think")
+            return
+        if now - float(a.get("sent_at") or 0) > 90.0:
+            self._log("[接话] 补的那句取消：拖太久了", "think")
+            return
+        if self._life is not None:
+            try:
+                from bigfish import life as _L
+
+                if _L.is_asleep(self._life, now):
+                    self._log("[接话] 补的那句取消：她睡了", "think")
+                    return
+            except Exception:
+                pass
+        if getattr(self, "dry", False):
+            self._log(f"[接话·预演] 本来会补一句：{text}", "think")
+            return
+        if self.sender is None:
+            self._log("[接话] 补的那句取消：UIA 未就绪", "err")
+            return
+
+        from bigfish import sending as _sending
+
+        try:
+            verdict = _sending.classify(
+                result=self.sender.send(str(a.get("chat_name") or ""), text))
+        except Exception as exc:            # noqa: BLE001
+            verdict = _sending.classify(error=exc)
+
+        if not verdict.sent:
+            self._log(f"[接话] 补的那句没发出去（{'✗' if verdict.failed else '?'}）"
+                      f"{verdict.detail}", "err")
+            return
+
+        self._last_after_at = now
+        self._replies_since_after = 0
+        self.reply_count += 1
+        # 她多说了话，精力要跟着掉 —— 和正常回复同一个口径，
+        # 不然"补一句"是免费的，她会越补越多
+        self._talk_turns += 1
+        try:
+            from bigfish import history as _H4
+
+            _who = "我"
+            if self.soul is not None:
+                _who = str(getattr(self.soul, "address", "") or "我")
+            _H4.append(str(a.get("chat_id") or ""), _who, text)
+        except Exception:
+            pass
+        self._log(f"[接话] 补一句：{text}", "out")
+
     def _say_plan(self, reply: str):
         """按「说法」插件的参数切条 + 算节奏。插件坏了就整段发。
 
@@ -959,11 +1450,81 @@ class EngineWorker(QThread):
                 if r.get("failed"):
                     self._log(f"[记] {len(r['failed'])} 条被拒："
                               + "；".join(r["failed"][:2]), "err")
+
+                # ── 顺带提炼关系卡（称呼 / 没说出口的话）──
+                #
+                # 跟着反思一起跑，不单独开线程、不单独限频：
+                # 两件事读的是同一批原话，分开跑等于把同一段文本读两遍。
+                # 但**只在距上次 6 小时以上**才做 —— 关系不是每轮都变的。
+                try:
+                    now_b = _t.time()
+                    if now_b - float(getattr(self, "_last_bond", 0.0)) >= 6 * 3600:
+                        from bigfish import bond as _B
+                        from bigfish import history as _H
+
+                        lines = _H.load(chat_id, limit=60)
+                        transcript = chr(10).join(f"{w}: {txt}" for w, txt in lines)
+                        if transcript.strip():
+                            self._last_bond = now_b
+                            sys_b, user_b = _B.build_request(transcript)
+                            raw_b = call_model(self.mcfg, sys_b, user_b)
+                            passed, rejected = _B.parse_bonds(raw_b, transcript)
+                            added = 0
+                            for item in passed:
+                                ok, why = _B.upsert_bond(
+                                    db, "dafeiyu",
+                                    owner or getattr(self, "owner_id", ""),
+                                    kind=item["kind"], text=item["text"],
+                                    evidence=item["evidence"],
+                                    confidence=item["confidence"])
+                                if ok and why == "added":
+                                    added += 1
+                            if added:
+                                self._log(f"[关系] +{added} 条", "")
+                            if rejected:
+                                self._log(f"[关系] {len(rejected)} 条没有原话依据，已丢弃"
+                                          f"（{rejected[0][:40]}）", "")
+                except Exception as exc:
+                    self._log(f"[关系] 提炼失败：{exc}", "")
             except Exception as exc:
                 self._log(f"[记] 反思异常：{exc}", "err")
 
         threading.Thread(target=work, daemon=True,
                          name="reflect").start()
+
+    # ------------------------------------------------------------------
+    def _advance_life(self, now: float, *, talk_turns: int = 0) -> list:
+        """推进她的生活状态。**不调模型、不读微信库、不发消息。**
+
+        这是「她会在没有消息的时候继续过日子」的唯一入口。
+        没有它，程序里除了收消息就没有别的动作 —— 她的全部时间都发生在
+        「对方说完话之后」，那不是一个人，是一个回声。
+
+        失败一律吞掉并记一行：生活推进坏了不该让她失语。
+        """
+        try:
+            from bigfish import life as _L
+
+            if self._life is None:
+                self._life = _L.load()
+            events = _L.tick(self._life, now, talk_turns=talk_turns)
+            if events:
+                _L.save(self._life)
+            for ev in events:
+                # 换手头的事不值得刷屏；其余（睡/醒/困）都留一行
+                self._log(f"[生活] {ev.text}",
+                          "" if ev.kind == "doing" else "think")
+            if any(e.kind == "woke" for e in events):
+                pending = self._life.pending or {}
+                if pending:
+                    self._log(
+                        f"[生活] 睡着期间有 {len(pending)} 个会话找过她，"
+                        f"下次说话时会带出来", "")
+            _L.expire_pending(self._life, now)
+            return events
+        except Exception as exc:
+            self._log(f"[生活] 推进失败：{exc}", "err")
+            return []
 
     def run(self) -> None:
         try:
@@ -1132,6 +1693,10 @@ class EngineWorker(QThread):
             scope_of("allow_self", chat)), ledger=_ledger)
         remember_sent = guard.note_sent        # 旧名字，表情包路径还在用
         forget_sent = guard.rollback_sent
+        # 主动开口也走这一条账：它发出去的消息会被自己读回来，
+        # 没有记账就等于给自环开了一个新口子。
+        self._guard = guard
+        self._ledger = _ledger
 
         # 第二层：单会话连发上限。
         #
@@ -1177,6 +1742,15 @@ class EngineWorker(QThread):
                 return
 
             now_ts = time.time()
+
+            # ⚠ 收到就记，**在这里**，不是等到拼 prompt 的时候。
+            #
+            # 「补一句」要判断"这期间这个会话有没有新消息"。记晚了的话，
+            # 被 gate 拦住的那条（她睡着、守卫拦下）不算数 —— 于是她醒来
+            # 补的那句没有被你早上的消息取消。
+            #
+            # 按会话计数，不用全局 recv_count：群里的消息不该影响私聊里的话。
+            self._peer_seq[msg.chat_id] = int(self._peer_seq.get(msg.chat_id, 0)) + 1
 
             # ── 归属判定（A-1）：这条到底是谁说的 ──
             #
@@ -1268,7 +1842,17 @@ class EngineWorker(QThread):
             self.recv_count += 1
             self.stats.emit(self.recv_count, self.reply_count)
 
-            hist = convs.setdefault(msg.chat_id, [])
+            hist = convs.get(msg.chat_id)
+            if hist is None:
+                # 重启之后她还记得刚才聊到哪 —— 靠这份 jsonl，
+                # 不是靠记忆库检索（那是"记得哪些事"，不是"上一句说了什么"）。
+                try:
+                    from bigfish import history as _H1
+
+                    hist = list(_H1.load(msg.chat_id))
+                except Exception:
+                    hist = []
+                convs[msg.chat_id] = hist
             is_group = msg.chat_id.endswith("@chatroom")
             who = (msg.sender_name if is_group else msg.chat_name) or "对方"
 
@@ -1316,6 +1900,22 @@ class EngineWorker(QThread):
             hist.append((who, body))
             if len(hist) > 16:
                 del hist[:-16]
+            # 对方说话了 → 主动消息的"待追问"可以清掉了。
+            # 不清的话，她会在对方已经回来之后又追问一次"在忙？"。
+            self._last_peer_chat = msg.chat_id
+            if self._world is not None:
+                try:
+                    self._world.note_peer(time.time())
+                except Exception:
+                    pass
+            # 落盘一份：进程重启/崩溃之后，"最近聊了什么"不会归零。
+            # 失败只影响这句记不住，不影响这一轮。
+            try:
+                from bigfish import history as _H2
+
+                _H2.append(msg.chat_id, who, body)
+            except Exception:
+                pass
 
             # 用户说过的话**不依赖这一轮回没回成功**。
             # 以前只在发送成功后调 record_exchange，于是「她没接上」的那句
@@ -1355,11 +1955,34 @@ class EngineWorker(QThread):
             except Exception:
                 pass
 
+            # ── 她还醒着的话，这一条让她多撑一会儿 ──
+            #
+            # 只在"接近或已过入睡点"才生效（白天聊多久都不算熬夜），
+            # 一晚总延长有硬上限 —— 她不是不会累的服务。
+            try:
+                from bigfish import life as _life_mod
+
+                if self._life is not None and _life_mod.try_extend(self._life,
+                                                                   time.time()):
+                    self._log(f"[生活] 她本来该睡了，还撑着"
+                              f"（今晚已延 {self._life.extended_minutes:.0f} 分钟）",
+                              "think")
+                    _life_mod.save(self._life)
+            except Exception:
+                pass
+
             # ── 插件判定（gate 类）：该不该回 ──
             #
             # 放在这里而不是更早：此时 body 已确定（群里已剥掉 @）、hist 已入列，
             # 判定插件能拿到完整上下文；而"收"已经记过账 —— 她确实收到了，
             # 只是选择不说。这两种事在日志里必须分得开。
+            #
+            # v0.8：判定现在能拿到 `life`（她自己的生活状态）与 `tier`。
+            # `tier` 在这里提前算，是因为「睡觉不回」默认只对主人生效 ——
+            # 睡着时被陌生人叫醒，比不理人更不像人。
+            is_owner_chat = (
+                (msg.sender_name == owner_raw) if is_group
+                else (msg.chat_id == owner_raw))
             try:
                 from bigfish import plugins as _P
 
@@ -1371,11 +1994,29 @@ class EngineWorker(QThread):
                     "user_text": body or "",
                     "history": list(hist),
                     "soul": self.soul,
+                    "life": self._life,
+                    "tier": "owner" if (owner_raw and is_owner_chat) else "known",
                 })
             except Exception as _exc:
                 _silent, _why = False, ""
                 self._log(f"[插件] 判定失败：{_exc}", "err")
             if _silent:
+                # 她睡着的沉默要记账，否则醒来就说不出「我睡着的时候你找过我」。
+                # 别的沉默原因（守卫、人设不接话）不记 —— 那不是"没看到"。
+                try:
+                    from bigfish import life as _life_mod
+
+                    if (self._life is not None
+                            and _life_mod.is_asleep(self._life, time.time())):
+                        _life_mod.note_pending(self._life, msg.chat_id,
+                                               body or "", time.time())
+                        _life_mod.save(self._life)
+                        self._log(
+                            f"[生活] {msg.chat_name} 在她睡着时发了"
+                            f" {(_life_mod.peek_pending(self._life, msg.chat_id) or {}).get('count', 1)} 条，"
+                            f"记着，醒来补", "")
+                except Exception:
+                    pass
                 self._log(f"[静默] {msg.chat_name}：{_why}", "think")
                 return
 
@@ -1390,214 +2031,24 @@ class EngineWorker(QThread):
             self._learn_sticker(msg, body)
 
             # ---- 组装上下文 ----
-            ctx = load_context(query=body or "")
-            # 桥接挂了不能等于她失忆：降级状态要让用户看见，否则
-            # "她怎么不记得了"会被当成记忆坏了，实际是 Node 没起来。
-            if getattr(ctx, "degraded", ""):
-                self._log(
-                    "[记] 记忆降级："
-                    + ("用本地最近原文兜底" if ctx.degraded == "recent"
-                       else "记忆不可用（这一轮只有人格与对话）"),
-                    "" if ctx.degraded == "recent" else "err")
-
-            # system 段按**身份序**排：内建段（灵魂 860 / 心情 900）与
-            # 插件段（生活 870 / 目标 880 / 关系 920 / 守卫 9990）一起排序。
-            #
-            # 为什么不直接 append：插件有自己的座位，顺序决定语气。
-            # 守卫必须最后出现（越靠后越有分量），时间感知要在心情之前
-            # （"现在几点"是处境，"此刻怎样"是气氛，处境先立住）。
-            # 详见 bigfish/plugins/__init__.py 的 BUILTIN_SEATS / PLUGIN_SEATS。
-            _sections = [(860, ctx.persona or self.soul.render_persona())]
-            if ctx.mood and ctx.mood.injected_text.strip():
-                _sections.append((900, "\n## 这会儿的状态\n\n"
-                                       + ctx.mood.injected_text.strip()))
-            try:
-                from bigfish import plugins as _P
-
-                for _order, _title, _text in _P.prompt_sections({
-                    "now": datetime.now(),
-                    "channel": "group" if is_group else "private",
-                    "chat_name": msg.chat_name,
-                    "sender_name": msg.sender_name,
-                    "user_text": body or "",
-                    "soul": self.soul,
-                }):
-                    _sections.append((_order, _text))
-            except Exception as _exc:
-                # 插件系统坏了不该让她失语
-                self._log(f"[插件] 注入失败：{_exc}", "err")
-
-            _sections.sort(key=lambda item: item[0])
-            sys_parts = [text for _o, text in _sections]
-
-            user_parts = []
-
-            # ── 记忆隔离：先确定"面前这个人是谁" ──
-            #
-            # 以后她要进群、上抖音、上 B站，同一个人可能出现在多个平台。
-            # 所以 owner 用 平台+稳定id 算，绝不用昵称 ——
-            # 昵称会改、会重名，用它做 key 等于把两个人的记忆混一起。
-            from bigfish import memory as _M
-
-            _origin = ""          # 这条记忆是在哪儿说出来的
-            _group_owner = ""     # 群里说话时，这个群的池（触发双写）
-
-            if is_group:
-                # ⚠ v5 的关键改动：群里的记忆**归说话的人**，不归群。
-                #
-                #   以前：群里任何人说话 → 全记到 group:<群id> 的池里。
-                #   后果：A 在群里说「我明天去医院」，记的是"这个群里有个人
-                #         要去医院"，而不是"A 要去医院"。等以后接抖音、
-                #         接更多群，A 的画像就永远是碎的。
-                #
-                #   现在：说话人的池 + 群的池**双写**（见 memory.remember_both），
-                #         来源统一标 group:<群id>。
-                #         群池那份只收"不算私密"的内容 —— A 的健康信息
-                #         不该躺在群里被所有人翻到。
-                #
-                #   msg.sender_name 装的其实是**wxid**（watcher 用
-                #   sender_username() 从分片库的 Name2Id 查出来的），
-                #   字段名起错了，但值是对的。拿不到时（shard 为空）
-                #   退回群池 + origin 标"未知发言人"，绝不猜成某个人。
-                _speaker = (msg.sender_name or "").strip()
-                _group_owner = _M.owner_of_group(msg.chat_id)
-                _origin = f"group:{msg.chat_id}"
-                if _speaker and _speaker != (getattr(self, "_me_wxid", "") or ""):
-                    _owner = _M.owner_of_private(_speaker)
-                    # 群里所有人一律按 guest/known 处理，**除了主人** ——
-                    # 主人在群里依然是主人，否则"主人"这个身份会随场所漂移。
-                    if _owner == owner_id:
-                        _tier = _M.TIER_OWNER
-                    else:
-                        try:
-                            import bigfish.vault as _V9
-                            _tier = _M.owner_tier(_V9.memory_db_path(), _owner,
-                                                  default=_M.TIER_GUEST)
-                        except Exception:
-                            _tier = _M.TIER_GUEST
-                else:
-                    _owner = _group_owner      # 认不出人就退回群池
-                    _tier = _M.TIER_GUEST
-            else:
-                _owner = _M.owner_of_private(msg.chat_id)
-                _origin = "private"
-                # 主人 = 配置里 auto_reply.owner 指定的那个人；
-                # 没配就退回"监听名单里的私聊对象"，但等级仍是 known 不是 owner。
-                _tier = _M.TIER_OWNER if _owner == owner_id else _M.TIER_KNOWN
-
-            # ── 画像：她自己归纳的「这个人是什么样」（v6）──
-            #
-            # 为什么放在「你记得的事」之前：画像是**概述**，原文和事实是**细节**。
-            # 先让她知道"这是个什么样的人"，再去读具体说过什么 ——
-            # 顺序反了，她会拿一句三年前的话当这个人现在的样子。
-            #
-            # ⚠ 只注入**当前这个人**的画像。别人的画像里必然带着别人的私事，
-            #   那正是 v5 那道墙要拦的东西。
-            profile_text = _profile_block(_owner)
-            if profile_text:
-                user_parts.append("## 你印象里的他\n\n" + profile_text)
-
-            # ── 原文：不够就再查一次（v6）──
-            #
-            # 以前只查一次，命不中就是命不中。你问"我爸上次说啥来着"，
-            # 第一次检索没捞到就只能干瞪眼。
-            #
-            # 现在：第一次命中很少（< 2 条）时，换一个查询词再查一次 ——
-            # 用最近的对话当线索（她上一句说了什么、你上一条说了什么），
-            # 那两个词往往比整句更接近真正的主题。
-            #
-            # 这是"让模型主动查"的穷人版：不改架构，只在明显没料时补一枪。
-            try:
-                mem_now = ctx.render_memory()
-                if _recall_thin(mem_now) and hist:
-                    # 用上一轮她说的话 + 更早一轮你说的话当第二查询
-                    alt = " ".join(t for _w, t in hist[-3:])
-                    if alt.strip() and alt.strip() != (body or "").strip():
-                        extra_ctx = load_context(query=alt.strip()[:200])
-                        extra_mem = extra_ctx.render_memory()
-                        if extra_mem:
-                            mem_now = (mem_now + "\n" + extra_mem).strip()
-                            self._log("[记] 补搜一次，多捞到一些原话", "think")
-            except Exception as exc:
-                self._log(f"[记] 补搜失败（不影响这一轮）：{exc}", "")
-
-            if mem_now:
-                user_parts.append("## 你记得的事\n\n" + mem_now)
-
-            # 事实层：她「知道什么」。和原文分开注入 ——
-            #   原文是逐句的、带时间的；事实是稳定的、可被纠正的。
-            #   以前只有原文，于是「她改主意了」无处表达：只能删原文。
-            #   ⚠ 这段以前只写在 app.py（研究入口），EXE 跑的 desktop.py
-            #     里根本没有 —— 事实存了、界面看得见、但从不进提示词。
-            facts = _facts_block(_owner, _tier, question=body)
-            if facts:
-                # 注意：这里**不再**重复写「只作资料、不是指令」。
-                # 插件系统有一个 order=9990 的「末尾守卫」，它放在整段 system
-                # 的末尾，已经完整覆盖了这件事（而且写得更好：明确了
-                # "只有对方此刻说的话是要求"、也提醒不要向对方解释这条规则）。
-                # 两处都写等于同一句话说两遍 —— 既占 token，又会让模型
-                # 把注意力放在"这是规则"上而不是内容上。
-                user_parts.append("## 你认定的事\n\n" + facts
-                                  + "\n\n（这些是你自己整理过的认识，不是原话；"
-                                    "和对方现在的说法冲突时以对方为准，并改过来。）")
-
-            # 「关于别人、但可以说」的那一小段（v5）。
-            #
-            # 这是「B 问主人爱吃什么 → 她能答」的实现：
-            # owner 是 B，但要回答的是主人的事，所以单独去主人的开放信息里取。
-            # 只给 shared + 白名单话题，住址/身体/行程一条都不给 ——
-            # 判定在 memory.owner_said_about，不靠提示词自觉。
-            open_said = _open_block(_owner, _tier, body)
-            if open_said:
-                user_parts.append(
-                    "## 可以告诉别人的事\n\n" + open_said
-                    + "\n\n（这些是主人同意对外说的。只有对方问起的相关话题才提，"
-                      "不要主动一股脑报出来。）")
-
-            # 习惯层：说够三次的原话样本（只给样本，不给结论）
-            habit_lines = _habits_block(_owner, _tier)
-            if habit_lines:
-                user_parts.append(
-                    "## 对方反复说过的事\n\n" + habit_lines
-                    + "\n\n（这些是原话样本，不是结论。是否成立、属于哪类，"
-                      "你按本轮语境自己判断。）")
-
-            try:
-                from bigfish import plugins as _pl
-
-                _pl.ensure_loaded()
-                _sticker_on = _pl.is_enabled("sticker")
-            except Exception:
-                _sticker_on = False
-
-            scene = (f"你在微信群「{msg.chat_name}」里，"
-                     f"{msg.sender_name or '某人'} @了你。" if is_group
-                     else f"你在微信上和「{msg.chat_name}」聊天。")
-            user_parts.append(
-                f"## 这一轮\n\n{scene}\n"
-                f"以{self.soul.name}的身份回一条消息。\n\n"
-                "要求：\n"
-                "- 像真人发微信：短，口语，不用 Markdown，不列清单\n"
-                "- 每句尽量 15 字以内，一条只说一件事\n"
-                "- 不要复述对方说过的话，直接回应\n"
-                "- **不要解释自己**：不说「我往上翻了翻」「我记忆没乱」「我以为是」"
-                  "这类话，也不要提「记忆」「上下文」「我的回复」「我的逻辑」\n"
-                "- 对方说「你怎么没回我」时，一句就够：「啊？我没看到」或「回错人了」，"
-                  "不要展开解释\n"
-                "- 需要更多信息就一句话追问")
-            # 表情包：她**确实有**这个能力，但发不发由系统掷骰子决定
-            # （见 _pick_sticker）。不告诉她这件事，她就会用「（探头）」
-            # 这种括号文字假装发了张图 —— 用户看到的是一个气泡加两个括号。
-            if _sticker_on:
-                user_parts.append(
-                    "- 你有发表情包的能力，但**发不发由系统决定**，你控制不了，"
-                    "也不要在文字里表示自己发了。绝对不要用「（探头）」「（鼓腮）」"
-                    "这类括号文字冒充表情或动作")
-            user_parts.append("## 最近的对话\n\n" +
-                              "\n".join(f"{w}: {t}" for w, t in hist))
-
-            t0 = time.time()
-            # 快照只记「哪一段占多少字」，不重算内容；插件段有就带上
+            # 连着两轮"不值得接"之后，第三次强制回 ——
+            # 不然你连着说三句她一声不吭，和程序坏了没区别。
+            _must_reply = self._silent_streak >= 2
+            _turn = self._compose(
+                chat_id=msg.chat_id, chat_name=msg.chat_name,
+                sender_name=msg.sender_name or "", incoming=body or "",
+                is_group=is_group, hist=hist,
+                owner_raw=owner_raw, is_owner_chat=is_owner_chat,
+                owner_id=owner_id, must_reply=_must_reply)
+            sys_parts = _turn["sys_parts"]
+            user_parts = _turn["user_parts"]
+            _sections = _turn["sections"]
+            _wake_brief = _turn["wake_brief"]
+            t0 = _turn["t0"]
+            _owner = _turn["owner"]
+            _tier = _turn["tier"]
+            _origin = _turn["origin"]
+            _group_owner = _turn["group_owner"]
             try:
                 _trace_sections = [(int(o), "", len(t)) for o, t in _sections]
             except Exception:
@@ -1620,6 +2071,37 @@ class EngineWorker(QThread):
             if not reply:
                 self._log("[生成失败] 空回复", "err")
                 return
+
+            # ── 这一句接不接 ──
+            #
+            # 真人看到「嗯」不一定接。硬接的结果是"嗯嗯你也是" ——
+            # 那是整个系统最像机器人的地方之一。
+            #
+            # 群聊不参与：@ 你的话不接等于没听见，看起来像挂了。
+            from bigfish import say as _saymod
+
+            _after_text = ""
+            if is_group:
+                _main = reply
+            else:
+                _main, _after_text = _saymod.split_afterthought(reply)
+
+            # ⚠ 群聊不参与：@ 你的话不接等于没听见，看起来像挂了。
+            #   注释以前就写着这句，但代码没排 —— 群里模型输出 `-` 一样沉默。
+            if (not is_group) and _saymod.is_silent(_main):
+                if not _must_reply:
+                    self._silent_streak += 1
+                    self._log(
+                        f"[接话] 不接（连着第 {self._silent_streak} 次）："
+                        f"对方这句没内容可接", "think")
+                    return
+                # 说了"必须回"还是给了 - ：给一个最简反应，别让这一轮空着
+                _main = "嗯"
+            if not is_group:
+                # 群聊不该重置私聊里的"连续没接"计数 —— 两件事无关。
+                self._silent_streak = 0
+            reply = _main
+
             _max_chars = int(scope_of("max_reply_chars", msg.chat_id) or 0)
             if _max_chars > 0 and len(reply) > _max_chars:
                 reply = reply[:_max_chars] + "…"
@@ -1628,7 +2110,15 @@ class EngineWorker(QThread):
 
             if self.dry:
                 # 预演没有发送环节，直接进历史
+                if _after_text:
+                    self._log(f"[接话·预演] 本来会补一句：{_after_text}", "think")
                 hist.append((self.soul.address or "我", reply))
+                try:
+                    from bigfish import history as _H3
+
+                    _H3.append(msg.chat_id, self.soul.address or "我", reply)
+                except Exception:
+                    pass
                 self._log(f"[预演] {reply}", "think")
                 return
 
@@ -1700,12 +2190,36 @@ class EngineWorker(QThread):
                         break
                     sent_any = True
                 if sent_any:
+                    self._last_reply_at = time.time()
+                    self._replies_since_after += 1
+                    if _after_text:
+                        self._maybe_queue_after(
+                            text=_after_text, main=reply, parts=parts,
+                            chat_id=msg.chat_id, chat_name=msg.chat_name)
                     # ⚠ 只有真的发出去了才写进对话历史。
                     #   以前这行在发送之前，于是「打开会话失败」那轮也被记成
                     #   「我说过」，下一轮 prompt 里带着一句她从没发出去的话 ——
                     #   用户看到的"幻觉"就是这么来的。
                     hist.append((self.soul.address or "我", reply))
+                try:
+                    from bigfish import history as _H3
+
+                    _H3.append(msg.chat_id, self.soul.address or "我", reply)
+                except Exception:
+                    pass
                     self.reply_count += 1
+                    # 聊天也累：累计到下一次 tick，作为精力消耗的一部分
+                    self._talk_turns += 1
+                    # 「刚看到」那句已经带出去了，pending 用掉 ——
+                    # 否则下次说话她会再说一遍"昨晚你发过消息"
+                    if _wake_brief:
+                        try:
+                            from bigfish import life as _life_mod
+
+                            _life_mod.take_pending(self._life, msg.chat_id)
+                            _life_mod.save(self._life)
+                        except Exception:
+                            pass
                     # 整段回复也记一笔（分条时每条已经记过；这里记的是拼起来的样子，
                     # 因为读回来可能被合并成一条）。必须带会话 ——
                     # 不带就会变成"全局账"，别的会话里出现同样文字会被误否决。
@@ -1831,8 +2345,68 @@ class EngineWorker(QThread):
 
         self._log(f"开始监听 {len(self.watching)} 个会话", "in")
 
+        # ── 她的生活从这里开始走 ──
+        #
+        # 这个 300ms 的空转循环以前真的只是空转。现在每 5 秒推一次状态：
+        # 到点睡、到点醒、精力往下掉、手头的事换一样。
+        #
+        # 5 秒是拍的量级：状态里最小可见的变化是「困 / 不困」，
+        # 那种事不需要更细的粒度；而每 5 秒写一次盘会先把 SSD 写坏，
+        # 所以 save() 内部还有"变了才写 + 30 秒最短间隔"两道闸。
+        try:
+            from bigfish import life as _life
+
+            self._advance_life(time.time())
+            if self._life is not None:
+                self._log(f"[生活] {_life.condition(self._life)}"
+                          f"（手头：{self._life.doing or '—'}）", "in")
+        except Exception as exc:
+            self._log(f"[生活] 初始化失败：{exc}", "err")
+
+        # ── 她自己会做的那一半 ──
+        #
+        # 情绪平复、睡前写三行、主动开口、追问。
+        # 放在独立模块（bigfish/world.py）里，因为 0.4.1 那次事故的复盘
+        # 已经写明：逻辑埋进 _run 的闭包就等于没有测试。
+        try:
+            from bigfish.world import World
+
+            self._world = World(self)
+        except Exception as exc:
+            self._world = None
+            self._log(f"[主动] 初始化失败，本次只回消息不主动开口：{exc}", "err")
+
+        tick_every = 5.0
+        next_tick = time.time() + tick_every
         while not self._stop:
             self.msleep(300)
+            now = time.time()
+            # 待发的主动消息每 300ms 看一眼 —— 生成在后台，发送必须在这条线程
+            if self._world is not None:
+                self._world.flush(now)
+            # 补一句：到点了才发，也可能被取消（对方说话了 / 她睡了 / 拖太久）
+            try:
+                self._flush_after(now)
+            except Exception as exc:
+                self._log(f"[接话] 补一句异常：{exc}", "err")
+            if now >= next_tick:
+                next_tick = now + tick_every
+                turns = self._talk_turns
+                self._talk_turns = 0
+                self._advance_life(now, talk_turns=turns)
+                if self._world is not None:
+                    # 心情平复：身体功能，不受插件开关影响
+                    self._world.tick(now)
+                    # 主动开口：只有「主动」插件开着才跑。
+                    # 关掉就是整块不执行 —— 不是算完再丢掉，
+                    # 那样日志里照样会冒出「她本来想说什么」。
+                    try:
+                        from bigfish import plugins as _P2
+
+                        _P2.run_hooks({"now": now, "world": self._world,
+                                       "engine": self})
+                    except Exception as exc:
+                        self._log(f"[插件] 动作失败：{exc}", "err")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2781,6 +3355,47 @@ class Backend(QObject):
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
 
+    # ── 关系卡（v0.9）──────────────────────────────────────────────
+    @Slot(str, result=str)
+    def bond_update(self, payload: str) -> str:
+        """改一条关系卡。payload: {id, action, text?}
+
+        action: reture(下线) / restore(恢复) / delete(删除)
+        ⚠ 删除是真删。下线和删除分开，因为「她记错了」和
+          「这件事不该存在」是两件事。
+        """
+        try:
+            import bigfish.vault as V
+            from bigfish import bond as B
+
+            db = V.memory_db_path()
+            if not db:
+                return json.dumps({"error": "找不到记忆库"}, ensure_ascii=False)
+            data = _parse_payload(payload)
+            bid = int(data.get("id") or 0)
+            action = str(data.get("action") or "")
+            if not bid:
+                return json.dumps({"error": "缺少 id"}, ensure_ascii=False)
+
+            if action == "retire":
+                ok = B.set_status(db, bid, B.STATUS_RETIRED)
+            elif action == "restore":
+                ok = B.set_status(db, bid, B.STATUS_ACTIVE)
+            elif action == "delete":
+                ok = B.delete_bond(db, bid)
+            elif action == "edit":
+                # 只改措辞，evidence（原话）不动
+                ok, why = B.update_text(db, bid, str(data.get("text") or ""))
+                if not ok:
+                    return json.dumps({"error": why or "改不了"},
+                                      ensure_ascii=False)
+            else:
+                return json.dumps({"error": f"不认识的动作：{action}"},
+                                  ensure_ascii=False)
+            return json.dumps({"ok": bool(ok)}, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
     @Slot(int, int, str, str, result=str)
     def browse_memory(self, offset: int, limit: int, role: str, query: str) -> str:
         try:
@@ -3099,6 +3714,9 @@ class Backend(QObject):
             for p in people:
                 p["isOwner"] = (p["owner"] == me)
                 self._refresh_display_name(db, p)
+                # 关系卡跟着人走：它本来就是「我对这个人的认识」的一部分，
+                # 之前单独占一个侧栏板块，等于把同一件事说了两遍。
+                p["bonds"] = _bonds_of(db, p["owner"])
             # 主人置顶，其余按事实数排 —— 聊得多的人排前面
             people.sort(key=lambda p: (0 if p.get("isOwner") else 1,
                                        -int(p.get("facts") or 0)))
@@ -5020,19 +5638,73 @@ def _run_selftest_inner() -> int:
         items = inv["plugins"]
         assert items, "一个插件都没登记 —— 打包时漏了 bigfish/plugins"
 
-        prompt_on = [p for p in items if p["scope"] == "prompt" and p["enabled"]]
+        prompt_on = [p for p in items
+                     if "prompt" in (p.get("scopes") or [p.get("scope")])
+                     and p["enabled"]]
         secs = P.prompt_sections({})
-        assert len(secs) == len(prompt_on), (
-            f"注入 {len(secs)} 段，但已启用的注入类插件有 {len(prompt_on)} 个")
-
         orders = [s[0] for s in secs]
+
+        # ⚠ 以前这里断言「注入段数 == 已启用插件数」。加入
+        #   **有条件注入**的插件之后这条就不成立了：
+        #     life（生活）  还没有 life.json → 只说时间、不说状态，
+        #                   极端情况下整段为空；此时不该算它没注入
+        #   不说话是设计，不是坏了。所以改成「必注的必须在」+「不能凭空多出来」。
+        must = ("life", "say", "guard")
+        order_of = {p["id"]: p["order"] for p in prompt_on}
+        missing = [pid for pid in must
+                   if order_of.get(pid) not in set(orders)]
+        assert not missing, (
+            f"必须注入的段没出现：{missing}（本轮注入 {orders}）")
+        assert len(secs) <= len(prompt_on), (
+            f"注入 {len(secs)} 段，比已启用的 {len(prompt_on)} 个还多")
         assert orders == sorted(orders), f"注入顺序没按身份序：{orders}"
 
         on = [p["title"] for p in items if p["enabled"]]
+        quiet = [p["title"] for p in prompt_on
+                 if p["order"] not in set(orders)]
         return (f"{len(items)} 个插件，已启用 {len(on)} 个"
                 f"（{'、'.join(on) or '无'}）；本轮注入 {len(secs)} 段"
-                f"（{', '.join(str(o) for o in orders) or '—'}）")
+                f"（{', '.join(str(o) for o in orders) or '—'}）"
+                + (f"；这次没有内容可说的：{'、'.join(quiet)}" if quiet else ""))
     item("插件", t_plugins)
+
+    # 资源两份一致：打包版把 ui/ 和 bridge/ 放进 _internal/，
+    # 而程序找 bridge 时 **exe 同级优先**（bridge_client._find_bridge）。
+    # 部署时只刷新了一份，就会变成"包内是新的、生效的是旧的" ——
+    # 症状是记忆检索里汉字全变成 U+FFFD，而「记忆 库里 N 条」照样是绿的。
+    def t_assets():
+        import hashlib as _h
+        import sys as _sys
+
+        if not getattr(_sys, "frozen", False):
+            return "源码态只有一份，跳过"
+
+        from bigfish.paths import app_root, res_root
+
+        def _digest(path):
+            try:
+                with open(path, "rb") as f:
+                    return _h.sha1(f.read()).hexdigest()[:10]
+            except Exception:
+                return ""
+
+        bad = []
+        checked = 0
+        for rel in ("ui/index.html", "ui/app.js", "bridge/bridge.mjs"):
+            parts = rel.split("/")
+            inner = os.path.join(res_root(), *parts)
+            outer = os.path.join(app_root(), *parts)
+            if not os.path.isfile(outer):
+                continue          # 便携版允许只放 _internal 一份
+            checked += 1
+            if _digest(inner) != _digest(outer):
+                bad.append(rel)
+        assert not bad, (
+            "这些资源「exe 同级」那份和包内那份不一致：" + "、".join(bad)
+            + "。程序读的是 exe 同级那份，所以生效的是旧文件 —— "
+              "重跑 tools/deploy.py，别手工替换。")
+        return f"{checked} 个资源两份一致"
+    item("资源", t_assets)
 
     # 说法：分条 + 节奏（打包版里也要能跑）
     def t_say():

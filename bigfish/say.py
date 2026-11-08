@@ -640,3 +640,117 @@ def split_reply_with_llm(
     except Exception:
         pass
     return split_reply(raw, policy)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 接不接这一句
+# ══════════════════════════════════════════════════════════════════════
+
+#: 她说「这一句不值得接」的表示法。
+#:
+#: 为什么需要一个标记而不是「输出空」：模型输出空串和输出失败长得一样，
+#: 分不清是"她想好了不说话"还是"生成坏了"。给一个明确的符号，
+#: 日志里就能写清「[接话] 不接：对方回的是「嗯」」。
+SILENT_MARKS = frozenset({
+    "-", "—", "——", "（不说话）", "(不说话)", "算了", "不说了", "不回", "…",
+})
+
+
+def is_silent(text: str) -> bool:
+    """这一轮她是不是决定不接。"""
+    t = (text or "").strip().strip("。．.，,~～ \t")
+    return t in SILENT_MARKS
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 要不要补一句
+# ══════════════════════════════════════════════════════════════════════
+
+#: 「补一句」的标记行：`补：xxx`
+_AFTER_MARK = re.compile(r"^[ \t]*(?:补|补充|又想起|再说一句)[：:][ \t]*(.*)$", re.M)
+
+
+def split_afterthought(raw: str) -> Tuple[str, str]:
+    """把一次输出拆成（主回复, 补的那句）。
+
+    格式约定：
+
+        第一句（或者一条完整回复）
+
+        补：第二句
+
+    没有「补：」就整段都是主回复。补的那句为空 / 写「-」= 不补。
+
+    ⚠ 这里只负责拆，**不负责判断该不该发** —— 判断在
+      `allow_afterthought`，因为那要看主回复有多长、分了几条。
+    """
+    text = (raw or "").strip()
+    m = _AFTER_MARK.search(text)
+    if not m:
+        return text, ""
+    main = text[:m.start()].strip()
+    after = (m.group(1) or "").strip()
+    if is_silent(after):
+        after = ""
+    # 补的那句不该带标点以外的格式
+    after = " ".join(after.split())
+    return main, after
+
+
+#: 补一句的门槛（全在本地，不靠模型自评）
+#:
+#: ⚠ 核心不是"随机补"，是"主回复说不完整才补"。
+#:   真人的补一句几乎都发生在「哦」「行吧」「那你忙」之后 ——
+#:   自己也知道太干了。说完整段话之后又补一句的，只有机器人会。
+AFTER_MAX_MAIN_CHARS = 12     # 主回复到达这么长 = 已经说完了
+AFTER_MAX_PARTS = 2           # 主回复分了 ≥2 条 = 已经说多了
+AFTER_COOLDOWN_HOURS = 6.0    # 两次补之间至少隔多久
+AFTER_STREAK_LIMIT = 3        # 最近 N 条回复内补过就不再补
+AFTER_PROBABILITY = 0.5       # 过完所有门槛之后还要掷骰
+
+
+def allow_afterthought(main: str, parts: Sequence[str], *, now: float,
+                       last_after_at: float = 0.0,
+                       recent_count: int = 99,
+                       rng: Any = None) -> Tuple[bool, str]:
+    """这个「补一句」要不要真的发出去。返回 (发不发, 不发的理由)。
+
+    为什么要在本地再筛一遍
+    ────────────────────
+    让模型写「补：」本来就会滥用 —— 它不知道什么时候该补，只知道格式上
+    可以补。只靠 prompt 约束的结果是"每条回复后面都跟一句"，那比不补还假。
+
+    所以规则是：**生成宽松，发送严格。**
+
+    六道筛，前四道问"这句话说完了没有"，后两道问"最近是不是补太多了"：
+
+        1. 主回复空            → 不补（没东西可补）
+        2. 已经分了 ≥2 条      → 不补（再说就多了）
+        3. 主回复 ≥12 字       → 不补（说完了）
+        4. 以问句结尾          → 不补（球已经踢出去了）
+        5. 6 小时内补过        → 不补
+        6. 最近 3 条内补过     → 不补
+
+    全过还要掷骰 50% —— 留一点不确定，免得变成"短句必补"的机械规则。
+    """
+    body = str(main or "").strip()
+    if not body:
+        return False, "主回复是空的"
+    if not parts:
+        return False, "没有可发的内容"
+    if len(parts) >= AFTER_MAX_PARTS:
+        return False, f"已经分了 {len(parts)} 条"
+    if len(body) >= AFTER_MAX_MAIN_CHARS:
+        return False, f"主回复 {len(body)} 字，说完了"
+    if body.endswith(("？", "?", "吗", "呢")):
+        return False, "以问句结尾，球踢出去了"
+    if last_after_at and (now - last_after_at) < AFTER_COOLDOWN_HOURS * 3600:
+        return False, f"{AFTER_COOLDOWN_HOURS:.0f} 小时内补过"
+    # recent_count = 自从上次补过之后过了几条回复。**小 = 刚补过**，
+    # 所以要挡住的是小于门槛，不是大于 —— 这里一开始写反了，
+    # 结果变成"越常补越允许补"，正好和本意相反。
+    if recent_count < AFTER_STREAK_LIMIT:
+        return False, f"只隔了 {recent_count} 条回复"
+    if rng is not None and rng.random() > AFTER_PROBABILITY:
+        return False, "掷骰没中"
+    return True, ""

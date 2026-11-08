@@ -31,6 +31,20 @@ def expect(page, label, js, ok_fn, desc=""):
     checks.append((page, label, js, ok_fn, desc))
 
 
+# ── 印象页的关系卡（v0.9.1）──
+#
+# 关系卡从独立的「关系」页搬进了印象页。这一页本来就能打开，
+# 所以真正要确认的是"新加的那一栏真的渲染出来了"，
+# 而不只是"页面不白屏"。
+expect("impression", "人数标签有内容", "document.querySelector('#imprCount').textContent",
+       lambda v: v.strip() not in ("", "—"), "不能停在占位符")
+expect("impression", "关系卡那一栏在",
+       "document.querySelector('#imprPanes').textContent.includes('我们之间')",
+       lambda v: str(v).strip().lower() == "true", "搬迁之后必须出现在印象页里")
+expect("impression", "关系卡有出处说明",
+       "document.querySelector('#imprPanes').textContent.includes('依据')",
+       lambda v: str(v).strip().lower() == "true", "每条都要能对回原话")
+
 # ── 概览 ──
 expect("overview", "状态文字", "document.querySelector('#ovState').textContent",
        lambda v: v.strip() != "", "不能为空")

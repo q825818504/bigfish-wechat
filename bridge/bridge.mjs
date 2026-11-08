@@ -209,7 +209,17 @@ async function loadMemoryStore(root, scope) {
 async function localRecall(root, dbPath, query, maxChars, warnings) {
   const py = process.env.BIGFISH_PYTHON ||
     (process.platform === 'win32' ? 'python' : 'python3');
-  const env = { ...process.env, PYTHONPATH: [join(HERE, '..'), process.env.PYTHONPATH || '']
+  // ⚠ 必须显式要求 Python 用 UTF-8 写 stdout。
+  //
+  //   Node 这边按 utf-8 读（下面 spawnSync 的 encoding），而 Windows 上
+  //   Python 默认按 cp936 写 —— 两边一对不上，记忆原文里每个汉字都会变成
+  //   U+FFFD。`tools/start.bat` 设了 PYTHONUTF8=1 所以走 bat 时看不出来，
+  //   但**双击 exe 启动时没有这个变量**，于是打包版的记忆检索全是乱码。
+  //   不要再依赖调用方的环境：这里就是唯一的地基。
+  const env = { ...process.env,
+    PYTHONUTF8: '1',
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONPATH: [join(HERE, '..'), process.env.PYTHONPATH || '']
     .filter(Boolean).join(process.platform === 'win32' ? ';' : ':') };
   try {
     const { spawnSync } = await import('node:child_process');

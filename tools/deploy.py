@@ -178,6 +178,18 @@ def deploy() -> None:
         for name in ("ui", "bridge"):
             if (src / name).is_dir():
                 shutil.copytree(src / name, DIST / name, dirs_exist_ok=True)
+        # PyInstaller 6 把 ui/ 和 bridge/ 打进 _internal/，而程序找 bridge
+        # 时 **exe 同级优先**（见 bridge_client._find_bridge）。只刷 _internal
+        # 等于没刷：生效的永远是 exe 旁边那份几个月前的旧文件。
+        # 两份一起刷，才保证"新打包的资源和程序看到的资源"是同一份。
+        for name in ("ui", "bridge"):
+            fresh = src / "_internal" / name
+            if not fresh.is_dir():
+                continue
+            target = DIST / name
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+            shutil.copytree(fresh, target)
     except Exception:
         # 复制失败：把旧程序放回去，别留一个半新半旧的目录
         if moved_old and (DIST / "_internal").exists():
