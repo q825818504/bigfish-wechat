@@ -2182,3 +2182,16 @@ RuntimeError: 数据目录不可写：[Errno 13] Permission denied:
 
 - **没打 tag、没发 Release**。用户只要求同步到 GitHub。
 - 界面那两处（切页拦截、快照段落表）只能真机看，自检覆盖不到渲染。
+
+### 推送结果
+
+- 提交：`f836936 v0.11.1：补回六处被吞掉的行为，攒批改成「到点问模型」`
+- 33 文件，+2465 / −118；新增 3 个文件
+  （`bigfish/listen_judge.py`、`tools/selftest_listen_judge.py`、`tools/selftest_mood.py`）
+- `git push origin main`：`24937ed..f836936`
+- `git ls-remote origin refs/heads/main` 回读 `f8369368e370e4da11a57238b597cd88757507dd`，与本地 HEAD 一致
+- 工作树干净（`git status --porcelain` 空）
+- raw 回读 `bigfish/__init__.py`：`__version__ = "0.11.1"` ✓
+- 提交前扫过密钥（`brz_` / `sk-` / `ghp_`）：待提交文件中零命中
+
+**未打 tag、未发 Release** —— 用户只要求同步到 GitHub。
