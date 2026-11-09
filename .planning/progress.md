@@ -2311,3 +2311,46 @@ const p = Math.max(0, Math.min(1, Number(dims[k] ?? 0)));
 
 **存量数据不用清**：旧值 0~10 会随着后面几轮判定自然涨到 30~50，
 衰减也仍按 90 分钟半衰期往回走。
+
+
+## 2026-11-09 22:0x — v0.11.2 已发布
+
+### 提交与标签
+
+| 项 | 值 |
+|---|---|
+| 主分支 | `c535b13 v0.11.2：修六个真机一天跑出来的问题` |
+| 发布审计 | `d350dc8 发布审计：便携包按前缀排除 config.json 的所有备份` |
+| Tag | `v0.11.2`（annotated，tag 对象 `99bcf38`，指向 `d350dc8`） |
+
+⚠ 第一次 push 时到 GitHub 的 TLS 被间歇性阻断（`schannel: failed to receive
+handshake`），直连和代理都失败，而百度正常、代理访问 codeload 正常。
+重试几轮后恢复。**遇到同样的报错先重试，不要急着改代码或换远端。**
+
+### 发布前审计抓到一次漏包
+
+第一版 zip（`1a79efd3…`）里带了 `BigFish-0.11.2/config.json.bak` ——
+**里面有真实 API Key**。`build_portable.py` 的 `SKIP_FILES` 是精确名匹配，
+追不上 `.bak` / `.bak2` / `.pre-rebuild` 这些手工备份。
+
+改法：加 `SKIP_PREFIXES`，按前缀拦 `config.json` / `settings.json` /
+`plugins.json` / `keys.json`；manifest 的 `excluded` 也写明「含所有 .bak 变体」。
+重新打包后 339 个文件，反查名单零命中。
+
+### Release
+
+- 地址：https://github.com/q825818504/bigfish-wechat/releases/tag/v0.11.2
+- Release ID：`439203873`
+- 附件：
+  - `BigFish-0.11.2-portable.zip` — 200.5 MB（210,200,436 bytes）
+    SHA-256 `f076b7be4700e04b8f30b546157222f558c27022387ed0d7aa36f43e523e148b`
+  - `BigFish-0.11.2-manifest.json` — 643 bytes
+- 发布后核验：Release API `draft=false` / `prerelease=false`；
+  附件大小与本地一致；`ls-remote refs/tags/v0.11.2` = `99bcf38`；
+  raw 回读 `bigfish/__init__.py` 为 `0.11.2`。
+
+### 这一版装了什么
+
+0.11.1 的全部（六条「记着没做」的修复 + 攒批判定 + 跨轮配额 +
+消息链路日志）加上 0.11.2 的七个真机问题（睡醒补回、关系提炼 502、
+醒来时刻、主动消息会话名、话说半句、手头的事重复、情绪维度显示）。
