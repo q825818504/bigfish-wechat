@@ -55,6 +55,9 @@ class Incoming:
     identity: str = ""
     #: 哪条规则得出的（见 bigfish/identity.py）
     identity_rule: str = ""
+    #: 补回的消息（她睡着期间收到的，醒来重新走一遍回复链）。
+    #: 这类消息**已经写过库、上过屏**，handle 里不要再写一遍。
+    replayed: bool = False
     raw_content: str = ""
 
     def preview(self, width: int = 60) -> str:

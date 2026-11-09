@@ -178,8 +178,14 @@ def main() -> int:
     check("下午换成第二条",
           L.current_plan_item(st, at(15)) == "把书看完",
           L.current_plan_item(st, at(15)))
-    check("还没到第一条时用第一条",
-          L.current_plan_item(st, at(7)) == "去趟超市",
+    # ⚠ 2026-11-09 改了：只有离第一条**够近**（90 分钟内）才提前用它。
+    #   无条件"用第一条"会让 19:00 的日程在 17:00 就变成"手头在做的事"，
+    #   19:00 又显示一次 —— 用户看到一天里做了两遍同一件事。
+    check("离第一条很近时提前用第一条",
+          L.current_plan_item(st, at(9)) == "去趟超市",
+          L.current_plan_item(st, at(9)))
+    check("离第一条太远就空着（交给静态池）",
+          L.current_plan_item(st, at(7)) == "",
           L.current_plan_item(st, at(7)))
 
     L.refresh_doing(st, at(15))

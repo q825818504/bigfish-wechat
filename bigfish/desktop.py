@@ -137,6 +137,12 @@ def wants_sticker(text: str) -> bool:
     value = str(text or "")
     return any(w in value for w in STICKER_WANT_WORDS)
 
+#: 睡醒之后多久开始回"睡着期间收到的消息"（秒）。
+#:
+#: 为什么不是立刻：刚睁眼就秒回不像人；也给她留一点"刚醒"的状态进提示词
+#: （`life.briefing` 会写「刚看到」那一段）。
+CATCHUP_DELAY = 20.0
+
 #: 发出表情后，多久之内读回来的同一条算回环。
 #: 实测数据库落库要 10~12 秒（比文字慢得多），10 秒窗口会把"已发出"
 #: 误判成"没发出去"。这里给到 45 秒，留足余量。
@@ -410,7 +416,16 @@ def _cut_at_sentence(text: str, limit: int) -> str:
     if joined.replace(marker, "").strip():
         # 截掉的部分不补省略号：完整的句子比"…"更像人说话
         return joined
-    # 第一句就超预算：只能硬切，但至少别把分条标记算进去
+    # 第一句就超预算：**宁可超一点，也不要半句**。
+    #
+    # 2026-11-09 实测：跨轮配额把预算压到 18 字，她那句
+    # 「交接这段最难熬，还得对着那领导笑」被硬切成
+    # 「交接这段最难熬，还得对着那领导」—— 缺一个谓语，直接成了病句，
+    # 用户以为是语音被砍了一半。
+    # 一句完整的话比"少数几个字"重要得多，所以只有离谱超长（2 倍以上）
+    # 才硬切 —— 那种情况一定是模型写嗨了。
+    if len(plain) <= limit * 2:
+        return text.strip()
     return plain[:limit].rstrip("，,、 ") + "…"
 
 
@@ -764,6 +779,10 @@ class EngineWorker(QThread):
         #: 只放内存：进程重启清零（和账本 D-9 同一个理由 ——
         #: 残留的旧计数会让重启后第一句话莫名变短）。
         self._sent_parts: dict = {}
+        #: 睡醒补回：[(到点时刻, chat_id, 会话名, 对方最后一句)]。
+        #: 她睡着时别人发的消息，醒来要**主动回一条**，
+        #: 而不是"等对方下次说话才带出来"（2026-11-09 用户要求）。
+        self._catchup: list = []
         #: 她的生活状态（bigfish/life.py）。None = 还没加载。
         #: 只在引擎线程里读写，不跨线程共享。
         self._life = None
@@ -2140,7 +2159,19 @@ class EngineWorker(QThread):
                         transcript = chr(10).join(f"{w}: {txt}" for w, txt in lines)
                         if transcript.strip():
                             sys_b, user_b = _B.build_request(transcript)
-                            raw_b = call_model(self.mcfg, sys_b, user_b)
+                            # 关系提炼给一倍半预算：推理模型经常把 3000 全花在
+                            # reasoning 上、正文为空（2026-11-09 每个会话都撞上）。
+                            # `call_model` 遇到 empty_content 还会再扩，这里是起点。
+                            _mcfg_b = self.mcfg
+                            try:
+                                from dataclasses import replace as _replace
+
+                                _mcfg_b = _replace(
+                                    self.mcfg,
+                                    max_tokens=max(1200, int(self.mcfg.max_tokens * 1.5)))
+                            except Exception:
+                                pass
+                            raw_b = call_model(_mcfg_b, sys_b, user_b)
                             passed, rejected = _B.parse_bonds(raw_b, transcript)
                             added = 0
                             for item in passed:
@@ -2175,6 +2206,54 @@ class EngineWorker(QThread):
                          name="reflect").start()
 
     # ------------------------------------------------------------------
+    def _drain_catchup(self, now: float, enqueue) -> None:
+        """到点的补回消息，一条一条交给正常回复链。
+
+        `enqueue` 由调用方传进来 —— 正常路径上传的是"丢进生成队列"，
+        **不是直接生成**。这一点很要命：主循环每 300ms 一轮，还管着主动
+        消息的发送和生活 tick；在这里同步调模型会把它按住 1~16 秒，
+        别的会话、主动开口全跟着停。
+
+        为什么走同一条生成链而不是自己拼 prompt：记忆、心情、刚醒的状态、
+        发送三态与账本全都复用，不会长出第二套。
+        """
+        if not self._catchup:
+            return
+        from bigfish.watcher import Incoming
+
+        left = []
+        for due_at, chat_id, chat_name, text in self._catchup:
+            if now < due_at:
+                left.append((due_at, chat_id, chat_name, text))
+                continue
+            if self._stop:
+                return
+            # 没正文就不补：handle 里 `if not text: return`，但那样队列会被
+            # 静默吃掉一条，日志也看不出来。这里直接跳过，留个记录。
+            if not str(text or "").strip():
+                continue
+            try:
+                msg = Incoming(
+                    chat_id=chat_id,
+                    chat_name=chat_name or chat_id,
+                    text=text,
+                    msg_type="文本",
+                    sender_name="",
+                    # timestamp 是**秒**（微信 create_time），`_source_ms` 会转
+                    timestamp=int(time.time()),
+                    identity="peer",
+                    identity_rule="wake_catchup",
+                    raw_content=text,
+                    replayed=True,
+                )
+                self._log(f"[生活] 醒来补回：{chat_name or chat_id}"
+                          f"（睡着时发的）", "in")
+                enqueue(msg)
+            except Exception as exc:
+                self._log(f"[生活] 补回失败：{exc}", "err")
+        self._catchup = left
+
+    # ------------------------------------------------------------------
     def _advance_life(self, now: float, *, talk_turns: int = 0) -> list:
         """推进她的生活状态。**不调模型、不读微信库、不发消息。**
 
@@ -2197,11 +2276,31 @@ class EngineWorker(QThread):
                 self._log(f"[生活] {ev.text}",
                           "" if ev.kind == "doing" else "think")
             if any(e.kind == "woke" for e in events):
+                # ── 睡醒补回 ──
+                #
+                # 以前这里只打一行日志「下次说话时会带出来」—— 也就是说
+                # 对方不发新消息，她永远不会回那句。用户 2026-11-09 明确要求：
+                # 「我不希望是这种，而是睡醒了看到没回的消息主动回复」。
+                #
+                # 做法：把 pending 会话排进 self._catchup，主循环到点后
+                # 重新走一遍正常回复链（同一轮模型调用、同一套发送三态与账本），
+                # 提示词里的「## 刚看到」段会告诉她"睡着期间他找过你"。
+                # 延迟 20 秒：刚睁眼就秒回不像人，也免得跟"刚醒"那段抢话。
                 pending = self._life.pending or {}
                 if pending:
-                    self._log(
-                        f"[生活] 睡着期间有 {len(pending)} 个会话找过她，"
-                        f"下次说话时会带出来", "")
+                    queued = []
+                    for _cid, _it in list(pending.items()):
+                        _it = _it if isinstance(_it, dict) else {}
+                        _txt = str(_it.get("text") or _it.get("preview") or "").strip()
+                        if not _cid or not _txt:
+                            continue
+                        queued.append((now + CATCHUP_DELAY, _cid,
+                                       str(_it.get("chat_name") or ""), _txt))
+                    if queued:
+                        self._catchup = queued
+                        self._log(
+                            f"[生活] 睡着期间有 {len(queued)} 个会话找过她，"
+                            f"醒来会主动回一条（{CATCHUP_DELAY:.0f} 秒后）", "")
             _L.expire_pending(self._life, now)
             return events
         except Exception as exc:
@@ -2629,21 +2728,29 @@ class EngineWorker(QThread):
             # 以前只在发送成功后调 record_exchange，于是「她没接上」的那句
             # 在记忆页里根本不存在 —— 用户质问「你怎么没回我」时，
             # 她查不到任何依据，只能编。
-            try:
-                from bigfish import vault as _v_user
+            #
+            # ⚠ 补回的消息（replayed）不要重复写：她睡着时那条已经进过库，
+            #   再写一次会让记忆页里同一句话出现两遍，而且 local_id 不同，
+            #   UNIQUE 挡不住。
+            _replayed = bool(getattr(msg, "replayed", False))
+            if not _replayed:
+                try:
+                    from bigfish import vault as _v_user
 
-                _lid = getattr(msg, "local_id", None)
-                _v_user.capture_message(
-                    f"wechat:{msg.chat_id}",
-                    f"wx-u-{_lid}" if _lid else f"wx-u-{int(time.time() * 1000)}",
-                    "user", body, _source_ms(msg))
-            except Exception:
-                pass
+                    _lid = getattr(msg, "local_id", None)
+                    _v_user.capture_message(
+                        f"wechat:{msg.chat_id}",
+                        f"wx-u-{_lid}" if _lid else f"wx-u-{int(time.time() * 1000)}",
+                        "user", body, _source_ms(msg))
+                except Exception:
+                    pass
 
             # 日志不在这里打 —— 即时那行已经由 enqueue() 在消息到手的瞬间
             # 发过了。这里再打一次等于同一句话在日志里出现两遍，
             # 而中间那 2 秒的空窗正是用户抱怨「卡一会」的来源。
-            self.chat_event.emit(msg.chat_name, msg.preview(60), "in")
+            # 补回的消息也不上屏（它当时已经出现过一次）。
+            if not _replayed:
+                self.chat_event.emit(msg.chat_name, msg.preview(60), "in")
 
             # 昵称跟着微信走：wxid 是稳定的，昵称/备注会改。
             # 记下当前名字，印象页和记忆页显示的就是最新的那个。
@@ -2719,7 +2826,8 @@ class EngineWorker(QThread):
                     if (self._life is not None
                             and _life_mod.is_asleep(self._life, time.time())):
                         _life_mod.note_pending(self._life, msg.chat_id,
-                                               body or "", time.time())
+                                               body or "", time.time(),
+                                               chat_name=msg.chat_name)
                         _life_mod.save(self._life)
                         self._log(
                             f"[生活] {msg.chat_name} 在她睡着时发了"
@@ -3318,6 +3426,17 @@ class EngineWorker(QThread):
         import queue as _queue
 
         _gen_queue: "_queue.Queue" = _queue.Queue(maxsize=64)
+
+        def _enqueue_gen(msg) -> None:
+            """把一条消息丢给生成 worker。**不阻塞** —— 队列满就丢并记一笔。
+
+            睡醒补回也走这里：那条消息同样要过模型、同样会占一个生成位，
+            但不该把调用方（主循环）按住。
+            """
+            try:
+                _gen_queue.put_nowait(msg)
+            except _queue.Full:
+                self._log("[并发] 生成队列已满，这条补回的消息丢了", "err")
         _outbox: "_queue.Queue" = _queue.Queue()
         _chat_locks: dict = {}
         _chat_locks_guard = threading.Lock()
@@ -3614,6 +3733,15 @@ class EngineWorker(QThread):
                 self._flush_after(now)
             except Exception as exc:
                 self._log(f"[接话] 补一句异常：{exc}", "err")
+            # ── 睡醒补回 ──
+            #
+            # 她睡着时对方发的消息，醒来 20 秒后重新走一遍正常回复链。
+            # 走 handle 而不是自己拼 prompt：记忆、心情、刚醒的状态、
+            # 发送三态与账本全都复用同一条路，不会长出第二套。
+            try:
+                self._drain_catchup(now, _enqueue_gen)
+            except Exception as exc:
+                self._log(f"[生活] 补回异常：{exc}", "err")
             if now >= next_tick:
                 next_tick = now + tick_every
                 turns = self._talk_turns

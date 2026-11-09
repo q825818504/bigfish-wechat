@@ -542,6 +542,16 @@ def test_render() -> None:
     state3.sleep_debt = 90
     check("欠债会说出来", "睡得不太够" in L.render(state3, now))
 
+    # ⚠ 2026-11-09 实测：她 09:33 醒，中午被问「几点醒的」答「八点多吧」——
+    #   提示词里只有「刚醒没多久」，没有具体时刻，她只能编。
+    #   "我几点醒的"属于她自己的生活，必须由状态直接给。
+    state4, _ = fresh(2026, 11, 7, 10)
+    state4.just_woke_at = at(2026, 11, 7, 9, 33)
+    early = L.render(state4, at(2026, 11, 7, 10, 0))
+    check("刚醒时带具体时刻", "09:33" in early, early[:120])
+    late_day = L.render(state4, at(2026, 11, 7, 15, 0))
+    check("过了几小时也还记得几点醒的", "09:33" in late_day, late_day[:120])
+
 
 def test_condition() -> None:
     print("\n[一句话] 给日志和界面用")

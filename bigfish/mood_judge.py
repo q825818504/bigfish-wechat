@@ -48,6 +48,17 @@ MOOD_STEP_DIVISOR = 3
 # 单根情绪的半衰期（分钟）。与 index.js 的 decay() 一致。
 DIM_HALF_LIFE_MIN = 90
 
+#: 维度增益：判定给的是「强度」增量（-10..10），但**直接累加太钝**。
+#:
+#: 实测（2026-11-09，用户跑了一整天）：单次 delta 3~5 分、90 分钟半衰期，
+#: 一天下来七根维度长期停在 0~10 —— 界面上看起来"几乎没有情绪"，
+#: 而她本人的描述是「心疼他熬着，担心他气着」。数值和事实对不上。
+#:
+#: ×3 之后单次 9~15 分，稳态落在 30~50，正好是"能看出来、又不至于满格"。
+#: ⚠ 这是**标定值**，不是推导值：改它只需要重跑 `selftest_mood`。
+#:   心情值不走这个增益（那边有基线 70 和 /3 的步长，另有一套标定）。
+DIM_GAIN = 3.0
+
 #: 数值 → 一句人话。阈值只有这一份 ——
 #: bridge_client.Mood.label 也走这里，否则心情页显示的和提示词里的会对不上。
 MOOD_LABELS: Tuple[Tuple[int, str], ...] = (
@@ -277,8 +288,10 @@ def apply_mood_delta(
     dims_cur = s.get("dims") if isinstance(s.get("dims"), dict) else {}
     delta_dims = verdict.get("dims") or {}
     for k in MOOD_DIMS_ALL:
+        # 乘 DIM_GAIN：判定给的是强度，直接加太钝（见常量处的实测说明）。
+        _d = int(round(int(delta_dims.get(k, 0)) * DIM_GAIN))
         dims_cur[k] = _clamp(
-            int(round(float(dims_cur.get(k) or 0) + int(delta_dims.get(k, 0)))), 0, 100)
+            int(round(float(dims_cur.get(k) or 0) + _d)), 0, 100)
     s["dims"] = dims_cur
 
     s["lastReason"] = str(verdict.get("reason") or "")[:200]

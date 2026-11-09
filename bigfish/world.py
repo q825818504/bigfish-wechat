@@ -932,13 +932,28 @@ class World:
         return self.pro
 
     def _display_name(self, chat_id: str) -> str:
-        """wxid → 昵称。查不到就用 wxid 兜底（UIA 也认）。"""
+        """wxid → 昵称。查不到就用 wxid 兜底。
+
+        ⚠ `WeChatReader.sessions()` 返回的是 **dict**（`{"username", "name"}`），
+          这里以前用 `getattr(sess, "username")` 读 —— 永远拿到空串，
+          于是每个 wxid 都原样返回。主动消息拿 wxid 去发，UIA 那边
+          当前会话是「老爸」，校验对不上，直接中止：
+          「会话名不匹配：期望 'wxid_51f85n6xp73o22'，实际 '老爸'」。
+          2026-11-09 用户实测到的就是这个。
+        """
         try:
             reader = self._reader()
             if reader is not None:
                 for sess in (reader.sessions() or []):
-                    if str(getattr(sess, "username", "")) == chat_id:
-                        return str(getattr(sess, "display_name", "") or chat_id)
+                    if isinstance(sess, dict):
+                        uid = str(sess.get("username") or "")
+                        name = str(sess.get("name") or "")
+                    else:
+                        uid = str(getattr(sess, "username", "") or "")
+                        name = str(getattr(sess, "name", "")
+                                   or getattr(sess, "display_name", "") or "")
+                    if uid == chat_id and name:
+                        return name
         except Exception:
             pass
         return chat_id

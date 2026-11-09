@@ -673,7 +673,19 @@ def current_plan_item(state: LifeState, now: float) -> str:
             chosen = what
         else:
             break
-    return chosen or entries[0][1]
+    if chosen:
+        return chosen
+    # 现在早于第一条：**只有离得够近**才提前用它。
+    #
+    # 原来这里无条件 `return entries[0][1]`，理由是"刚醒来第一条通常是
+    # 洗漱/吃早饭，用第一条比空着更像人"。但代价是：一条 19:00 的
+    # 「把冬天的厚衣服翻出来整理」，17:00 就被当成"手头在做的事"显示，
+    # 19:00 又显示一次 —— 用户看到的是一天里做了两遍同一件事
+    # （2026-11-09 实锤）。90 分钟以内算"提前准备"，超过就交给静态池。
+    first_m = entries[0][0]
+    if first_m - minute <= 90:
+        return entries[0][1]
+    return ""
 
 
 def mark_plan_done(state: LifeState, what: str, *, now: float,
@@ -1029,10 +1041,14 @@ def _looks_like_sleep_time(state: LifeState, now: float) -> bool:
 # 外部输入
 # ══════════════════════════════════════════════════════════════════════
 
-def note_pending(state: LifeState, chat_id: str, text: str, now: float) -> None:
-    """她睡着时收到消息：记账，不叫醒。醒来才补一句。
+def note_pending(state: LifeState, chat_id: str, text: str, now: float,
+                 chat_name: str = "") -> None:
+    """她睡着时收到消息：记账，不叫醒。醒来主动补一句。
 
     ⚠ 只记会话和一句预览，不记全文 —— 全文在微信库里，记两份会漂移。
+
+    `chat_name` 是给对方看的会话名（「老爸」）。醒来补回时要拿它去发 ——
+    UIA 认显示名，不认 wxid，缺了它就得现场再查一次会话列表。
     """
     if not chat_id:
         return
@@ -1043,7 +1059,12 @@ def note_pending(state: LifeState, chat_id: str, text: str, now: float) -> None:
     item["count"] = int(item.get("count") or 0) + 1
     item["last_at"] = now
     item["preview"] = (text or "").strip()[:40]
+    #: 醒来补回时要拿它当"对方说的那句话"去查记忆、拼上下文，
+    #: 40 字的预览常常刚好处在半句上。留 200 字，够用又不至于把整段聊天存两份。
+    item["text"] = (text or "").strip()[:200]
     item["first_at"] = item.get("first_at") or now
+    if chat_name:
+        item["chat_name"] = str(chat_name)[:60]
 
 
 def take_pending(state: LifeState, chat_id: str) -> Optional[Dict[str, Any]]:
@@ -1169,8 +1190,21 @@ def render(state: LifeState, now: Optional[float] = None, *,
     else:
         lines.append("状态还行。")
 
-    if state.just_woke_at and (now - state.just_woke_at) < 90 * 60:
-        lines.append("刚醒没多久。")
+    # ⚠ 一定要给**具体的醒来时刻**，不能只说「刚醒没多久」。
+    #   2026-11-09 实测：她 09:33 醒，中午被问「几点醒的」，
+    #   答「八点多吧」—— 提示词里根本没有这个数，她只能编。
+    #   「我几点醒的」属于"她自己的生活"，必须由状态直接给，不能让模型猜。
+    if state.just_woke_at:
+        try:
+            _wake_hm = _local(state.just_woke_at).strftime("%H:%M")
+            _mins = max(0.0, (now - float(state.just_woke_at)) / 60.0)
+            if _mins < 90:
+                lines.append(f"今天 {_wake_hm} 醒的，刚醒没多久。")
+            else:
+                lines.append(f"今天 {_wake_hm} 醒的。")
+        except Exception:
+            if (now - state.just_woke_at) < 90 * 60:
+                lines.append("刚醒没多久。")
 
     if state.sleep_debt >= 45:
         lines.append(f"这两天睡得不太够（欠 {state.sleep_debt:.0f} 分钟）。")

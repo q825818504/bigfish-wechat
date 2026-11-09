@@ -160,6 +160,30 @@ def test_not_ready() -> None:
     check("没发请求", fake.calls == 0, str(fake.calls))
 
 
+def test_reasoning_empty() -> None:
+    """上游把「正文被 reasoning 吃光」包成 5xx —— 要认出来，抬预算重试。
+
+    2026-11-09 实测：关系提炼每一轮都失败，日志只剩一句
+    「提炼失败（30 分钟后再试）」，body 里写着
+    "an empty reply ... the whole output spent on reasoning"。
+    那不是网关挂了，是 max_tokens 不够。
+    """
+    print("")
+    print("-- 空正文：被 reasoning 吃光 --")
+    from bigfish import replier as R
+
+    check("认出 spent on reasoning",
+          R._is_reasoning_empty(
+              "an empty reply (the model answered nothing; try again) — "
+              "cut at its length, the whole output spent on reasoning"),
+          "没认出来")
+    check("认出 answered nothing",
+          R._is_reasoning_empty("upstream error: answered nothing"), "没认出来")
+    check("普通网关错误不误判",
+          not R._is_reasoning_empty('{"error":"Bad Gateway"}'), "误判了")
+    check("空 body 不误判", not R._is_reasoning_empty(""), "误判了")
+
+
 def main() -> int:
     print("模型重试回归测试（bigfish/replier.py）")
     test_once()
@@ -169,6 +193,7 @@ def main() -> int:
     test_empty_content_bump()
     test_attempts_one()
     test_not_ready()
+    test_reasoning_empty()
 
     print(f"\n{'=' * 46}")
     total = PASS + FAIL

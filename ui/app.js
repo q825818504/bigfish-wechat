@@ -1221,7 +1221,9 @@ async function loadMood() {
     const dims = d.dims || {};
     const box = $('#moodDims');
     box.innerHTML = Object.entries(DIM_NAMES).map(([k, label]) => {
-      const p = Math.max(0, Math.min(1, Number(dims[k] ?? 0)));
+      // 维度是 0..100，不是 0..1（与 mood_judge 同一套量纲）。
+    // 以前写 Math.min(1, v)：9 和 10 都被夹成 1，界面上「不是 0% 就是 100%」。
+    const p = Math.max(0, Math.min(100, Number(dims[k] ?? 0))) / 100;
       return `<div class="dim-row">
         <span class="dim-name">${label}</span>
         <span class="dim-track"><span class="dim-fill" style="width:${(p * 100).toFixed(1)}%"></span></span>

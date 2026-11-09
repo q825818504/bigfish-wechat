@@ -158,6 +158,23 @@ def main() -> int:
         check("上限 0 = 不注入", s.get("lastInjectedText") == "",
               repr(s.get("lastInjectedText")))
 
+        section("维度：增益让强度落在能看出来的区间")
+        # 2026-11-09 实测：单次 delta 3~5 直接累加，一天下来七根维度长期
+        # 停在 0~10，界面上像"几乎没有情绪"。★3 之后落在 30~50。
+        s = run_case(MJ, V, {"injectMode": "off"},
+                     {"moodDelta": 0, "dims": {"sad": 8, "worry": 4},
+                      "reason": "", "confidence": 90})
+        check("sad 8 → 24（×DIM_GAIN）", int(s["dims"]["sad"]) == 24,
+              str(s["dims"]))
+        check("worry 4 → 12", int(s["dims"]["worry"]) == 12, str(s["dims"]))
+        check("没提到的维度保持 0", int(s["dims"].get("happy") or 0) == 0,
+              str(s["dims"]))
+        # 封顶仍然有效：连续多次判定不会超过 100
+        s = run_case(MJ, V, {"injectMode": "off"},
+                     {"moodDelta": 0, "dims": {"sad": 10},
+                      "reason": "", "confidence": 90}, times=6)
+        check("维度封顶 100", int(s["dims"]["sad"]) == 100, str(s["dims"]))
+
         section("autoJudge：闸门在 desktop 里")
         src = os.path.join(_ROOT, "bigfish", "desktop.py")
         with open(src, "r", encoding="utf-8") as f:

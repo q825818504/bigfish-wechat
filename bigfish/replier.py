@@ -248,6 +248,24 @@ DEFAULT_ATTEMPTS = 3
 #: 退避基数：1s → 2s → 4s（封顶）
 RETRY_BACKOFF = (1.0, 2.0, 4.0)
 
+#: 上游把「正文被 reasoning 吃光」包成 5xx 时的特征词。
+#: 中转站（OpenCode Go / one-api 一类）的 body 长这样：
+#:   "an empty reply (the model answered nothing; try again) —
+#:    cut at its length, the whole output spent on reasoning"
+_REASONING_EMPTY_HINTS = (
+    "spent on reasoning",
+    "answered nothing",
+    "empty reply",
+    "empty content",
+    "reasoning token",
+)
+
+
+def _is_reasoning_empty(detail: str) -> bool:
+    """这条错误正文是不是在说「token 全花在推理上、正文为空」。"""
+    low = str(detail or "").lower()
+    return any(h in low for h in _REASONING_EMPTY_HINTS)
+
 #: 最近一次失败（给界面显示"她为什么没回"）。空 = 最近一次成功。
 _LAST_ERROR: Dict[str, Any] = {}
 
@@ -401,6 +419,18 @@ def _call_once(cfg: ModelConfig, system: str, user: str) -> str:
             raw = r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace") if exc.fp else ""
+        # ⚠ 有些中转（OpenCode Go / one-api 那一类）会把「正文被 reasoning
+        #   吃光」包成 **502** 返回，body 里写 "an empty reply (the model
+        #   answered nothing ... the whole output spent on reasoning)"。
+        #   那不是网关挂了，是 max_tokens 不够 —— 该抬预算再试，
+        #   而不是原样重试三次（每次都在同一个地方撞死）。
+        #   2026-11-09 实测：关系提炼每一轮都这么失败，日志只剩一句
+        #   "提炼失败（30 分钟后再试）"。
+        if _is_reasoning_empty(detail):
+            raise ModelError(
+                f"模型只输出了推理、正文为空（{detail[:160]}）",
+                status_code=exc.code, retryable=True,
+                kind="empty_content") from exc
         raise ModelError(
             _http_hint(exc.code, detail, cfg),
             status_code=exc.code,

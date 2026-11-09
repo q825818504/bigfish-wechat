@@ -850,7 +850,9 @@ MOOD_DEFAULTS: Dict[str, Any] = {
     "injectConfidence": 40,
     "decayHalfHours": 12,
     "sigMood": 3,
-    "sigDim": 5,
+    # ⚠ 与 mood_judge.DIM_GAIN 配套：维度增量乘 3 之后，单次变化
+    #   落在 9~15，阈值留在 5 等于"每次都算显著"。15 才是"明显动了"。
+    "sigDim": 15,
     "injectPerDay": 6,
     "autoJudge": True,
 }
