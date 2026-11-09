@@ -43,6 +43,10 @@ SKIP_FILES = {
     'config.json', 'settings.json', 'plugins.json',
     'keys.json', 'keys.json.bak', 'image_keys.json', 'credentials.json',
 }
+#: 按前缀再拦一遍。`config.json.bak` / `.bak2` / `.pre-rebuild` 这些备份里
+#: 同样躺着真实 API Key —— 2026-11-09 实测漏了一个 `config.json.bak` 进包，
+#: 是靠发布前反查 zip 名单才发现的。精确名列表永远追不上人的手。
+SKIP_PREFIXES = ('config.json', 'settings.json', 'plugins.json', 'keys.json')
 SKIP_EXT = {'.sqlite3', '.sqlite3-wal', '.sqlite3-shm', '.wav', '.mp3', '.log'}
 
 
@@ -52,6 +56,8 @@ def should_skip(rel: str) -> bool:
         return True
     name = parts[-1]
     if name in SKIP_FILES:
+        return True
+    if any(name.startswith(p) for p in SKIP_PREFIXES):
         return True
     return any(name.lower().endswith(ext) for ext in SKIP_EXT)
 
@@ -88,9 +94,11 @@ manifest = {
     'archive_sha256': h.hexdigest(),
     'file_count': len(files),
     'excluded': [
-        'data/', 'wechatauto_db/', 'voice/', 'config.json',
-        'settings.json', 'plugins.json', 'keys.json', 'keys.json.bak',
-        'image_keys.json', 'credentials.json', '*.sqlite3', '*.wav', '*.mp3', '*.log',
+        'data/', 'wechatauto_db/', 'voice/',
+        # 前缀拦：备份里也有真实 Key（.bak / .bak2 / .pre-rebuild）
+        'config.json*（含所有 .bak 变体）', 'settings.json*', 'plugins.json*',
+        'keys.json*', 'image_keys.json', 'credentials.json',
+        '*.sqlite3', '*.wav', '*.mp3', '*.log',
     ],
     'note': '便携版：解压到任意目录，双击 BigFish.exe。需要管理员权限（UIA 发送）。',
 }
