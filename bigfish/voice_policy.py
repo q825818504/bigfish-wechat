@@ -42,6 +42,9 @@ from typing import Any, Dict, List, Mapping, Optional
 
 VOICE_TAG = re.compile(r"\[\[\s*voice\s*\]\]", re.I)
 TEXT_TAG = re.compile(r"\[\[\s*(?:text|no[_-]?voice)\s*\]\]", re.I)
+#: 表情标记。和语音标记走同一个清理点 —— 发给对方之前必须清干净。
+#: `[[text]]` 是两件事共用的一句「别用非文字」：不出声、也不配图。
+STICKER_TAG = re.compile(r"\[\[\s*(?:sticker|no[_-]?sticker)\s*\]\]", re.I)
 
 #: 对方明确要语音。宁可窄一点：误判成"要语音"会让她突然发一条音频文件。
 REQUEST_RE = re.compile(
@@ -78,8 +81,12 @@ def is_requested(text: str) -> bool:
 
 
 def strip_tags(text: str) -> str:
-    """把 [[voice]] / [[text]] 从正文里拿掉，发给对方之前一定要过。"""
-    return TEXT_TAG.sub("", VOICE_TAG.sub("", text or "")).strip()
+    """把 [[voice]] / [[text]] / [[sticker]] 从正文里拿掉，发给对方之前一定要过。
+
+    这些标记是模型对系统说的话，不是对对方说的话。漏一个，
+    对方就会看到一句「[[sticker]]」——比不发图更糟。
+    """
+    return STICKER_TAG.sub("", TEXT_TAG.sub("", VOICE_TAG.sub("", text or ""))).strip()
 
 
 @dataclass

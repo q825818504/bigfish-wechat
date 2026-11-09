@@ -78,22 +78,25 @@ def msg(chat: str, author: str, text: str, *, at: float,
 def test_listen() -> None:
     section("攒批")
 
-    # 1) 单条：短消息（「在吗」2 字、没标点）→ 等满自适应上限 4.0s
-    #    ⚠ 这条以前是"等满 2.0s"。改成自适应之后，「在吗」这种极短、
-    #      没标点的消息要等 4 秒 —— 因为它几乎肯定是多条里的第一条。
-    #      这正是要修的 bug：对方断句时被插话。
+    # 1) 单条：短消息（「在吗」2 字、没标点）→ 等满自适应上限
+    #    ⚠ 2026-11-08 上限从 4.0 提到 6.0：用户实测「稍微犹豫一下再发，
+    #      她就已经回复了」。这里不写死数字，直接读 policy 的值 ——
+    #      调参时不该改测试。
+    _q = L.ListenPolicy().quiet_max
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "在吗", at=0.0))
-    clock.now = 3.9
-    check("短消息 3.9s 还没到期", b.tick() == [], "sealed too early")
-    clock.now = 4.0
+    clock.now = _q - 0.1
+    check(f"短消息 {_q - 0.1:.1f}s 还没到期", b.tick() == [], "sealed too early")
+    clock.now = _q
     out = b.tick()
-    check("短消息 4.0s 封批", len(out) == 1 and len(out[0].messages) == 1, f"{out}")
+    check(f"短消息 {_q:.1f}s 封批", len(out) == 1 and len(out[0].messages) == 1, f"{out}")
     check("reason=quiet", out[0].reason == "quiet", f"got {out[0].reason}")
-    check("waited≈4.0", 3.9 <= out[0].waited <= 4.1, f"got {out[0].waited}")
+    check(f"waited≈{_q:.1f}", _q - 0.1 <= out[0].waited <= _q + 0.1,
+          f"got {out[0].waited}")
 
     # 2) 同人连发 3 条：一批只回一次
+    _q2 = L.adaptive_quiet("吃饭了没", L.ListenPolicy())
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "大肥鱼", at=0.0))
@@ -101,11 +104,11 @@ def test_listen() -> None:
     b.feed(msg("c1", "小明", "你在不在", at=0.5))
     clock.now = 1.0
     b.feed(msg("c1", "小明", "吃饭了没", at=1.0))
-    clock.now = 4.9
+    clock.now = 1.0 + _q2 - 0.1
     check("连发期间不封批", b.tick() == [], "sealed early")
-    clock.now = 5.0
+    clock.now = 1.0 + _q2
     out = b.tick()
-    check("最后一条后 4s 封批",
+    check(f"最后一条后 {_q2:.1f}s 封批",
           len(out) == 1 and len(out[0].messages) == 3, f"{out}")
     check("批次里三个人称一致", out[0].authors == ["小明"], f"{out[0].authors}")
 
@@ -132,27 +135,33 @@ def test_listen() -> None:
     check("@ 后 1.0s 封批", len(out) == 1, f"{out}")
     check("reason=mention", out[0].reason == "mention", f"got {out[0].reason}")
 
-    # 5) 纯图：等 4s（可能在连发图）
+    # 5) 纯图：等 max(自适应, quiet_media) —— 可能在连发图
+    _pol5 = L.ListenPolicy()
+    _q_media = max(L.adaptive_quiet("", _pol5), _pol5.quiet_media)
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "", at=0.0, msg_type="图片"))
-    clock.now = 3.9
-    check("纯图 3.9s 未到期", b.tick() == [], "sealed early")
-    clock.now = 4.0
+    clock.now = _q_media - 0.1
+    check(f"纯图 {_q_media - 0.1:.1f}s 未到期", b.tick() == [], "sealed early")
+    clock.now = _q_media
     out = b.tick()
-    check("纯图 4.0s 封批", len(out) == 1 and out[0].reason == "media", f"{out}")
+    check(f"纯图 {_q_media:.1f}s 封批",
+          len(out) == 1 and out[0].reason == "media", f"{out}")
 
     # 6) max_wait：一直发也要回（max_batch 调大，单独测这一条规则）
+    #    ⚠ 2026-11-08 上限 12 → 30，这里读 policy 的值，不写死。
+    _mw = L.ListenPolicy().max_wait
     clock = Clock()
     b = L.MessageBatcher(L.ListenPolicy(max_batch=20), clock=clock)
+    # 每 3 秒补一句：普通窗口（6s）永远不会先到期，逼出 max_wait
     for i in range(10):
-        clock.now = float(i)
-        b.feed(msg("c1", "小明", f"第{i}句", at=float(i), local_id=i + 1))
-    clock.now = 11.9
-    check("max_wait 前一刻还没封", b.tick() == [], "sealed early")
-    clock.now = 12.0
+        clock.now = float(i * 3)
+        b.feed(msg("c1", "小明", f"第{i}句", at=float(i * 3), local_id=i + 1))
+    clock.now = _mw - 0.1
+    check(f"max_wait 前一刻还没封（{_mw - 0.1:.0f}s）", b.tick() == [], "sealed early")
+    clock.now = _mw
     out = b.tick()
-    check("max_wait=12s 强制封批", len(out) == 1, f"{out}")
+    check(f"max_wait={_mw:.0f}s 强制封批", len(out) == 1, f"{out}")
     check("reason=max_wait", out[0].reason == "max_wait", f"got {out[0].reason}")
     check("封批时已攒 10 条", len(out[0].messages) == 10, f"got {len(out[0].messages)}")
 
@@ -181,11 +190,32 @@ def test_listen() -> None:
     b3.feed(msg("c1", "我", "别的会话", at=1.0, is_self=True))
     check("allow_self 只放行指定会话", b3.pending() == {}, f"{b3.pending()}")
 
+    # 8.2) 跳过日志：同会话 120 秒内只打一行，且要带她的原话。
+    #      以前每条自己的消息都打一行「自己发的消息」，和上一条「收」挨在一起，
+    #      看起来像"对方的消息被跳过了"（2026-11-08 用户当场这么问）。
+    logs: list[str] = []
+    clock4 = Clock()
+    b4 = L.MessageBatcher(clock=clock4, on_log=logs.append)
+    for i in range(3):
+        b4.feed(msg("c9", "老爸", f"她说的第{i}句", at=1.0 + i, is_self=True))
+        clock4.now += 1.0
+    check("跳过日志同会话只打一行", len(logs) == 1, f"{logs}")
+    check("跳过日志带她的原话", logs and "她说的第0句" in logs[0], f"{logs}")
+    check("跳过日志不再说「allow_self 没对这个会话开」",
+          logs and "没对这个会话开" not in logs[0], f"{logs}")
+    # 另一个会话各算各的
+    b4.feed(msg("c10", "小红", "另一句", at=9.0, is_self=True))
+    check("换个会话重新打一行", len(logs) == 2, f"{logs}")
+    # 过了 120 秒再打
+    clock4.now = 200.0
+    b4.feed(msg("c9", "老爸", "很久以后", at=200.0, is_self=True))
+    check("超过 120 秒再打一行", len(logs) == 3, f"{logs}")
+
     # 9) 多会话互不干扰
     #    这里用固定窗口（adaptive=False）：测的是"两个会话不是同一个桶"，
     #    不该被自适应的秒数变化牵着走。
     clock = Clock()
-    b = L.MessageBatcher(L.ListenPolicy(adaptive=False), clock=clock)
+    b = L.MessageBatcher(L.ListenPolicy(adaptive=False, batch_min_wait=0.0), clock=clock)
     b.feed(msg("c1", "小明", "A", at=0.0))
     b.feed(msg("c2", "小红", "B", at=0.0))
     clock.now = 1.5
@@ -199,7 +229,7 @@ def test_listen() -> None:
 
     # 10) 重复推送不重复入批（同样用固定窗口）
     clock = Clock()
-    b = L.MessageBatcher(L.ListenPolicy(adaptive=False), clock=clock)
+    b = L.MessageBatcher(L.ListenPolicy(adaptive=False, batch_min_wait=0.0), clock=clock)
     b.feed(msg("c1", "小明", "一", at=0.0, local_id=7))
     b.feed(msg("c1", "小明", "一", at=0.1, local_id=7))
     clock.now = 2.0
@@ -226,7 +256,7 @@ def test_transcript() -> None:
     section("时间线")
 
     clock = Clock()
-    b = L.MessageBatcher(L.ListenPolicy(adaptive=False), clock=clock)
+    b = L.MessageBatcher(L.ListenPolicy(adaptive=False, batch_min_wait=0.0), clock=clock)
     b.feed(msg("c1", "小明", "大肥鱼", at=0.0))
     b.feed(msg("c1", "小明", "你在不在", at=0.5))
     clock.now = 2.5
@@ -250,10 +280,13 @@ def test_adaptive() -> None:
     拿字数当完整度的代理，句尾标点微调。
     """
     section("自适应窗口")
-    pol = L.ListenPolicy()
+    # 这里测的是**算法本身**（字数/标点怎么调秒数），所以把
+    # batch_min_wait 关掉 —— 默认 6 秒的下限会把所有结果夹成 6.0，
+    # 相对关系就测不出来了。下限的行为另有专门用例。
+    pol = L.ListenPolicy(batch_min_wait=0.0)
 
-    check("【在吗】等最久（≈4.0）",
-          abs(L.adaptive_quiet("在吗", pol) - 4.0) < 0.01,
+    check(f"【在吗】等最久（≈{pol.quiet_max:.1f}）",
+          abs(L.adaptive_quiet("在吗", pol) - pol.quiet_max) < 0.01,
           f"{L.adaptive_quiet('在吗', pol)}")
 
     # 长消息：60 字以上直接到下限
@@ -279,7 +312,7 @@ def test_adaptive() -> None:
               pol.quiet_min - 1e-9 <= v <= pol.quiet_max + 1e-9, f"{v}")
 
     # 关掉自适应 → 退回固定值（老行为，可回退）
-    fixed = L.ListenPolicy(adaptive=False)
+    fixed = L.ListenPolicy(adaptive=False, batch_min_wait=0.0)
     check("adaptive=False 用 quiet_same_author",
           L.adaptive_quiet("在吗", fixed) == fixed.quiet_same_author,
           f"{L.adaptive_quiet('在吗', fixed)}")
@@ -291,6 +324,7 @@ def test_adaptive() -> None:
           str(L.visible_chars("   ")))
 
     # 端到端：对方断句三连，攒成一批
+    _q3 = L.adaptive_quiet("吃饭了没", L.ListenPolicy())
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "大肥鱼", at=0.0))
@@ -298,9 +332,9 @@ def test_adaptive() -> None:
     b.feed(msg("c1", "小明", "你在不在", at=1.0))
     clock.now = 2.0
     b.feed(msg("c1", "小明", "吃饭了没", at=2.0))
-    clock.now = 5.5
+    clock.now = 2.0 + _q3 - 0.5
     check("断句期间一直不封批", b.tick() == [], "sealed early")
-    clock.now = 6.0
+    clock.now = 2.0 + _q3
     out = b.tick()
     check("三句攒成一批（不再逐条回）",
           len(out) == 1 and len(out[0].messages) == 3, f"{out}")
@@ -314,33 +348,37 @@ def test_post_reply_grace() -> None:
     没有"她刚说完"这个上下文。
     """
     # 1) 她 0s 说完，对方 1s 继续说 → 等满 6s 冷却
+    _polg = L.ListenPolicy()
+    _qg = max(L.adaptive_quiet("那你说说", _polg), _polg.post_reply_grace - 1.0)
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "那你说说", at=1.0), replied_at=0.0)
-    clock.now = 4.0
-    check("冷却期内 4s 不封批", b.tick() == [], "sealed too early")
-    clock.now = 6.0
+    clock.now = 1.0 + _qg - 0.1
+    check(f"冷却期内 {_qg - 0.1:.1f}s 不封批", b.tick() == [], "sealed too early")
+    clock.now = 1.0 + _qg
     out = b.tick()
-    check("冷却 6s 到期封批", len(out) == 1, f"{out}")
+    check(f"冷却 {_qg:.1f}s 到期封批", len(out) == 1, f"{out}")
 
     # 2) 她 0s 说完，对方 5s 才说 → 冷却只剩 1s，但普通窗口（4s）更长，
     #    取两者较大值：宁可多等，也别在她刚说完就抢话
+    _qg2 = max(L.adaptive_quiet("那你说说", _polg), _polg.post_reply_grace - 5.0)
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "那你说说", at=5.0), replied_at=0.0)
-    clock.now = 8.9
+    clock.now = 5.0 + _qg2 - 0.1
     check("冷却叠加普通窗口（不提前封批）", b.tick() == [], "sealed early")
-    clock.now = 9.0
-    check("冷却叠加后 9s 封批", len(b.tick()) == 1, "did not seal")
+    clock.now = 5.0 + _qg2
+    check(f"冷却叠加后 {5.0 + _qg2:.1f}s 封批", len(b.tick()) == 1, "did not seal")
 
-    # 3) 距她说完已经 10s → 超过冷却，按普通窗口（短消息 4s）
+    # 3) 距她说完已经 10s → 超过冷却，按普通窗口（自适应上限）
+    _qg3 = L.adaptive_quiet("在吗", _polg)
     clock = Clock()
     b = L.MessageBatcher(clock=clock)
     b.feed(msg("c1", "小明", "在吗", at=10.0), replied_at=0.0)
-    clock.now = 12.0
+    clock.now = 10.0 + _qg3 - 0.1
     check("冷却过期后走普通窗口", b.tick() == [], "sealed too early")
-    clock.now = 14.0
-    check("普通窗口 4s 封批", len(b.tick()) == 1, "did not seal")
+    clock.now = 10.0 + _qg3
+    check(f"普通窗口 {_qg3:.1f}s 封批", len(b.tick()) == 1, "did not seal")
 
     # 4) 被 @ 时不加冷却（对方在叫你，别让人等）
     clock = Clock()
@@ -349,6 +387,105 @@ def test_post_reply_grace() -> None:
            replied_at=0.0)
     clock.now = 2.1
     check("@ 不套冷却（1s 就回）", len(b.tick()) == 1, "被冷却拖住了")
+
+
+def test_batch_judge() -> None:
+    """到点问一次模型：他说完了没有。
+
+    用户的原话：「底线限制，最短是 6 秒，然后超过 6 秒的时候，
+    需要模型判断是否对方可能还有下一句话没说完，如果有继续等待，
+    最久不能超过 30 秒」。这里把四条都钉住。
+    """
+    section("攒批判定（到点问模型）")
+
+    # 0) 不启用判定 = 老行为：到点就封
+    clock = Clock()
+    b = L.MessageBatcher(L.ListenPolicy(batch_min_wait=6.0), clock=clock)
+    b.feed(msg("c1", "小明", "在吗", at=0.0))
+    clock.now = 6.0
+    check("没启用判定时到点就封", len(b.tick()) == 1, "did not seal")
+    check("没启用判定时 due 为空", b.due() == [], f"{b.due()}")
+
+    # 1) 启用判定：到点先不封，报名等结论
+    clock = Clock()
+    b = L.MessageBatcher(L.ListenPolicy(batch_min_wait=6.0, judge_max_rounds=1),
+                         clock=clock, judge=True)
+    b.feed(msg("c1", "小明", "在吗", at=0.0))
+    clock.now = 5.9
+    check("未到点不报名", b.due() == [], f"{b.due()}")
+    clock.now = 6.0
+    check("到点不直接封", b.tick() == [], "sealed too early")
+    due = b.due()
+    check("到点报名判定", len(due) == 1 and due[0][0] == "c1", f"{due}")
+    check("同一会话不重复报名", b.due() == [], f"{b.due()}")
+    check("等判定期间 tick 也不封", b.tick() == [], "sealed while awaiting")
+
+    # 2) 判定「还有下一句」→ 再等 judge_extra
+    clock.now = 6.5
+    check("more=true 时不封", b.verdict("c1", True) is None, "sealed")
+    clock.now = 6.5 + 8.0 - 0.1
+    check("延长期间不封", b.tick() == [], "sealed early")
+    clock.now = 6.5 + 8.0
+    check("延长到期后封批", len(b.tick()) == 1, "did not seal")
+
+    # 3) 判定「说完了」→ 立刻封
+    clock = Clock()
+    b = L.MessageBatcher(L.ListenPolicy(batch_min_wait=6.0), clock=clock,
+                         judge=True)
+    b.feed(msg("c1", "小明", "在吗", at=0.0))
+    clock.now = 6.0
+    b.due()
+    out = b.verdict("c1", False)
+    check("more=false 立刻封", out is not None and len(out.messages) == 1, f"{out}")
+    check("封批理由 judged", out is not None and out.reason == "judged", f"{out}")
+
+    # 4) 硬上限：一直说「还有」也越不过 max_wait
+    clock = Clock()
+    pol = L.ListenPolicy(batch_min_wait=6.0, judge_extra=8.0,
+                         judge_max_rounds=9, max_wait=30.0)
+    b = L.MessageBatcher(pol, clock=clock, judge=True)
+    b.feed(msg("c1", "小明", "在吗", at=0.0))
+    for _t in (6.0, 14.0, 22.0):
+        clock.now = _t
+        b.due()
+        clock.now = _t + 0.5
+        b.verdict("c1", True)          # 一直说"还有"
+    clock.now = 29.9
+    check("没到 30 秒时还在等", b.tick() == [], "sealed early")
+    clock.now = 30.0
+    out = b.tick()
+    check("30 秒硬上限强制封批", len(out) == 1, f"{out}")
+    check("封批理由 max_wait",
+          out and out[0].reason == "max_wait", f"{out and out[0].reason}")
+
+    # 5) 判定期间对方又说话 → 旧结论作废，重新计时
+    clock = Clock()
+    b = L.MessageBatcher(L.ListenPolicy(batch_min_wait=6.0), clock=clock,
+                         judge=True)
+    b.feed(msg("c1", "小明", "在吗", at=0.0))
+    clock.now = 6.0
+    b.due()
+    clock.now = 6.2
+    b.feed(msg("c1", "小明", "问你个事", at=6.2))
+    check("旧判定回来被忽略", b.verdict("c1", False) is None, "stale verdict accepted")
+    check("两条都还在批里", b.pending().get("c1") == 2, f"{b.pending()}")
+    clock.now = 12.1
+    check("按新消息重新计时", b.tick() == [], "sealed on old deadline")
+
+    # 6) 最短等待对长消息也生效（用户要的是「底线 6 秒」）
+    pol = L.ListenPolicy(batch_min_wait=6.0)
+    long_text = ("我今天去长坂坡了，看到了樱花，还看到了枣树，"
+                 "回来的路上碰到了老王他家的狗，它一直冲我叫。" * 2)
+    check("长消息也至少等 6 秒",
+          abs(L.adaptive_quiet(long_text, pol) - 6.0) < 0.01,
+          f"{L.adaptive_quiet(long_text, pol)}")
+    pol_off = L.ListenPolicy(batch_min_wait=0.0)
+    check("下限设 0 时长消息回到 1.5 秒",
+          abs(L.adaptive_quiet(long_text, pol_off) - 1.5) < 0.01,
+          f"{L.adaptive_quiet(long_text, pol_off)}")
+    check("下限调大能超过自适应上限",
+          abs(L.adaptive_quiet("在吗", L.ListenPolicy(batch_min_wait=10.0)) - 10.0) < 0.01,
+          f"{L.adaptive_quiet('在吗', L.ListenPolicy(batch_min_wait=10.0))}")
 
 
 def main() -> int:
@@ -360,6 +497,7 @@ def main() -> int:
     test_adaptive()
     test_transcript()
     test_post_reply_grace()
+    test_batch_judge()
 
     print("\n" + "=" * 66)
     if FAIL:

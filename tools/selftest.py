@@ -442,6 +442,9 @@ item("发送收尾", lambda: _run_unit("selftest_send_tail.py"))
 # 以前 set_watching 只改内存 + 存盘，watcher._chats 不动 ——
 # 用户加了监控，对方说话没反应，日志里连一行 [收] 都没有。
 item("监听热更新", lambda: _run_unit("selftest_watch_hot.py"))
+# 攒批判定：到点问模型「他说完了吗」。判定失败必须倒向「说完了」，
+# 否则一次网络抖动就能把回复拖到 30 秒上限。
+item("攒批判定", lambda: _run_unit("selftest_listen_judge.py"))
 # 每轮观测：data/turns.jsonl 的格式、裁剪、静默失败。
 # 排查"她为什么慢"只能靠它 —— 日志是给人读的，这个是给脚本读的。
 item("每轮观测", lambda: _run_unit("selftest_turns.py"))

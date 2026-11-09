@@ -1729,8 +1729,9 @@ def _search_chunks_impl(path: str, bank: str, query: str, *, limit: int = 8,
             out.append(c)
             used += len(c["text"])
         # 记一次命中（只记真的进了返回集的那几条）
+        # ⚠ 传 path 而不是 conn：检索用的是只读连接，写不进 chunk_hits。
         try:
-            _bump_chunk_hits(conn, [c["chunk"] for c in out])
+            _bump_chunk_hits(path, [c["chunk"] for c in out])
         except Exception:
             pass
         return out[:limit]
@@ -1824,29 +1825,42 @@ def search_with_fallback(path: str, bank: str, query: str, *,
         return [], "empty"
 
 
-def _bump_chunk_hits(conn: sqlite3.Connection, chunk_ids: Sequence[int]) -> None:
+def _bump_chunk_hits(path: str, chunk_ids: Sequence[int]) -> None:
     """给一批片段记一次命中。
 
     ⚠ 只记**真正进入了返回结果**的片段，不记候选池。
       记候选会让"被搜到过"和"被用上过"混为一谈 —— 而这两件事的区别，
       正是这套权重存在的理由。
+
+    ⚠ 必须**另开一个写连接**。检索走的是 `mode=ro`（见 `_search_chunks_impl`
+      开头的 connect(read_only=True)），在只读连接上 INSERT 会抛
+      `attempt to write a readonly database`，被 except 吞掉 ——
+      于是 `chunk_hits` 永远是空表，"以前帮上过忙"的加权从 0.10 起就恒不生效。
+      2026-11-08 用 `.tmp/probe_chunk_hits.py` 实证过：跑两次检索，表里 0 行。
+
+    写失败一律静默：记忆排序微调不该让这一轮检索失败。
     """
     ids = [int(c) for c in chunk_ids if str(c).strip()]
     if not ids:
         return
     now = _now_ms()
-    for cid in ids:
-        try:
+    conn = None
+    try:
+        conn = connect(path)          # 写连接（不带 read_only）
+        for cid in ids:
             conn.execute(
                 "INSERT INTO chunk_hits(chunk,hits,last_hit) VALUES(?,1,?) "
                 "ON CONFLICT(chunk) DO UPDATE SET hits=hits+1, last_hit=excluded.last_hit",
                 (cid, now))
-        except Exception:
-            pass
-    try:
         conn.commit()
     except Exception:
         pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def render_recall(items: List[Dict[str, Any]]) -> str:

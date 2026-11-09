@@ -760,6 +760,10 @@ class EngineWorker(QThread):
         self.owner_id = ""          # 主人在记忆库里的 owner 键
         #: chat_id -> [时间戳]，表情包冷却用
         self._sticker_sent: dict = {}
+        #: chat_id -> [(时刻, 这一轮发了几条)]，**跨轮条数配额**用。
+        #: 只放内存：进程重启清零（和账本 D-9 同一个理由 ——
+        #: 残留的旧计数会让重启后第一句话莫名变短）。
+        self._sent_parts: dict = {}
         #: 她的生活状态（bigfish/life.py）。None = 还没加载。
         #: 只在引擎线程里读写，不跨线程共享。
         self._life = None
@@ -892,8 +896,72 @@ class EngineWorker(QThread):
         except Exception:
             return "after"
 
+    # ── 跨轮条数配额（0.11.1）──
+    def _note_sent_parts(self, chat_id: str, n: int) -> None:
+        """记下「这个会话刚刚发出去几条」。给下一轮的表达预算用。
+
+        为什么需要：单轮看每轮都合理，连起来就是刷屏 ——
+        用户实测「我连发两条，她第一轮 3 条、第二轮又 3 条 = 一次 6 条」。
+        """
+        try:
+            now = time.time()
+            span = self._sent_parts.setdefault(str(chat_id), [])
+            span.append((now, max(1, int(n or 1))))
+            span[:] = [t for t in span if now - t[0] < 300.0]
+        except Exception:
+            pass
+
+    def _recent_sent_parts(self, chat_id: str, window: float = 90.0):
+        """最近 window 秒内：这个会话发了几条、回了几轮。"""
+        try:
+            now = time.time()
+            span = [t for t in self._sent_parts.get(str(chat_id), [])
+                    if now - t[0] < window]
+            return sum(n for _t, n in span), len(span)
+        except Exception:
+            return 0, 0
+
+    def _listen_policy(self):
+        """把「说法」面板上的攒批参数翻成 ListenPolicy。
+
+        为什么住在说法插件里：这几项决定「她什么时候开始想」，
+        属于「怎么说话」的一部分，和分条、节奏是同一类东西。
+
+        读不到就整份用默认 —— 攒批不该因为配置坏了而停摆。
+        """
+        from bigfish import listen as _L
+
+        cfg = {}
+        try:
+            from bigfish import plugins as _P
+
+            _P.ensure_loaded()
+            cfg = _P.config_of("say") if _P.is_enabled("say") else {}
+        except Exception:
+            cfg = {}
+
+        def _num(key, default, lo, hi):
+            try:
+                v = float(cfg.get(key, default))
+            except (TypeError, ValueError):
+                v = float(default)
+            return max(lo, min(hi, v))
+
+        min_wait = _num("batch_min_wait", 6.0, 0.5, 20.0)
+        cap = _num("batch_max_wait", 30.0, 6.0, 120.0)
+        # 硬上限必须比最短等待长，否则「至少等 6 秒」和「最多等 5 秒」自相矛盾
+        cap = max(cap, min_wait + 1.0)
+        return _L.ListenPolicy(
+            batch_min_wait=min_wait,
+            judge_enabled=bool(cfg.get("batch_judge", True)),
+            judge_extra=_num("batch_judge_extra", 8.0, 1.0, 20.0),
+            judge_max_rounds=int(_num("batch_judge_rounds", 3, 0, 10)),
+            judge_timeout=_num("batch_judge_timeout", 6.0, 1.0, 30.0),
+            max_wait=cap,
+        )
+
     def _pick_sticker(self, msg, body: str, reply: str,
-                      mood=None) -> str:
+                      mood=None, mark: str = "") -> str:
         """决定这一轮要不要跟一张表情包，返回文件路径（空串 = 不发）。
 
         三层判断，任何一层否决就安静地不发：
@@ -917,6 +985,16 @@ class EngineWorker(QThread):
             return "", "after"
         cfg = _plugins.config_of("sticker")
 
+        # ---- 模型自己表态 ----
+        #
+        # 以前「要不要发」只有掷骰子：模型想配图也表达不了（D-78 的尾巴）。
+        # 现在它可以在正文里写标记，系统照它的意思办：
+        #   [[text]]    → 这一轮明确不配图（比冷却、概率都优先）
+        #   [[sticker]] → 跳过概率，但**仍受冷却** —— 每句都配图就是刷屏
+        if mark == "text":
+            return "", "after"
+        forced = mark == "sticker"
+
         # ---- 被明确要求时，跳过冷却和概率 ----
         #
         # 以前这里只有「冷却 + 15% 概率」，**完全不看用户说了什么**。
@@ -933,17 +1011,20 @@ class EngineWorker(QThread):
                 return "", "after"
 
             # ---- 概率 ----
-            try:
-                rate = float(cfg.get("rate", 0.15))
-            except (TypeError, ValueError):
-                rate = 0.15
-            rate = max(0.0, min(1.0, rate))
-            if rate <= 0:
-                return "", "after"
-            import random
+            # 模型自己点了 [[sticker]] 就不掷骰子：它看过这句话，
+            # 比一个固定概率更知道该不该配图。冷却上面已经拦过了。
+            if not forced:
+                try:
+                    rate = float(cfg.get("rate", 0.15))
+                except (TypeError, ValueError):
+                    rate = 0.15
+                rate = max(0.0, min(1.0, rate))
+                if rate <= 0:
+                    return "", "after"
+                import random
 
-            if random.random() > rate:
-                return "", "after"
+                if random.random() > rate:
+                    return "", "after"
 
         # ---- 插件选择 ----
         path, position = "", "after"
@@ -1029,10 +1110,14 @@ class EngineWorker(QThread):
         if _addr and _peer and _peer != _addr:
             _persona_text = _persona_text.replace(
                 f"称呼对方「{_addr}」", f"称呼对方「{_peer}」")
-        _sections = [(860, _persona_text)]
+        # ⚠ 三段都带**段名**。快照面板要靠它回答「哪一段吃掉了预算」——
+        #   以前这里只存 (座位, 正文)，写快照时标题被填成空串，
+        #   于是「她这轮看到了什么」只能看到一个总字数。
+        _sections = [(860, "人格", _persona_text)]
         if ctx.mood and ctx.mood.injected_text.strip():
-            _sections.append((900, "\n## 这会儿的状态\n\n"
-                                   + ctx.mood.injected_text.strip()))
+            _sections.append((900, "这会儿的状态",
+                              "\n## 这会儿的状态\n\n"
+                              + ctx.mood.injected_text.strip()))
 
         # ── 此刻的表达预算（p0-2）──
         #
@@ -1053,9 +1138,19 @@ class EngineWorker(QThread):
             _mood_dims = getattr(ctx.mood, "dims", None) if ctx.mood else None
             _energy = (getattr(self._life, "energy", None)
                        if self._life is not None else None)
+            # 跨轮配额：最近 90 秒她已经说了几条、回了几轮。
+            # 用户实测过「连发两条 → 6 条」的场景，单轮预算看不出来，
+            # 必须把"刚说过话"喂进预算里。
+            # 用 getattr：老 entry / 测试替身没有这个方法时按 0 算，
+            # 不要让一条配额把整段预算打进 except。
+            _rp_fn = getattr(self, "_recent_sent_parts", None)
+            _recent_parts, _recent_replies = (
+                _rp_fn(chat_id) if callable(_rp_fn) else (0, 0))
             _turn_policy = _policy.response_policy(
                 mood=_mood_v, dims=_mood_dims, energy=_energy,
-                now=time.time())
+                now=time.time(),
+                recent_parts=_recent_parts,
+                recent_replies=_recent_replies)
 
             from bigfish import afterglow as _afterglow
 
@@ -1074,7 +1169,8 @@ class EngineWorker(QThread):
                 _bits = [b for b in _bits if b]
                 if _bits:
                     _sections.append(
-                        (905, "\n## 这一轮的说话方式\n\n" + "\n".join(_bits)))
+                        (905, "这一轮的说话方式",
+                         "\n## 这一轮的说话方式\n\n" + "\n".join(_bits)))
             except Exception:
                 pass
 
@@ -1094,13 +1190,13 @@ class EngineWorker(QThread):
                 "life": self._life,
                 "tier": "owner" if (owner_raw and is_owner_chat) else "known",
             }):
-                _sections.append((_order, _text))
+                _sections.append((_order, _title or "", _text))
         except Exception as _exc:
             # 插件系统坏了不该让她失语
             self._log(f"[插件] 注入失败：{_exc}", "err")
 
         _sections.sort(key=lambda item: item[0])
-        sys_parts = [text for _o, text in _sections]
+        sys_parts = [text for _o, _t, text in _sections]
 
         user_parts = []
 
@@ -1875,6 +1971,16 @@ class EngineWorker(QThread):
           它不碰 Qt 对象，只做 HTTP + 写文件，跑完就退。
           需要往界面吐日志时通过 _log（signal，跨线程安全）。
         """
+        # 心情页的「自动判断」关掉后，这里就不再跟着对话动 ——
+        # 心情只会按半衰期回落。以前这个开关没人读，关了照样每轮烧一次模型。
+        try:
+            from bigfish import vault as _vault_mj
+
+            if _vault_mj.read_mood_config().get("autoJudge") is False:
+                return
+        except Exception:
+            pass
+
         import threading
 
         self_name = getattr(self.soul, "name", "") or ""
@@ -2534,7 +2640,9 @@ class EngineWorker(QThread):
             except Exception:
                 pass
 
-            self._log(f"[收] {msg.chat_name}：{msg.preview(50)}", "in")
+            # 日志不在这里打 —— 即时那行已经由 enqueue() 在消息到手的瞬间
+            # 发过了。这里再打一次等于同一句话在日志里出现两遍，
+            # 而中间那 2 秒的空窗正是用户抱怨「卡一会」的来源。
             self.chat_event.emit(msg.chat_name, msg.preview(60), "in")
 
             # 昵称跟着微信走：wxid 是稳定的，昵称/备注会改。
@@ -2655,7 +2763,14 @@ class EngineWorker(QThread):
             _origin = _turn["origin"]
             _group_owner = _turn["group_owner"]
             try:
-                _trace_sections = [(int(o), "", len(t)) for o, t in _sections]
+                # (座位, 段名, 字数)。旧格式是二元组，两种都认。
+                _trace_sections = []
+                for _it in _sections:
+                    if len(_it) >= 3:
+                        _o, _n, _t = _it[0], _it[1], _it[2]
+                    else:
+                        _o, _n, _t = _it[0], "", _it[1]
+                    _trace_sections.append((int(_o), str(_n or ""), len(_t)))
             except Exception:
                 _trace_sections = []
             try:
@@ -2766,6 +2881,18 @@ class EngineWorker(QThread):
             # 绝不能出现在对方收到的文字里。但判定层要看到原始标记，
             # 所以先留一份 raw，再清正文。
             _voice_reply = reply
+            # 表情标记也在**原始** reply 上读（和语音标记同一处）：
+            #   [[sticker]] 要配图 / [[text]] 不配图。
+            # 读完立刻被 strip_tags 清掉，绝不发给对方。
+            _sticker_mark = ""
+            try:
+                _low = (reply or "").lower()
+                if "[[sticker]]" in _low:
+                    _sticker_mark = "sticker"
+                elif "[[text]]" in _low:
+                    _sticker_mark = "text"
+            except Exception:
+                pass
             try:
                 from bigfish.voice_policy import strip_tags as _strip_voice_tags
 
@@ -2803,7 +2930,8 @@ class EngineWorker(QThread):
                     try:
                         with _sticker_lock:
                             sticker_path, _pos = self._pick_sticker(
-                                msg, body, reply, mood=_sticker_mood)
+                                msg, body, reply, mood=_sticker_mood,
+                                mark=_sticker_mark)
                     except Exception as exc:
                         self._log(f"[表情] 挑选失败：{exc}", "err")
                     _cost = time.time() - _t_pick
@@ -3015,6 +3143,11 @@ class EngineWorker(QThread):
                                 f"判定她在自问自答，该会话静音 {int(guard.mute)}s。"
                                 f"检查 allow_self 与回环识别。", "err")
 
+                        # 记下这一轮发了几条 —— 下一轮的跨轮配额要用。
+                        # 语音只发一条，不能按文字分段数算。
+                        _n_sent = (1 if (_voice_only and _voice_sent)
+                                   else len([p for p in (parts or [reply]) if p]))
+                        self._note_sent_parts(msg.chat_id, _n_sent)
                         self.stats.emit(self.recv_count, self.reply_count)
                         # 用分段后的样子记：{{split}} 留在正文里看不懂，
                         # 而且用户想核对"她到底发了几条、每条什么"。
@@ -3164,9 +3297,12 @@ class EngineWorker(QThread):
         from bigfish.watcher import Incoming
 
         batcher = L.MessageBatcher(
-            L.ListenPolicy(),
+            self._listen_policy(),
             allow_self_for=lambda chat: bool(scope_of("allow_self", chat)),
             on_log=self._log,
+            # 启用「到点问一次模型」：判定由 _judge_one 在后台线程跑，
+            # 攒批器本身不开 HTTP。见 docs/接话与补一句.md 的「攒批判定」。
+            judge=True,
         )
 
         # ── 并发：生成并行，投递串行 ──
@@ -3231,7 +3367,23 @@ class EngineWorker(QThread):
 
             ⚠ 这里绝对不许调模型。一旦阻塞，watcher 的轮询就被按住，
               对方接着发的话读不到 —— 那正是这次要修的东西。
+
+            ⚠ 「收到了」必须**在这里**打，不能留到 handle()。
+              以前那行 `[收]` 在 handle 里，也就是要等轮询(≤1.2s) + 攒批(2s)
+              之后才出现；用户看到的是「有人发消息，程序卡一会才收到」。
+              消息其实早就在手里了，只是没告诉他。现在到手机就报。
             """
+            try:
+                # 只报**对方**的消息。她自己发的也会被 watcher 读回来
+                # （发送确认 + 防自环要读），但那不是"收到" ——
+                # 以前这里不看 is_self，于是日志里会出现
+                # 「[收] 老爸：那你今天干点啥了」，其实那是她刚说的话。
+                # 自己的消息由 [发] 覆盖，读回由倾听层的 [跳过] 兜底说明。
+                if not getattr(msg, "is_self", False):
+                    self._log(
+                        f"[收] {msg.chat_name or ''}：{msg.preview(50)}", "in")
+            except Exception:
+                pass
             try:
                 batcher.feed(L.BatchMessage(
                     chat_id=msg.chat_id,
@@ -3309,21 +3461,78 @@ class EngineWorker(QThread):
                 self._log("[并发] 生成队列已满（64），丢弃这一批 —— "
                           "她在前面的会话里还没想完", "err")
 
+        # ── 攒批判定（0.11.1）──
+        #
+        # 安静窗口到点后先问一次模型「他说完了吗」：
+        #   more=true  → 再等 judge_extra 秒（最多 judge_max_rounds 次）
+        #   more=false → 立刻封批
+        # 一次请求 0.5~2 秒，必须离开 tick 线程，否则别的会话会被按住。
+        # 并发限 2：同一会话不会重复判（batcher 的 awaiting 挡着），
+        # 限并发是为了别为几个会话同时打爆模型额度。
+        from concurrent.futures import ThreadPoolExecutor
+
+        _judge_pool = ThreadPoolExecutor(max_workers=2,
+                                         thread_name_prefix="bigfish-judge")
+
+        def _judge_one(chat_id: str, msgs: list) -> None:
+            """问模型「他还有下一句吗」，然后把结论交回攒批器。"""
+            more, why = False, ""
+            try:
+                from bigfish import listen_judge as _LJ
+
+                last = msgs[-1] if msgs else None
+                more, why = _LJ.judge_more(
+                    [{"text": m.text} for m in msgs],
+                    peer=((getattr(last, "author", "") or
+                           getattr(last, "chat_name", "") or "对方")
+                          if last else "对方"),
+                    self_name=getattr(self.soul, "name", "") or "",
+                    timeout=float(batcher.policy.judge_timeout),
+                )
+                if why:
+                    self._log("[倾听] 判定："
+                              + ("他还有下一句" if more else "说完了")
+                              + f"（{why}）", "think")
+            except Exception as exc:          # noqa: BLE001
+                # 判定失败一律按"说完了"走：宁可早回一句，也不让人干等
+                self._log(f"[倾听] 判定失败（按说完了处理）：{exc}", "err")
+                more = False
+            try:
+                _b = batcher.verdict(chat_id, more)
+                if _b is not None:
+                    handle_batch(_b)
+            except Exception as exc:          # noqa: BLE001
+                self._log(f"[倾听] 判定收尾异常：{exc}", "err")
+
+        _pol_at = 0.0
+
         def _batch_loop() -> None:
-            """每 200ms 看一眼有没有该封的批。
+            """每 200ms 看一眼有没有该封的批、该判定的批。
 
             为什么不复用主循环那个 `msleep(300)`：主循环管的是主动开口和
             生活状态（5 秒一次就够），而封批精度直接决定「她等多久」。
-            200ms 的误差对 1.5~4 秒的窗口来说可以忽略。
+            200ms 的误差对 6 秒的窗口来说可以忽略。
             """
+            nonlocal _pol_at
             while not self._stop:
                 time.sleep(0.2)
                 try:
+                    # 面板改完 5 秒内生效。读 plugins.json 有磁盘 IO，
+                    # 不该每 200ms 来一次。
+                    if time.time() - _pol_at >= 5.0:
+                        _pol_at = time.time()
+                        batcher.set_policy(self._listen_policy())
                     for _b in batcher.tick():
                         handle_batch(_b)
+                    for _cid, _msgs in batcher.due():
+                        _judge_pool.submit(_judge_one, _cid, _msgs)
                 except Exception as exc:
                     self._log(f"[倾听] 封批异常：{exc}", "err")
             # 退出前把没封的批次冲掉 —— 不然对方最后那几句永远等不到回
+            try:
+                _judge_pool.shutdown(wait=False)
+            except Exception:
+                pass
             try:
                 for _b in batcher.flush_all():
                     handle_batch(_b)
@@ -3455,6 +3664,12 @@ class Backend(QObject):
         self.last_error = ""
         self.recv_count = 0
         self.reply_count = 0
+        #: 账号标识（`wxid_*` / 数据目录名）。**唯一键** ——
+        #: 作用域解析、配置里的 accounts、启动引擎都用它。
+        self.account_id = ""
+        #: 展示用昵称。昵称会改、会重名，所以**绝不能拿它当键**。
+        self.account_nick = ""
+        #: 兼容旧调用方的展示名 = 昵称优先，没有昵称就用 id。
         self.account = ""
         self._reader = None
         # 日志缓冲：信号可能因为界面还没连上而丢失，
@@ -3624,7 +3839,12 @@ class Backend(QObject):
                 }, ensure_ascii=False)
 
             info = r.self_info()
-            self.account = info.get("nick_name") or acc
+            # 标识与展示名分开存：acc 是目录名/wxid（唯一键），昵称只用来显示。
+            # 以前一个字段轮流存两种东西，于是 `_scope_ctx` 拿昵称当 bot_id
+            # 去查 config.accounts（键是目录名）—— 查不到就落回全局层。
+            self.account_id = acc
+            self.account_nick = str(info.get("nick_name") or "")
+            self.account = self.account_nick or acc
             self._reader = r
             cost = time.time() - t0
 
@@ -3632,7 +3852,7 @@ class Backend(QObject):
             c = load_json_config()
             ar = c.setdefault("auto_reply", {})
             ar["account"] = acc
-            c.setdefault("accounts", {})[acc] = self.account
+            c.setdefault("accounts", {})[acc] = self.account_nick or acc
 
             # 每个微信号各存一份监听列表。
             # 理由：不同号关注的会话完全不同（工作号 vs 私人号），
@@ -3648,7 +3868,7 @@ class Backend(QObject):
             return json.dumps({
                 "ok": True,
                 "account": acc,
-                "nick": self.account,
+                "nick": self.account_nick or acc,
                 "nickSource": info.get("nick_source", ""),
                 "wxid": getattr(r._db, "wxid", ""),
                 "chats": restored,
@@ -3704,7 +3924,14 @@ class Backend(QObject):
         # 直接从数据目录名推导（wxid_xxx_abcd → 只在必要时打开数据库读昵称），
         # 避免每 2 秒轮询都去解锁数据库。
         if not self.account:
-            self.account = self._peek_account()
+            _peek = self._peek_account()
+            self.account = _peek
+            # _peek_account 优先给昵称，拿不到才给 wxid —— 两种要落到对应字段，
+            # 否则 id 会一直是空的，作用域兜底又回到昵称当键的老问题。
+            if _peek.startswith("wxid_"):
+                self.account_id = self.account_id or _peek
+            elif _peek:
+                self.account_nick = self.account_nick or _peek
 
         diag = self._diagnose_items()
         # 发送通道没就绪时，每 20 秒在后台补试一次。
@@ -3737,7 +3964,9 @@ class Backend(QObject):
             "recv": self.recv_count,
             "reply": self.reply_count,
             "watching": len(self.watching),
+            # account 是展示名（昵称优先）；accountId 才是唯一键。
             "account": self.account,
+            "accountId": self.account_id,
             "diagnose": diag,
             # 提权与否启动时就定了，每 2 秒重算纯属浪费
             "admin": _is_admin_cached(self),
@@ -3878,7 +4107,13 @@ class Backend(QObject):
     def list_chats(self, limit: int) -> str:
         try:
             reader = self._reader_or_open()
-            self.account = reader._db.account
+            # 这里拿到的是目录名/wxid —— 是**标识**，不是昵称。
+            # 以前直接写进 self.account，于是同一个字段一会儿是昵称、
+            # 一会儿是目录名，谁拿它当键谁踩坑。
+            self.account_id = str(getattr(reader._db, "account", "") or "") \
+                or self.account_id
+            if not self.account:
+                self.account = self.account_id
             rows = reader.sessions(limit=limit)
             out = []
             for s in rows:
@@ -3970,7 +4205,10 @@ class Backend(QObject):
         from bigfish import scopes as _scopes
 
         cfg = load_json_config()
-        bot = str((cfg.get("auto_reply") or {}).get("account") or "") or self.account
+        # bot_id 必须是**唯一键**（目录名/wxid）—— config.accounts 的键就是它。
+        # 以前兜底用 self.account，而那个字段可能是昵称，查不到就落回全局层。
+        bot = (str((cfg.get("auto_reply") or {}).get("account") or "")
+               or self.account_id or self.account)
         resolver = None
         if self._reader is not None:
             try:
@@ -5819,6 +6057,25 @@ class Backend(QObject):
                               ensure_ascii=False)
 
     @Slot(str, result=str)
+    def prompt_trace_sections(self, path: str) -> str:
+        """一份快照的段落表：每段座位 / 段名 / 字数。
+
+        界面用它画「字数花在哪」—— 只有总字数的时候，
+        看到 system 8000 字也不知道是哪一段涨的。
+        """
+        try:
+            from bigfish import prompt_trace as T
+
+            if not path or not os.path.isfile(path):
+                return json.dumps({"ok": False, "error": "文件不在了",
+                                   "sections": []}, ensure_ascii=False)
+            return json.dumps({"ok": True, "sections": T.sections_of(path)},
+                              ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc),
+                               "sections": []}, ensure_ascii=False)
+
+    @Slot(str, result=str)
     def prompt_trace_open(self, path: str) -> str:
         """打开一份快照；传空串打开目录。"""
         try:
@@ -5946,8 +6203,11 @@ class Backend(QObject):
             if query:
                 cmd += ["--query", query]
 
+            # 同样要 CREATE_NO_WINDOW：GUI 进程没有控制台，不加就会闪黑框
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=25)
+                               encoding="utf-8", errors="replace", timeout=25,
+                               creationflags=getattr(subprocess,
+                                                      "CREATE_NO_WINDOW", 0))
             raw = (r.stdout or "").strip()
             if not raw:
                 return _json.dumps({"error": "桥接无输出"},

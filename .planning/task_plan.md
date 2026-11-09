@@ -452,3 +452,161 @@ exe 自检 16/17（UIA 需管理员）。
 
 - 提交前保留工作区改动；发布失败不强制推送。
 - 若 Release 附件误含敏感文件，立即删除附件与 Release，再修脚本重发。
+
+---
+
+## v0.11.1：核实后要修的 6 条（**已完成，未发布**）
+
+> 2026-11-08 23:xx。上一轮口头列的 9 条，逐条回代码核实：
+> **6 条仍在、1 条已实测（只是文档过时）、2 条不成立**
+> （详见 [findings.md](findings.md) 的「9 条候选问题核实」）。
+> 用户选定修 6 条，语音气泡那条只改文档。
+>
+> **本节六条已全部落地**，版本 0.11.1，逐条改法与验证见
+> [progress.md](progress.md) 与 `CHANGELOG.md` 的 0.11.1 段。
+> 2026-11-09 已打包验证并推送到 `main`（**未打 tag、未发 Release**）。
+
+### P0-1 · `chunk_hits` 命中加权恒不生效
+
+- **根因**：`memory.py:1659` 检索走 `connect(read_only=True)`（`mode=ro`），
+  末尾 `_bump_chunk_hits`（1827）在**同一个只读连接**上 INSERT，
+  报 `attempt to write a readonly database`，被 1844 的 `except: pass` 吞。
+- **实证**：`.tmp/probe_chunk_hits.py` —— 复制真实库跑两次检索，`chunk_hits` 仍 0 行。
+- **改法**：把「记命中」从只读连接里摘出来 —— 检索函数只负责返回结果，
+  由调用方（或 `_search_chunks_impl` 末尾另开一次短写连接）批量 upsert。
+  写法上要保证：写失败不影响检索返回值（现状已经是这样）。
+- **风险**：低。每次检索多一次短写连接（WAL 下 ~1ms），失败静默。
+- **测试**：`selftest_memory` 加一条「检索两次 → chunk_hits 涨到 2」。
+
+### P1-2 · 快照面板看不出哪段吃了预算
+
+- **根因**：`desktop.py:2658` 写盘时标题被置空（`(int(o), "", len(t))`），
+  UI 只拼 `user_chars`（`app.js:3022`）。
+- **改法**：`_sections` 本来带 `(order, title, text)`，标题原样传下去；
+  UI 在快照卡片里按 order 列出「段名 / 字数 / 占比」。
+- **风险**：低（纯展示）。注意 `sections` 字段的旧快照兼容（标题可能为空串）。
+
+### P1-3 · 设置页改完不保存就切页会丢
+
+- **根因**：`go()`（`app.js:61`）直接切页；声音页 / 模型页都是显式「保存」按钮，
+  切页时 `loadVoice()` 重填 DOM。`dirty` 只做在监听列表与会话作用域两处。
+- **改法**：给每个有草稿的页加 `isDirty()`，`go()` 前统一拦一道：
+  有改动就 `confirm('有未保存的修改，先保存吗？')` → 保存 / 放弃 / 留下。
+- **风险**：中（碰所有页的切换路径）。要保证「插件关着自动跳回插件页」那条不受影响。
+
+### P2-4 · 心情页 5 个旋钮是假旋钮
+
+- **现状**：`injectConfidence` / `sigMood` / `sigDim` / `injectMode` / `autoJudge`
+  只在 `vault.py` 定义与归一化，零行为读取；`injectMode` 仅被自检 assert。
+- **两条路**：
+  - **(a) 接上**：`autoJudge` → `_judge_mood_async` 的闸门；
+    `injectMode` → 注入层的 off / label / event 三档。
+    `sigMood` / `sigDim` 需要先定义「显著度」算法（当前没有），成本高。
+  - **(b) 删掉**：UI 移除 5 个控件、`vault` 保留键以兼容旧配置。
+- **建议**：先做 (a) 的两个（有明确语义），`sigMood` / `sigDim` 要么定义算法要么删控件。
+
+### P2-5 · 表情「要不要发」仍是掷骰子
+
+- **根因**：`_pick_sticker`（`desktop.py:935`）只有 `random.random() > rate`；
+  模型无法表达「这句该配张图」。
+- **改法**：照语音的路子给标记 —— 模型输出 `[[sticker]]` / `[[text]]`，
+  说法层保护标记不被当正文发出去，`_pick_sticker` 优先认标记，掷骰只作兜底。
+- **风险**：中（跨 `replier` / `say` / `desktop` 三处，标记要和 `{{split}}` 一样
+  在进记忆库前清掉）。
+
+### P3-6 · `Backend.account` 一个字段存两种东西
+
+- **现状**：`3627` 存昵称；`3707` `_peek_account()` 可能是 `wxid_*` 目录名；
+  `3881` 存 `reader._db.account`。又被 `get_status` 当展示名（3740）、
+  被 `_scope_ctx` 当 `bot_id` 兜底（3973）。
+- **改法**：拆成 `self.account_id`（目录名 / wxid，唯一键）与
+  `self.account_nick`（展示名），`bot_id` 只用前者。
+- **风险**：中低，但 `config.accounts` 的键是目录名，迁移时不能把昵称写进去。
+
+### P3-7 · 语音气泡：**已实测，只需改文档**
+
+- **事实**：真机已跑通，并修了 3 个只有真机才暴露的 bug（`CHANGELOG.md` 0.11.0「修复」段）：
+  ① 语音成功后 `name 'hist' is not defined`；② 语音与文字前台行为不一致 →
+  `force_show_wechat` + `open_chat`；③ 主动置前 + 气泡失败分级回退。
+  本机驱动也已装好（`CABLE In 16 Ch` / `CABLE Output`）。
+- **要做的**：只改两句过时表述 ——
+  `docs/声音.md:174`「当前机器没装 VB-CABLE」、
+  `CHANGELOG.md:39`「仍需在装有 VB-CABLE 的机器上实测」。
+- **代码不用动。**
+
+### 已不成立的两条（不用再查）
+
+- `set_data_root` 运行中不重启 —— 数据根每轮现查 `settings.json`（`vault.py:98`
+  无缓存），改完下一轮生效；残留只有内存里的 soul / life / 心情对象不重载。
+- `tools/setup-git-token.py` 不存在 —— 误报，文件在。
+
+---
+
+## v0.11.1 完成情况（2026-11-08 23:xx）
+
+| 条 | 改法 | 验证 |
+|---|---|---|
+| ① `chunk_hits` 加权 | `_bump_chunk_hits(path, ids)`：另开短写连接，不再复用只读 conn | `selftest_memory` 新增 6 项（含「没命中就不记」）；实证脚本跑两次检索，`hits` 涨到 2 |
+| ② 心情五个旋钮 | `apply_mood_delta` 里新增「2.5 注入文本」：`injectMode` off/label/event + `injectConfidence` 门槛 + `sigMood`/`sigDim` 阈值 + `injectPerDay` 当日额度；`autoJudge` 进 `_judge_mood_async` 闸门；顺手修掉 `injectPerDay=0` 被 `or 6` 吞掉的 bug | 新增 `tools/selftest_mood.py` 19/19 |
+| ③ 快照按段展开 | `_sections` 改三元组 `(order, title, text)`（desktop + app 两个入口）；`prompt_trace.sections_of()` + 新槽 `prompt_trace_sections`；UI 画段名/字数/占比 | `selftest_trace` 新增 2 项，23/23 |
+| ④ 设置页 dirty | `markDirty` 用「用户动过」判据（程序回填不触发 input/change），`go()` 前 confirm，保存成功 `markClean` | 语法检查通过；真机待看 |
+| ⑤ `account` 混存 | 拆 `account_id` / `account_nick`，`bot_id` 只用 id；`get_status` 多给 `accountId` | 编译 + 端到端自检通过 |
+| ⑥ 表情手柄 | `[[sticker]]` 跳概率仍受冷却、`[[text]]` 不配图；`strip_tags` 统一清标记；说法插件提示词加两行 | `selftest_sticker` 新增 3 项（假 self 直调 `_pick_sticker`），77/77；`selftest_voice` 新增 6 项标记清理 |
+
+### 还差什么
+
+- **没提交、没打包、没发版**。版本号已升 0.11.1（`__init__.py` + CHANGELOG 顶部一致）。
+- ④ 的切页拦截只能真机看：改一半切页应弹确认框。
+- ③ 的快照段落表只能真机看：设置页选一份快照，下面应出现段名/字数/占比。
+- 端到端 `tools/selftest.py` 里「模型调用」失败是当前 Key 被上游 403，与本次无关。
+
+---
+
+## 0.11.1 追加：消息到达延迟（用户报的「卡一下 + 闪两个黑框」）
+
+### 用户原话
+
+> 当别人给大肥鱼发消息的时候，电脑会停顿一会，然后闪说两个 cmd 框日志才会接收到消息。
+
+### 实测（`.tmp/probe_bridge_speed.py`）
+
+| 项 | 耗时 |
+|---|---|
+| `node -e "0"` 冷启动 | 53 ms |
+| `node bridge.mjs context --query 你好`（有记忆检索） | 126 ms |
+| `node bridge.mjs context`（无 query） | 53 ms |
+
+**结论：node 冷启动不是主因。** 时间花在两个结构性地方。
+
+### 根因一：每次桥接都真的开一个 console 子进程
+
+程序是 PyInstaller windowed，**没有控制台**。这种情况下 `subprocess.run`
+默认给子进程新建 console —— 于是每轮回复闪一个黑框，且新窗口会抢一次前台
+（微信失焦 → UIA 那一步也跟着慢）。
+
+两个框的来源：
+
+1. `bridge_client._load_context_bridge`（`_compose` 每轮必调）；
+2. `desktop.py` 的补搜（`_recall_thin` 为真时再查一次，历史少时几乎每轮都真）。
+
+**改法**：两处都加 `creationflags=CREATE_NO_WINDOW`。
+注意项目里 `voice_driver` / `wechat_sender` 早就这么写了，只有桥接漏了。
+
+### 根因二：`[收]` 日志比消息晚 2~3 秒
+
+那行日志原本在 `handle()`（2565），也就是要等 **轮询 ≤1.2s + 攒批 2.0s**
+之后才出现。用户看到的是"有人发消息，程序卡一会才收到"——
+消息其实早就在手里了，只是没告诉他。
+
+**改法**：日志挪到 `enqueue()`（watcher 回调，消息到手的瞬间）；
+`handle()` 那行删掉，只保留 `chat_event.emit` 给聊天区。
+
+### 还没做的（等用户点单）
+
+| 项 | 收益 | 代价 |
+|---|---|---|
+| 攒批窗口 2.0s → 1.2s（同人） | 每轮少等 0.8s | 更早开跑，可能"插话"（v0.5.1 就是为这个加的 2s） |
+| 轮询 1.2s → 0.8s | 少等 0.4s | 每秒多一次库查询 |
+| 桥接常驻（`serve` + JSON-RPC） | 省两次进程创建（~100ms） | 要写长驻进程管理，是 0.11.x 的独立一件 |
+| 补搜合并成一次调用（`--alt`） | 省一次 node 启动 | 要改 `bridge.mjs` 的接口 |
+| 消息到手就预取上下文 | 整段桥接时间被藏起来 | 线程池 + 取消逻辑 |

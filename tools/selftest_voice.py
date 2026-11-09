@@ -245,6 +245,20 @@ def main() -> int:
     r = e.synthesize_turn(["测试"])
     check(not r.ok and "Key 不对" in r.error, "错误 · 401", r.error[:60])
 
+    # ── 标记清理：漏一个，对方就会看到「[[sticker]]」 ──
+    print()
+    from bigfish import voice_policy as VP
+
+    for label, raw, want in (
+        ("标记 · [[voice]] 清掉", "[[voice]] 在呢", "在呢"),
+        ("标记 · [[text]] 清掉", "[[text]] 在呢", "在呢"),
+        ("标记 · [[sticker]] 清掉", "[[sticker]] 在呢", "在呢"),
+        ("标记 · 大小写也清", "[[STICKER]] 在呢", "在呢"),
+        ("标记 · 行内也清", "在呢 [[sticker]]", "在呢"),
+        ("标记 · 三个一起清", "[[voice]][[sticker]] 在呢 [[text]]", "在呢"),
+    ):
+        check(VP.strip_tags(raw) == want, label, repr(VP.strip_tags(raw)))
+
     server.shutdown()
     print()
     if FAILS:

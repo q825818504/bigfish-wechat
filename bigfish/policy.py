@@ -165,6 +165,8 @@ def response_policy(
     dims: Optional[Dict[str, Any]] = None,
     energy: Any = None,
     now: Optional[float] = None,
+    recent_parts: int = 0,
+    recent_replies: int = 0,
 ) -> ResponsePolicy:
     """算这一轮的表达预算。
 
@@ -174,6 +176,11 @@ def response_policy(
 
     精力只做减法：低精力只会让她更短，不会让她更长。
     深夜同理 —— 困了的人不会突然话多。
+
+    `recent_parts` / `recent_replies` 是**跨轮配额**：最近 90 秒内
+    她已经发了几条、回了几轮。单轮看每轮都合理，连起来就是刷屏 ——
+    用户实测过「我连发两条，她第一轮 3 条，第二轮又 3 条 = 一次 6 条」。
+    所以预算要记得自己刚说过什么。
     """
     m = _num(mood, NEUTRAL_MOOD)
     e = _num(energy, NEUTRAL_ENERGY)
@@ -210,6 +217,31 @@ def response_policy(
         parts = min(parts, 2)
         bias = min(0.6, bias + 0.06)
         why += "，很晚了"
+
+    # ── 跨轮配额：刚说过话就少说 ──
+    #
+    # 这三档只收紧、不放宽，所以不会出现"聊得越久她越能说"。
+    # 阈值按"一次对话能忍多少条"定：6 条已经很吵，3 条开始要收。
+    try:
+        _rp = max(0, int(recent_parts or 0))
+        _rr = max(0, int(recent_replies or 0))
+    except (TypeError, ValueError):
+        _rp, _rr = 0, 0
+
+    if _rp >= 6:
+        parts = 1
+        chars = min(chars, 16)
+        why += "，刚连着说了几句"
+    elif _rp >= 3:
+        # 她已经说了 3 条，对方又发一句 —— 一句接住就够了。
+        # 这里给 2 条的话，两轮就是 5 条，用户照样觉得在刷屏。
+        parts = 1
+        chars = min(chars, 24)
+        why += "，刚说过话"
+
+    if _rr >= 2:
+        parts = 1
+        why += "，连着几轮都在回"
 
     return ResponsePolicy(
         max_parts=parts,

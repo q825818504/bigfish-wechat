@@ -246,6 +246,7 @@ $('#btnVoiceSave')?.addEventListener('click', async () => {
       return;
     }
     setText('#voiceSaveHint', '已保存');
+    if (typeof markClean === 'function') markClean('voice');
     toast('声音设置已保存');
     await loadVoice();
   } catch (e) {

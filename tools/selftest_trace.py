@@ -99,6 +99,13 @@ def main() -> int:
     check("provider 记录", d.get("provider") == "deepseek", str(d.get("provider")))
     check("sections 记录", len(d.get("sections") or []) == 2,
           str(d.get("sections")))
+    # 0.11.1：界面要按段展开，所以段名必须能从快照里读回来
+    secs = T.sections_of(files[0]) if files else []
+    check("sections_of 读回段名",
+          [s["name"] for s in secs] == ["灵魂", "记忆"], str(secs))
+    check("sections_of 带字数与座位",
+          [(s["seat"], s["chars"]) for s in secs] == [(860, 120), (850, 300)],
+          str(secs))
     raw = json.dumps(d, ensure_ascii=False)
     check("不含 api_key", "sk-SECRET" not in raw and "api_key" not in raw)
 

@@ -328,6 +328,59 @@ def main():
         chk("按会话查得到", S.read_usage("filehelper", root).get("stk_0001") == 1)
         chk("别的会话查不到", S.last_sent("other", root) == {})
 
+        section("模型标记：[[sticker]] / [[text]]（0.11.1）")
+        # 以前「要不要发」只有掷骰子，模型想配图也表达不了（D-78 的尾巴）。
+        # 这里用假 self 直接调 EngineWorker._pick_sticker：不碰 Qt、不发微信。
+        from bigfish import plugins as P
+
+        st = P.read_state(root)
+        st.setdefault("enabled", {})["sticker"] = True
+        st.setdefault("config", {})["sticker"] = {
+            "rate": 0, "cooldown": 0, "mode": "random", "position": "after"}
+        ok, err = P.write_state(st, root)
+        chk("插件配置写入", ok, err)
+
+        calls = {"n": 0}
+        real_collect = P.collect_sticker
+
+        def _fake_collect(ctx):
+            calls["n"] += 1
+            return "", "after"
+
+        class _Fake:
+            def __init__(self):
+                self._sticker_sent = {}
+
+            def _log(self, *a, **k):
+                pass
+
+        class _Msg:
+            chat_id = "filehelper"
+            chat_name = "文件传输助手"
+
+        try:
+            from bigfish import desktop as D
+
+            P.collect_sticker = _fake_collect
+            try:
+                f = _Fake()
+                D.EngineWorker._pick_sticker(f, _Msg(), "在吗", "在呢", mark="text")
+                chk("[[text]] 直接不发", calls["n"] == 0, f"挑了 {calls['n']} 次")
+                calls["n"] = 0
+                f = _Fake()
+                D.EngineWorker._pick_sticker(f, _Msg(), "在吗", "在呢", mark="sticker")
+                chk("[[sticker]] 跳过概率（rate=0 也会挑）", calls["n"] == 1,
+                    f"挑了 {calls['n']} 次")
+                calls["n"] = 0
+                f = _Fake()
+                D.EngineWorker._pick_sticker(f, _Msg(), "在吗", "在呢", mark="")
+                chk("没标记仍掷骰子（rate=0 → 不挑）", calls["n"] == 0,
+                    f"挑了 {calls['n']} 次")
+            finally:
+                P.collect_sticker = real_collect
+        except Exception as exc:
+            print(f"  （跳过：desktop 不可导入 {exc}）")
+
         shutil.rmtree(d, ignore_errors=True)
 
     except Exception:

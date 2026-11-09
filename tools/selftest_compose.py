@@ -83,6 +83,11 @@ class FakeEngine:
         return D.EngineWorker._peer_name_parts(
             self, chat_id, chat_name, sender_name)
 
+    def _recent_sent_parts(self, chat_id, window=90.0):
+        # 跨轮条数配额（0.11.1）。替身也要有 —— 否则 _compose 每轮都会
+        # 记一条「[预算] 计算失败」，那正是这条自检要抓的东西。
+        return 0, 0
+
 
 def main() -> int:
     print("=" * 56)

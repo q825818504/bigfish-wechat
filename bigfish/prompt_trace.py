@@ -240,6 +240,32 @@ def recent(limit: int = 20) -> List[Dict[str, Any]]:
     return out
 
 
+def sections_of(path: str) -> List[Dict[str, Any]]:
+    """读一份快照的段落表（只要段名和字数，不要正文）。
+
+    给设置页回答「这一轮的字数花在哪了」。以前只给一个总字数，
+    看到 system 8000 字也不知道是哪一段涨的。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d0 = json.load(f)
+    except Exception:
+        return []
+    raw = d0.get("sections")
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for s in raw:
+        if not isinstance(s, dict):
+            continue
+        out.append({
+            "seat": int(s.get("seat") or 0),
+            "name": str(s.get("name") or "")[:40],
+            "chars": int(s.get("chars") or 0),
+        })
+    return out
+
+
 def stats() -> Dict[str, Any]:
     """给界面看的一行摘要：开了没、存了几份、多大、**能不能写**。"""
     d = trace_dir()

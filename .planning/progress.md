@@ -1742,3 +1742,443 @@ Qt 找不到匹配的槽，调用静默失败。犯过两次
 - 发布后核验：Release API 200；附件大小与 manifest 一致；远端 main 与 tag 已推送。
 - 发布后补了一行 manifest 的 `excluded` 元数据，提交在 main 上；tag 仍指向
   a08945a，不影响已上传的 zip（zip 内容的实际排除逻辑在 tag 内）。
+
+
+## 2026-11-08 23:xx — 核实 9 条「挂着没做的小事」
+
+### 本轮性质
+
+**只核实、只更新 planning，没有改任何代码。** 用户要求先确认这些条目
+「现在还在不在」，在的再谈修不修。
+
+### 方法
+
+- 逐条回到代码里读，不用 planning 的记载当结论（D-36 同样适用）。
+- 第 1 条另写实证脚本 `D:\大脑\.tmp\probe_chunk_hits.py`：
+  复制真实记忆库 → 跑两次 `search_chunks` → 数 `chunk_hits` 行数。
+- 第 8 条查本机音频设备（`Get-PnpDevice -Class AudioEndpoint`）与
+  `dist/BigFish/wechatauto_logs` 的真实运行痕迹。
+- 结论以 HEAD `24937ed` 为准。
+
+### 结果
+
+**6 条仍在**：`chunk_hits` 加权恒失效（有实证）／心情页 5 个假旋钮／
+快照只显示总字数／设置页切页丢改动／`Backend.account` 混存两种东西／
+表情「要不要发」仍是掷骰子。
+
+**2 条不成立**：
+
+- `set_data_root` 那条 —— 数据根是每轮现查 `settings.json`（`vault.py:98`
+  无缓存），引擎内 40+ 处 `V.memory_db_path()` 现查，改完下一轮就生效。
+  残留只有「已加载进内存的 soul / life / 心情对象不重载」。
+- `tools/setup-git-token.py` 不存在 —— **这是我上一轮的误报**，文件在，
+  `task_plan.md:5` 与 `AGENTS.md:15` 的引用都是对的。
+
+### 顺带确认的一件事
+
+本机 **VB-CABLE 已经装好了**（`CABLE In 16 Ch` / `CABLE Output`，
+驱动状态 OK），`dist/BigFish/config.json` 也已经是 `send_as=bubble`。
+
+### 自我更正：语音气泡**已经真机实操过**
+
+我一开始把第 8 条判成「未实测」，是错的 —— 用户当场指出。
+证据在 `CHANGELOG.md` 0.11.0 的「修复」段，那三条**只可能由真机跑气泡暴露**：
+
+1. 语音成功后 `name 'hist' is not defined`（`_deliver` 与 `handle` 是兄弟闭包）；
+2. 语音与文字前台行为不一致（`wake()` 只保证可见，气泡还要前台）
+   → 改成 `force_show_wechat` + `open_chat`；
+3. 主动置前 + 气泡失败分级回退（还没按录音键 → 改文字；按过键 → 不补发）。
+
+所以这一条不是「待验证」，是**文档没跟上**：
+`docs/声音.md:174` 还写着「当前机器没装 VB-CABLE」，
+`CHANGELOG.md:39` 还写着「仍需在装有 VB-CABLE 的机器上实测」。
+这两句要改，代码不用动。
+
+**教训**：判断「有没有做过」不能只看日志目录 ——
+`dist/BigFish/wechatauto_logs` 里只有 `wechatauto` 这一个 logger 的记录，
+气泡的日志走程序自己的 `log_message`，不在那儿。日志不在 ≠ 事情没发生。
+
+### 未做
+
+- 没有改代码（等用户拍板修哪几条）。
+- 没有改 `docs/声音.md` 的过时表述（留给下一轮一起动）。
+
+
+## 2026-11-08 23:xx — v0.11.1：把六件「记着没做」的事做完
+
+### 本轮性质
+
+**修缺陷，不加功能。** 用户从上一轮核实的 9 条里点了 6 条，
+语音气泡那条只改文档（因为已经真机跑过）。
+
+版本 `0.11.1`，**未提交、未打包、未发版**。
+
+### 六条怎么改的
+
+| # | 根因 | 改法 |
+|---|---|---|
+| ① | 检索用 `mode=ro`，记命中在同一个只读连接上写，异常被吞 | `_bump_chunk_hits(path, ids)` 另开短写连接；`_search_chunks_impl` 改传 path |
+| ② | `lastInjectedText` 只被初始化为空串，之后没人写；五个旋钮无读者 | `apply_mood_delta` 新增「2.5 注入文本」；`autoJudge` 进 `_judge_mood_async` |
+| ③ | 写快照时段名被置空 `(order, "", len)` | `_sections` 改三元组；`prompt_trace.sections_of` + UI 段落表 |
+| ④ | `go()` 直接切页，切过去还重填 DOM | `markDirty` 判「用户动过」+ `go()` 前 confirm + 保存后 `markClean` |
+| ⑤ | 一个字段轮流存昵称和目录名 | 拆 `account_id` / `account_nick`；`bot_id` 只用 id |
+| ⑥ | `_pick_sticker` 只有 `random() > rate` | `[[sticker]]` / `[[text]]` 标记 + `strip_tags` 清理 + 说法提示词 |
+
+### 顺手抓到的一个真 bug
+
+`injectPerDay = 0`（用户把注入关掉）被 `int(cfg.get("injectPerDay") or 6)`
+改写成每天 6 次 —— **关掉反而更频繁**。
+新写的 `selftest_mood` 里「上限 0 = 不注入」当场把它钉出来了，
+改成只把 `None` 当未设置。这是"0 是合法值"的经典坑。
+
+### 自我更正（第二次）
+
+上一轮我把「语音气泡未实测」判成仍在，用户当场纠正：
+真机跑过，`CHANGELOG` 0.11.0 的修复段里那三条（`hist` 未定义、
+前台行为不一致、按过录音键不补发）**只可能由真机暴露**。
+本轮只改了两句过时表述：`docs/声音.md` 与 `CHANGELOG` 0.11.0 的验证段。
+
+**教训**：`dist/BigFish/wechatauto_logs` 里只有 `wechatauto` 一个 logger，
+气泡日志走程序自己的 `log_message`，不在那儿。**日志不在 ≠ 事情没发生。**
+
+### 验证（全部实跑）
+
+| 自检 | 结果 |
+|---|---|
+| `selftest_memory` | 230/230（新增 6 项命中加权） |
+| `selftest_mood`（新文件） | 19/19 |
+| `selftest_trace` | 23/23（新增 2 项段落表） |
+| `selftest_sticker` | 77/77（新增 3 项标记逻辑） |
+| `selftest_voice` | 全过（新增 6 项标记清理） |
+| `selftest_plugins` / `selftest_say` / `selftest_listen` / `selftest_send_tail` / `selftest_compose` | 92 / 71 / 54 / 15 / 19，全过 |
+| `check_slots` / `check_call_sites` | 0 处不符 |
+| `tools/selftest.py`（端到端） | 除「模型调用」外全过；那项是当前 Key 被上游 403，与本次无关 |
+
+### 没做
+
+- 没提交、没打包、没发 Release（等用户验收）。
+- ④ 的切页拦截、③ 的段落表只能真机看，自检覆盖不到渲染。
+- 表情手柄只做到"标记 → 跳过概率"，**没有**让模型选具体哪张图
+  （那要改 `collect_sticker` 的接口，是另一件事）。
+
+
+## 2026-11-08 23:1x — 消息到达「卡一下 + 闪两个黑框」
+
+### 现象（用户报）
+
+别人发消息 → 电脑停顿一会 → 闪两个 cmd 框 → `[收]` 日志才出现。
+
+### 实测结论：不是 node 慢
+
+`.tmp/probe_bridge_speed.py` 在真机上量的：
+
+- `node -e "0"`：**53 ms**
+- `node bridge.mjs context --query 你好`：**126 ms**（含记忆检索）
+- 无 query：53 ms
+
+所以「桥接脚本慢」是误判。真正的两块：
+
+**① 每轮回复真的开两个 console 子进程。**
+程序是 windowed 打包，没有控制台，`subprocess.run` 就会给子进程新建
+console —— 黑框闪一下，还抢一次前台。项目里 `voice_driver` 和
+`wechat_sender` 早就写了 `CREATE_NO_WINDOW`，**只有桥接漏了**。
+两个框 = `_compose` 的 `load_context` + `_recall_thin` 触发的补搜。
+
+**② `[收]` 日志在 `handle()` 里，不是消息到手时。**
+轮询 ≤1.2s + 攒批 2.0s，所以日志天然晚 2~3 秒。用户体感「卡住」，
+但消息其实一直在手里。
+
+### 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `bigfish/bridge_client.py` | `_NO_WINDOW` + `creationflags`；注释写清为什么 |
+| `bigfish/desktop.py`（记忆页搜索） | 同样补 `CREATE_NO_WINDOW` |
+| `bigfish/desktop.py`（`enqueue`） | 消息到手立刻打 `[收]` |
+| `bigfish/desktop.py`（`handle`） | 删掉重复的 `[收]`，保留 `chat_event.emit` |
+
+### 验证
+
+- `py_compile` 通过。
+- `selftest_send_tail` 15、`selftest_listen` 54、`selftest_ui_pages` 65、
+  `selftest_watch_hot` 10 全过。
+- `selftest_app_wiring` 25/26，失败项「历史里自己 3 条」——
+  **改之前就是这个结果**（用 `git stash` 跑过基线对比确认），
+  是那个用例等 0.8s 的时序不稳，与本次无关。
+- 真机效果待用户看：黑框应该不再出现，`[收]` 应该几乎即时。
+
+### 还没动（三条要用户拍板）
+
+攒批窗口（2.0s）、轮询间隔（1.2s）、桥接常驻。
+前两个直接影响「不打断对方说话」的手感，不是我一个人该改的；
+第三个是 0.11.x 的独立一件。
+
+
+## 2026-11-08 23:19 — 打包部署（0.11.1 的包）
+
+### 做了什么
+
+`python tools/deploy.py`：强杀 → 备份数据 → PyInstaller 打包 → 覆盖程序 → 自检。
+**只换程序**，`data/` 与 `config.json` 一律没动。
+
+| 项 | 结果 |
+|---|---|
+| 数据备份 | → `data-backup/`（源 `D:\大肥鱼`） |
+| 数据指纹 | 8785 文件 / 1,827,200,645 字节，覆盖前后一致 |
+| 覆盖内容 | `BigFish.exe` / `_internal` / `ui` / `bridge`（时间戳 23:19） |
+| 包内新代码确认 | `dist/BigFish/ui/app.js` 里 `markClean` / `traceSections` 命中 7 处 |
+
+### 自检结果（有一处需要说清楚）
+
+默认数据根下跑 `BigFish.exe --selftest`：**20 通过 / 1 失败 / 1 跳过**
+（跳过的是 UIA，非管理员）。
+
+失败项是「灵魂」：
+
+```
+RuntimeError: 数据目录不可写：[Errno 13] Permission denied:
+  'D:\大肥鱼\.bigfish-write-probe.tmp'
+```
+
+**这不是代码问题，也不是这次改动引入的。** 证据：
+
+1. 同一台机器、同一路径，**命令行 Python 能写**（固定名 `.bigfish-write-probe.tmp`
+   和 `mkstemp` 都成功）；
+2. 只有**打包后的 exe** 写不了 —— 三种探针写法（固定名 / mkstemp / 重试）全失败；
+3. 把 `BIGFISH_DATA_ROOT` 指到 `D:\大脑\.tmp\bfprobe` 再跑：**21 通过 / 0 失败**
+   （仍然 1 跳过 UIA）。
+
+     数据根  D:\大脑\.tmp\bfprobe｜soul=有 mood=无 memory=无｜可写
+
+4. 目录 ACL 正常：`Alime:(F)`、`Authenticated Users:(M)`，没有强制完整性标签。
+
+结论：`D:\大肥鱼` 对这个**新出现的未签名 exe** 有额外限制（安全软件按
+「路径 + 程序未知」拦），而 `D:\大脑\.tmp` 不在它的名单里。
+`vault` 的错误提示本来就写着解决办法：把 `BigFish.exe` 加进白名单，或管理员运行。
+
+### 待用户真机验证
+
+- 黑框是否不再闪（`CREATE_NO_WINDOW`）。
+- `[收]` 是否在消息到手时就出现，而不是晚 2~3 秒。
+- 启动方式：**管理员**（deploy 的提示也是这么写的）。
+
+
+## 2026-11-08 23:3x — 「[跳过] 自己发的消息」为什么会出现
+
+### 用户问
+
+> 黑框现在不闪了，但是出了个新问题，日志为什么会出现红框那部分的提示？
+
+红框里是两处：
+
+```
+23:28:26 [收] 老爸：这周末过得也太快了
+23:28:26 [跳过] 老爸：自己发的消息；allow_self 没对这个会话开
+23:29:32 [收] 老爸：断网一天可太亏了
+23:29:32 [跳过] 老爸：自己发的消息；allow_self 没对这个会话开
+```
+
+### 两层原因，一层是设计，一层是我上一轮引入的
+
+**① `[跳过]` 本身是设计内的自环防护，不是异常。**
+
+她发完 → 微信异步写库（实测 10~12 秒）→ watcher 1.2s 轮询读到 → 进 `feed`。
+这时 `is_self=True`，**必须丢掉**，否则她会回自己（v0.4.1 那次自问自答的成因）。
+问题只在于：以前**每条**都打一行，文案还写着「allow_self 没对这个会话开」，
+和紧邻的 `[收]` 一对照，看起来像"对方的消息被跳过了"。
+
+**② `[收]` 挪到 `enqueue()` 后没过滤 `is_self` —— 这是我上一轮引入的回归。**
+
+所以日志里会出现「[收] 老爸：那你今天干点啥了」这种句式，
+而那其实是**她刚发出去**的话（23:29:36 的 `[发]` 里就有同一句）。
+「收 + 跳过」并排出现，正是同一个消息被读成两次的效果。
+
+### 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `bigfish/desktop.py` | `enqueue` 里只对**对方**的消息打 `[收]`；自己的由 `[发]` 覆盖 |
+| `bigfish/listen.py` | 新增 `_note_self_skip()`：同会话 120 秒只提示一次，带她的原话，改说「属正常闭环」 |
+
+新文案长这样：
+
+```
+[跳过] 老爸：她自己刚发的「那你今天干点啥了」被读回来，属正常闭环（allow_self 未开，不再重复提示）
+```
+
+### 验证
+
+- `selftest_listen` 54 → **59**（新增 5 项：同会话只打一行 / 带原话 /
+  不再出现旧文案 / 换会话重新打 / 超过 120 秒再打）。
+- `send_tail` 15、`ui_pages` 65、`watch_hot` 10、`afterthought` 45 全过。
+
+
+## 2026-11-08 23:4x — 攒批太短 + 连发两条被回两轮
+
+### 用户报
+
+> 现在的时间还是太短了，我稍微犹豫一点发，她就已经回复了。
+> 然后假如她回的很多，每句话 3 条，我连发两条，她一下子就会 6 条，这不就成了刷屏？
+
+两件事，两个不同的根因。
+
+### ① 攒批窗口：4.0s 太短
+
+`adaptive_quiet()` 在 [1.5, 6.0] 之间按字数取值，短消息取上限。
+原来的上限是 **4.0s**，而真人发微信常见节奏是
+「在吗」→ 想 3 秒 →「问你个事」→ 再停 4 秒 → 正文。
+4 秒刚好卡在中间，于是被切成两轮：她回一次，对方再发，她又回一次。
+
+**改成 6.0s**。长句/有句号的消息仍走 `quiet_min`（1.5s），
+所以"说完一句"的回复速度没变慢 —— 只有"看起来没说完"的才多等。
+
+### ② 一次 6 条：预算只看单轮，不记得自己刚说过什么
+
+`policy.response_policy()` 原来只看心情 / 精力 / 时段。
+心情不错 → 4 条上限，`say` 插件配的是 3 条 → 每轮 3 条。
+对方连发两条 = 两轮 = **6 条**，单轮看每轮都合理。
+
+**新增跨轮配额**：`recent_parts` / `recent_replies`（最近 90 秒的条数与轮数），
+由 `EngineWorker._note_sent_parts()` 在发送成功后记账：
+
+| 最近 90 秒已发 | 这一轮 |
+|---|---|
+| ≥ 6 条 | 1 条，≤16 字 |
+| ≥ 3 条 | 1 条，≤24 字 |
+| 已回 ≥ 2 轮 | 1 条 |
+
+第一版写的是「≥3 条 → 2 条」，算下来两轮还是 5 条，用户照样会觉得在刷屏 ——
+所以直接压到 1 条。配额只收紧、不放宽，不会出现"聊得越久她越能说"。
+
+`_sent_parts` 只放内存，进程重启清零（和账本 D-9 同一个理由）。
+
+### 验证
+
+- `selftest_listen` 59/59：窗口断言全部改成读 `ListenPolicy` 的值
+  （`quiet_max`、`adaptive_quiet`、`post_reply_grace`），调参不再需要改测试。
+- `selftest_inner` 92 → **100**：新增 8 项跨轮配额断言。
+- `selftest_compose` 19/19：顺手给 `FakeEngine` 补了 `_recent_sent_parts` 桩 ——
+  否则 `_compose` 每轮都会记一条「[预算] 计算失败」。
+- `selftest_say` 71、`selftest_send_tail` 15、`selftest_growth` 108 全过。
+
+### 留给用户调的
+
+`say` 插件的 `max_parts` 现在是 **3**（`D:\大肥鱼\plugins.json`）。
+跨轮配额会把它压到 1~2；如果还嫌多，面板上直接改成 2 更彻底。
+
+
+## 2026-11-08 23:5x — 攒批判定：到点问模型「他说完了吗」
+
+### 用户提的方案
+
+> 最短是 6 秒，然后超过 6 秒的时候，需要模型判断是否对方可能还有下一句话没说完，
+> 如果有继续等待，最久不能超过 30 秒。以上配置我希望都可以改，体现在说法插件里。
+
+### 做法
+
+新增 `bigfish/listen_judge.py`（提示词 + 解析 + 失败倒向），
+`listen.py` 加三样东西：
+
+| 新增 | 作用 |
+|---|---|
+| `batch_min_wait` | 底线。任何消息都不早于这个时间封批（默认 6.0） |
+| `due()` | 到点、且还该问模型 → 报名（标 awaiting，同会话不会有两个判定在飞） |
+| `verdict(chat_id, more)` | 结算：more=true 再等 `judge_extra`；false 立刻封 |
+| `_should_judge()` | 守 `judge_max_rounds` 与 `max_wait` 两道闸 |
+
+`desktop.py` 的 `_batch_loop` 里每 200ms 取 `due()`，丢进 2 线程的池子跑
+`_judge_one()`；结果回 `batcher.verdict()`。判定离开 tick 线程，不会按住别的会话。
+
+参数全在**「说法」插件**面板（6 项），`_listen_policy()` 每 5 秒重读一次。
+
+### 两个坑，都踩到了
+
+1. **`judge` 默认 False 时 `_should_judge` 忘了短路。**
+   结果：谁都没接判定，但谁都不敢封批 —— 对方要等 30 秒才收到回复。
+   自检里「短消息 6.0s 封批」当场红了。改成 `if not self._judge: return False`。
+
+2. **`batch_min_wait=6.0` 把自适应窗口压平了。**
+   `quiet_max` 也是 6.0，于是 `adaptive_quiet()` 算出来的所有相对关系
+   （句号 < 无标点、长消息 1.5）全变成 6.0，`selftest_listen` 一次红 8 条。
+   这不是 bug，是默认值的必然结果 —— 用户要的「底线 6 秒」就等于关掉自适应。
+   处理：测算法本身的用例显式传 `batch_min_wait=0.0`；
+   另加一组「下限生效」的用例（长消息也等 6 秒、下限调大能超过上限）。
+
+### 验证
+
+- `selftest_listen` 59 → **80**（判定 15 项 + 下限 3 项 + 原有）
+- `selftest_listen_judge` **18/18**（新文件，假模型，不联网）
+- `selftest_plugins` 92、`selftest_inner` 100、`selftest_say` 71、
+  `selftest_send_tail` 15、`selftest_ui_pages` 65、`selftest_compose` 19
+- `tools/selftest.py` 已挂「攒批判定」一项
+
+### 真正延迟是多少
+
+用户之前抱怨慢，这次是他主动要求"多等"。把账算清楚：
+
+| 场景 | 现在 |
+|---|---|
+| 说完一句（句号收尾） | 6 秒起 + 判定 ≈ 7 秒 |
+| 分条发（「在吗」+ 3 秒后正文） | 6 秒起 + 判定，且两次消息合并成一批 |
+| 模型一直说「还有」 | 最多 30 秒 |
+
+也就是说**最坏情况比以前慢**（以前 12 秒封顶），换来的是不插话。
+
+
+## 2026-11-09 18:4x — v0.11.1 收尾：提交并推送到 main
+
+### 这一版到底是什么
+
+`0.11.0` 发布之后，用户要求核实「planning 里挂着、尚未动的小问题」。
+9 条里 **6 条仍在**、1 条只是文档过时、2 条不成立（其中一条是我自己的误报）。
+用户点了 6 条要修，随后又追加了两件事：
+
+1. 收到消息闪两个黑框 + `[收]` 日志慢 2~3 秒；
+2. 攒批太短（「我稍微犹豫一点发，她就已经回复了」），
+   并且连发两条就被回两轮、一次 6 条。
+
+最后一件是用户主动提的设计：**到点让模型判断「他说完了吗」**。
+
+### 全部改动（一次提交）
+
+| 类 | 内容 |
+|---|---|
+| 修复 | `chunk_hits` 加权恒失效 / 心情注入链路是空的 / 五个假旋钮 / `injectPerDay=0` 被 `or 6` 吞 / 表情只有掷骰子 / 设置页切页丢改动 |
+| 修复 | 闪黑框（缺 `CREATE_NO_WINDOW`）/ `[收]` 晚 2~3 秒 / `[收]` 把她自己的话当收到 / `[跳过]` 每条都刷 |
+| 改进 | 快照按段展开 / `account` 拆 `account_id`·`account_nick` / 心情标签阈值只留一份 |
+| 新增 | **攒批判定**：6 秒底线 → 问模型 → 还有再等 8 秒（最多 3 次）→ 硬上限 30 秒，参数在说法面板 |
+| 新增 | **跨轮条数配额**：90 秒内已发 ≥3 条就只回 1 条 |
+| 文档 | `docs/接话与补一句.md` 新增第七节；`docs/声音.md` 与 CHANGELOG 0.11.0 段的两句过时表述 |
+
+### 验证（提交前实跑）
+
+| 自检 | 结果 |
+|---|---|
+| `selftest_listen` | 80/80 |
+| `selftest_listen_judge`（新） | 18/18 |
+| `selftest_mood`（新） | 19/19 |
+| `selftest_memory` | 230/230 |
+| `selftest_inner` | 100/100 |
+| `selftest_sticker` | 77/77 |
+| `selftest_trace` | 23/23 |
+| `selftest_plugins` / `selftest_say` / `selftest_ui_pages` / `selftest_compose` / `selftest_send_tail` | 92 / 71 / 65 / 19 / 15 |
+| `selftest_voice` | 全过（新增 6 项标记清理） |
+| `check_slots` / `check_call_sites` | 0 处不符 |
+
+`tools/selftest.py` 端到端里「模型调用」失败是当前 Key 被上游 403，与本次无关。
+`selftest_app_wiring` 有一项「历史里自己 3 条」在**改动之前**就是失败的
+（用 `git stash` 跑基线确认过），是那个用例等 0.8 秒的时序不稳。
+
+### 打包状态
+
+`tools/deploy.py` 跑过三次，最后一次在攒批判定之后：
+程序已覆盖到 `dist/BigFish`（时间戳 11-08 23:5x），数据未动。
+
+自检固定 20 通过 / 1 失败 / 1 跳过 —— 失败项是 `D:\大肥鱼` 的写探针：
+同一路径命令行 Python 能写、打包 exe 不能（换 `BIGFISH_DATA_ROOT` 后 21/21），
+属于安全软件对新 exe 的限制，不是代码。
+
+### 还没做
+
+- **没打 tag、没发 Release**。用户只要求同步到 GitHub。
+- 界面那两处（切页拦截、快照段落表）只能真机看，自检覆盖不到渲染。

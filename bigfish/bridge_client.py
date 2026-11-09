@@ -39,6 +39,10 @@ def _find_bridge() -> str:
 
 _BRIDGE = _find_bridge()
 
+#: Windows 上不新建控制台。见 `_load_context_bridge` 里的说明：
+#: 少了这个，每调一次桥接就闪一个黑框，还会抢一次前台。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 @dataclass
 class Mood:
@@ -52,21 +56,15 @@ class Mood:
 
     @property
     def label(self) -> str:
-        """把数值翻成一句人话，便于模型理解。"""
-        v = self.value
-        if v is None:
-            return ""
-        if v >= 85:
-            return "心情很好"
-        if v >= 70:
-            return "心情不错"
-        if v >= 55:
-            return "心情还行"
-        if v >= 40:
-            return "有点平淡"
-        if v >= 25:
-            return "情绪低"
-        return "情绪很低"
+        """把数值翻成一句人话，便于模型理解。
+
+        ⚠ 阈值只有一份，在 `mood_judge.MOOD_LABELS`。
+          这里以前自己抄了一套 if/elif —— 两边一改就漂，提示词里的说法
+          和心情页显示的对不上。
+        """
+        from bigfish.mood_judge import label_of
+
+        return label_of(self.value)
 
     def active_dims(self, threshold: float = 15.0) -> List[str]:
         """活跃维度，带上强度。
@@ -183,9 +181,15 @@ def _load_context_bridge(query: str = "", data_root: str = "",
         cmd += ["--query", query]
 
     try:
+        # ⚠ 必须带 CREATE_NO_WINDOW。
+        #   程序是 GUI（PyInstaller windowed），**没有控制台**；
+        #   这时 subprocess 默认会为子进程新建一个 console —— 于是每调一次
+        #   桥接就在屏幕上闪一个黑框，还会把前台从微信抢走一下。
+        #   用户看到的是「有人发消息 → 电脑卡一下 → 闪两个黑框 → 日志才出来」。
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
-                           timeout=timeout)
+                           timeout=timeout,
+                           creationflags=_NO_WINDOW)
     except subprocess.TimeoutExpired:
         ctx.warnings.append("桥接超时")
         return ctx

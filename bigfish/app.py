@@ -435,8 +435,10 @@ class BigFishApp:
         try:
             from bigfish import plugins as _P
 
-            _sections = [(860, sys_parts[0])]
-            _sections += [(900, t) for t in sys_parts[1:]]
+            # 段名要和 desktop.py 一样带上：快照面板靠它回答
+            # 「哪一段吃掉了预算」。两个入口的快照要能对读。
+            _sections = [(860, "人格", sys_parts[0])]
+            _sections += [(900, "这会儿的状态", t) for t in sys_parts[1:]]
             for _order, _title, _text in _P.prompt_sections({
                 "now": datetime.now(),
                 "channel": "group" if msg.chat_id.endswith("@chatroom") else "private",
@@ -445,9 +447,9 @@ class BigFishApp:
                 "user_text": text,
                 "soul": self.soul,
             }):
-                _sections.append((_order, _text))
+                _sections.append((_order, _title or "", _text))
             _sections.sort(key=lambda item: item[0])
-            sys_parts = [t for _o, t in _sections]
+            sys_parts = [t for _o, _t, t in _sections]
         except Exception as exc:
             self.log(f"[插件] 注入失败：{exc}")
 

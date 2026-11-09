@@ -128,6 +128,38 @@ def main() -> int:
           str(night))
 
     # ════════════════════════════════════════════════════════════
+    section("[预算] 跨轮配额：刚说过话就少说（0.11.1）")
+    # ════════════════════════════════════════════════════════════
+    #
+    # 用户实测：「我连发两条，她第一轮 3 条、第二轮又 3 条 = 一次 6 条」。
+    # 单轮看每轮都合理，连起来就是刷屏。预算必须记得自己刚说过什么。
+
+    same = P.response_policy(mood=90, dims={"happy": 8}, energy=80, now=at(15))
+    check("不传配额时还是 4 条", same.max_parts == 4, str(same))
+
+    few = P.response_policy(mood=90, dims={"happy": 8}, energy=80, now=at(15),
+                            recent_parts=3)
+    check("刚发过 3 条 → 只发 1 条", few.max_parts == 1, str(few))
+    check("刚发过 3 条 → 字数收紧", few.max_chars <= 24, str(few))
+
+    many = P.response_policy(mood=90, dims={"happy": 8}, energy=80, now=at(15),
+                             recent_parts=6)
+    check("刚发过 6 条 → 只发 1 条", many.max_parts == 1, str(many))
+    check("刚发过 6 条 → 字数更紧", many.max_chars <= 16, str(many))
+
+    rounds = P.response_policy(mood=90, dims={"happy": 8}, energy=80, now=at(15),
+                               recent_replies=2)
+    check("连着回了两轮 → 只发 1 条", rounds.max_parts == 1, str(rounds))
+
+    # 只收紧、不放宽：心情很低时配额不该把 1 条变多
+    still_low = P.response_policy(mood=30, dims={"sad": 6}, energy=70, now=at(15),
+                                  recent_parts=0, recent_replies=0)
+    check("配额不放宽低心情", still_low.max_parts == 1, str(still_low))
+    check("脏配额不崩", P.response_policy(recent_parts="abc",
+                                          recent_replies=None).max_parts >= 1,
+          str(P.response_policy(recent_parts="abc")))
+
+    # ════════════════════════════════════════════════════════════
     section("[预算] 读不到状态时不抛、不夸张")
     # ════════════════════════════════════════════════════════════
 

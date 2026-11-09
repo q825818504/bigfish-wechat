@@ -58,7 +58,84 @@ function setText(sel, v) {
 
 /* ────────── 导航 ────────── */
 
+/* ── 未保存改动：切页前拦一道 ──
+ *
+ * 问题：声音 / 模型 / 灵魂 / 心情 / 插件 都是「填完点保存」，
+ * 而 go() 直接切页、切过去还会重填 DOM。改了一半切走，输入静默消失，
+ * 用户以为已经存上了。
+ *
+ * 判据用「用户动过」而不是「值和快照不同」：程序回填 value 不触发
+ * input/change，所以不会误报；选择即保存的控件列进 AUTOSAVE 跳过。
+ * chats 页不在这里管 —— 它有 watchDirty / scopeDirty，免得搜索框一打字就弹窗。
+ */
+const AUTOSAVE_IDS = new Set([
+  'cfgGroupReply', 'cfgGroupAllowAll', 'cfgModelSel', 'cfgChannel',
+  'tracePick', 'voiceDevice', 'memRole',
+]);
+const DIRTY_PAGES = new Set(['soul', 'mood', 'plugins', 'settings', 'voice']);
+const PAGE_DIRTY = {};
+
+function pageOf(el) {
+  const p = el && el.closest ? el.closest('.page') : null;
+  return (p && p.dataset.page) || '';
+}
+
+function markDirty(el) {
+  if (!el || AUTOSAVE_IDS.has(el.id)) return;
+  const page = pageOf(el);
+  if (page && DIRTY_PAGES.has(page)) PAGE_DIRTY[page] = true;
+}
+
+function markClean(page) {
+  if (page) PAGE_DIRTY[page] = false;
+}
+
+document.addEventListener('input', (e) => markDirty(e.target), true);
+document.addEventListener('change', (e) => markDirty(e.target), true);
+
+/** 每页的主保存按钮。chats 按脏源另算（监听列表 / 会话作用域是两件事）。 */
+const PAGE_SAVE = {
+  soul: 'btnSoulSave',
+  mood: 'btnMoodSave',
+  plugins: 'plugSave',
+  settings: 'btnSave',
+  voice: 'btnVoiceSave',
+};
+
+function pageHasDirty(page) {
+  if (page === 'chats') {
+    return !!(S.watchDirty || (typeof scopeDirty === 'function' && scopeDirty()));
+  }
+  return !!PAGE_DIRTY[page];
+}
+
+function pageSaveButtons(page) {
+  if (page === 'chats') {
+    return [
+      S.watchDirty ? 'btnSaveWatch' : '',
+      (typeof scopeDirty === 'function' && scopeDirty()) ? 'scopeSave' : '',
+    ].filter(Boolean);
+  }
+  return [PAGE_SAVE[page] || ''].filter(Boolean);
+}
+
 function go(page) {
+  const cur = pageOf(document.querySelector('.page.is-active'));
+  if (cur && cur !== page && pageHasDirty(cur)) {
+    const title = PAGE_TITLES[cur] || cur;
+    const save = confirm(
+      `「${title}」还有没保存的改动。\n\n`
+      + '确定 = 先保存再离开\n'
+      + '取消 = 不保存，直接离开');
+    if (save) {
+      // 保存函数在 click 时就采好了 payload，所以后面切页重填 DOM 不影响这次保存。
+      pageSaveButtons(cur).forEach((id) => {
+        const b = document.getElementById(id);
+        if (b && !b.disabled) b.click();
+      });
+    }
+    markClean(cur);
+  }
   const pagesEl = $('#pages');
   if (pagesEl) pagesEl.scrollTop = 0;
   $$('.nav-item').forEach((b) => b.classList.toggle('is-active', b.dataset.page === page));
@@ -1089,6 +1166,7 @@ $('#btnSoulSave').addEventListener('click', async () => {
       hint.className = 'hint-line is-err';
       return;
     }
+    markClean('soul');
     toast('已保存');
     hint.textContent = '已保存 ' + hhmmss() + '（rev ' + r.revision + '）';
     hint.className = 'hint-line is-ok';
@@ -1191,6 +1269,7 @@ $('#btnMoodSave').addEventListener('click', async () => {
       h.className = 'hint-line is-err';
       return;
     }
+    markClean('mood');
     toast('已保存');
     h.textContent = '已保存 ' + hhmmss() + '，下一轮判断生效';
     h.className = 'hint-line is-ok';
@@ -2912,6 +2991,7 @@ $('#btnSave').addEventListener('click', async () => {
   try {
     const r = JSON.parse(await S.bridge.save_config(JSON.stringify(p)));
     if (r.ok) {
+      markClean('settings');
       toast('已保存');
       const h = $('#saveHint');
       h.textContent = '已保存 ' + hhmmss();
@@ -3036,8 +3116,42 @@ async function refreshTraceList() {
           `${Math.round((st.bytes || 0) / 1024)} KB，保留最近 ${st.keep || 200} 份。`;
       }
     }
+    refreshTraceSections(sel.value);
   } catch (e) { /* 设置页不该因为快照失败而报错 */ }
 }
+
+/** 画「这一轮的字数花在哪」：每段一行，段名 / 字数 / 占比。
+ *
+ * 以前这里只有一个总字数，看到 system 8000 字也不知道是哪一段涨的 ——
+ * 人格？记忆？还是插件新塞了一段？只能打开 JSON 自己数。
+ */
+async function refreshTraceSections(path) {
+  const box = $('#traceSections');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!path || !S.bridge || !S.bridge.prompt_trace_sections) return;
+  try {
+    const d = JSON.parse(await S.bridge.prompt_trace_sections(path));
+    const secs = d.sections || [];
+    if (!secs.length) {
+      box.textContent = '这份快照没有段落信息（0.11.1 之前写的）。';
+      return;
+    }
+    const total = secs.reduce((a, s) => a + (s.chars || 0), 0) || 1;
+    secs.forEach((s) => {
+      const pct = Math.round(((s.chars || 0) / total) * 100);
+      const row = document.createElement('div');
+      row.className = 'trace-sec';
+      row.innerHTML =
+        `<span class="trace-sec-name">${esc(s.name || ('座位 ' + s.seat))}</span>` +
+        `<span class="trace-sec-bar" style="width:${Math.max(4, Math.min(180, pct * 1.8))}px"></span>` +
+        `<span class="trace-sec-num">${s.chars || 0} 字 · ${pct}%</span>`;
+      box.appendChild(row);
+    });
+  } catch (e) { box.textContent = ''; }
+}
+
+$('#tracePick')?.addEventListener('change', (e) => refreshTraceSections(e.target.value));
 
 /** 模型最近一次调用是否失败 —— 回答「她为什么没回」。 */
 async function refreshModelHealth() {
@@ -3425,6 +3539,7 @@ async function savePluginConfig() {
     renderPluginSeats();
     openPlugin(id);           // 里面会重新渲染预览
     setText('#plugHint', '已保存');
+    markClean('plugins');
     toast('已保存');
   } catch (e) {
     setText('#plugHint', '保存失败：' + (e.message || e));

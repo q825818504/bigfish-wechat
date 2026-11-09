@@ -33,7 +33,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: 判"纯图片/表情"用的类型名。与 `wechat.py` 的 `msg_type` 对齐。
 MEDIA_TYPES = frozenset({"图片", "表情", "语音", "视频", "文件", "动画表情"})
@@ -52,7 +52,12 @@ class ListenPolicy:
     #: 纯图/表情：可能在连发图，多等一会
     quiet_media: float = 4.0
     #: 从第一条算起的硬上限：再吵也要回一句
-    max_wait: float = 12.0
+    #
+    # ⚠ 2026-11-08 从 12 提到 30：用户要求「最久不能超过 30 秒」。
+    #   注意这个上限只在**判定说"还有下一句"**时才会真正用到 ——
+    #   正常情况 6 秒左右就封批了。它守的是"对方一直分条发、模型一直说还有"
+    #   那种极端情况，免得她永远不回。
+    max_wait: float = 30.0
     #: 一批最多几条；到顶立即封批
     max_batch: int = 8
     #: 单条最短间隔（同一会话 0.3s 内的重复推送视为同一条）
@@ -73,7 +78,14 @@ class ListenPolicy:
     #    one is often the first bubble of a multi-part message"
     #
     #: 短消息/没说完时的等待上限
-    quiet_max: float = 4.0
+    #
+    # ⚠ 2026-11-08 用户实测反馈：4 秒仍然太短 ——
+    #   「我稍微犹豫一点发，她就已经回复了」。真人发微信经常是
+    #   「在吗」→ 想 3 秒 → 「问你个事」→ 又停 4 秒 → 正文。
+    #   4 秒会把这种节奏切成两轮，她回一次，对方再发，又回一次。
+    #   6 秒覆盖绝大多数"犹豫一下再补一句"。长句/有句号的消息仍走
+    #   quiet_min（1.5s），所以说完一句的回复速度没变慢。
+    quiet_max: float = 6.0
     #: 长消息/明确说完时的等待下限
     quiet_min: float = 1.5
 
@@ -87,6 +99,30 @@ class ListenPolicy:
     # 两个人变成一问一答地刷屏（用户原话：「没有将它合并看待」）。
     # 现在：她说完之后 `post_reply_grace` 秒内到达的消息，等满这个冷却再封批。
     post_reply_grace: float = 6.0
+
+    # ── 攒批判定：到点问一次模型「他说完了吗」（0.11.1）──
+    #
+    # 固定窗口只能猜。用户的原话：
+    #   「最短是 6 秒，然后超过 6 秒的时候，需要模型判断是否对方可能
+    #     还有下一句话没说完，如果有继续等待，最久不能超过 30 秒」。
+    #
+    # 所以流程变成：安静窗口到点（≤ quiet_max）→ 问模型 →
+    #   more=true  再等 judge_extra 秒（最多问 judge_max_rounds 次）
+    #   more=false 立即封批
+    # 硬上限仍是 max_wait（30 秒），模型说多少次"还有"也越不过它。
+    #
+    # ⚠ 判定需要 `MessageBatcher(judge=...)` 传入执行器才会启用；
+    #   不传就是老行为（到点直接封批），测试和命令行都走那条路。
+    #: 最短等待。不管自适应算出多少，**都不能早于这个时间封批**。
+    #: 用户原话：「底线限制，最短是 6 秒」。0 = 不设下限（只走自适应）。
+    batch_min_wait: float = 6.0
+    judge_enabled: bool = True
+    #: 判定"还有下一句"之后，再等多久
+    judge_extra: float = 8.0
+    #: 一批最多问几次（防止对方一直发、模型一直说还有，把预算烧光）
+    judge_max_rounds: int = 3
+    #: 单次判定超时。超时按"说完了"处理 —— 让人等一句不值得
+    judge_timeout: float = 6.0
 
 
 #: 句末标点：说完了
@@ -113,8 +149,9 @@ def adaptive_quiet(text: str, policy: "ListenPolicy") -> float:
     ⚠ 不要把它写死成"一律等 4 秒" —— 对方说完整一段话时等 4 秒是呆。
       也不要一律等 1.5 秒 —— 「在吗」之后那句「吃饭了没」就会被插话。
     """
+    floor = max(0.0, float(policy.batch_min_wait or 0.0))
     if not policy.adaptive:
-        return policy.quiet_same_author
+        return max(policy.quiet_same_author, floor)
 
     lo, hi = policy.quiet_min, policy.quiet_max
     if hi <= lo:
@@ -133,7 +170,9 @@ def adaptive_quiet(text: str, policy: "ListenPolicy") -> float:
     else:
         quiet += 0.2          # 完全没标点 → 大概率还有一句，多等
 
-    return min(hi, max(lo, quiet))
+    # 下限最后夹一次：`batch_min_wait` 是用户设的"最短等到几秒"，
+    # 比自适应上限还长时以它为准（他明确要求等更久）。
+    return max(floor, min(hi, max(lo, quiet)))
 
 
 @dataclass
@@ -186,6 +225,10 @@ class _Bucket:
     last_at: float = 0.0
     deadline: float = 0.0
     reason: str = "quiet"
+    #: 已经问过几次「他说完了吗」。对方再发消息会清零。
+    judged: int = 0
+    #: 正在等判定结果（后台线程在跑）。期间 tick 不许抢封。
+    awaiting: bool = False
 
 
 class MessageBatcher:
@@ -198,13 +241,46 @@ class MessageBatcher:
         clock: Callable[[], float] = time.monotonic,
         allow_self_for: Optional[Callable[[str], bool]] = None,
         on_log: Optional[Callable[[str], None]] = None,
+        judge: bool = False,
     ) -> None:
         self.policy = policy or ListenPolicy()
         self._clock = clock
         self._allow_self_for = allow_self_for
         self._on_log = on_log
+        #: 是否启用「到点问一次模型」。判定本身在调用方的后台线程里跑
+        #: （见 desktop 的 `_judge_one`），这里只记一个开关 ——
+        #: 攒批器保持纯状态机，不自己发 HTTP。
+        #: 默认 False：命令行入口和自检走老行为（到点直接封批）。
+        self._judge = bool(judge)
         self._lock = threading.Lock()
         self._buckets: Dict[str, _Bucket] = {}
+        #: 上一次为哪个会话打过「自己发的消息被读回来」的日志（monotonic 时刻）
+        self._self_skip_at: Dict[str, float] = {}
+
+    def _note_self_skip(self, msg: BatchMessage) -> None:
+        """她刚发出去的那句被 watcher 读回来 —— 正常闭环，不要每条都喊。
+
+        为什么会有这条：她发完 → 微信异步写库（实测 10~12 秒）→ watcher 轮询
+        读到 → 进 feed。这时 `is_self=True`，**必须丢掉**，否则她会回自己
+        （2026-11-04 那次自问自答就是这样起来的）。
+
+        以前每个会话每次都打一行，「跳过」和上一条「收」挨在一起，
+        看起来像"对方的消息被跳过了"（2026-11-08 用户当场这么问）。
+        现在同一会话 120 秒内只打第一行，并且带上她的原话 ——
+        真出问题（她自己给自己发）时仍然看得见。
+        """
+        if not self._on_log:
+            return
+        now = self._clock()
+        last = self._self_skip_at.get(msg.chat_id)
+        if last is not None and now - last < 120.0:
+            return
+        self._self_skip_at[msg.chat_id] = now
+        text = (msg.text or "").strip().replace("\n", " ")[:24]
+        who = msg.chat_name or msg.chat_id
+        self._on_log(
+            f"[跳过] {who}：她自己刚发的「{text}」被读回来，属正常闭环"
+            f"（allow_self 未开，不再重复提示）")
 
     # ------------------------------------------------------------------
     def feed(self, msg: BatchMessage,
@@ -220,9 +296,7 @@ class MessageBatcher:
             allowed = bool(self._allow_self_for
                            and self._allow_self_for(msg.chat_id))
             if not allowed:
-                if self._on_log:
-                    self._on_log(f"[跳过] {msg.chat_name or msg.chat_id}："
-                                 "自己发的消息；allow_self 没对这个会话开")
+                self._note_self_skip(msg)
                 return None
         now = self._clock()
         at = msg.received_at or now
@@ -273,12 +347,33 @@ class MessageBatcher:
             deadline = min(deadline, bucket.first_at + self.policy.max_wait)
             bucket.deadline = deadline
             bucket.reason = "mention" if msg.at_bot else ("media" if msg.is_bare_media else "quiet")
+            # 对方又说话了：上一轮判定的结论作废，重新计次。
+            # 不重置的话，"他说完了" 的旧结论会按住后面新来的消息。
+            bucket.awaiting = False
+            bucket.judged = 0
 
             if len(bucket.messages) >= self.policy.max_batch:
                 return self._seal_locked(msg.chat_id, bucket, "batch_full", now)
         return None
 
     # ------------------------------------------------------------------
+    def _should_judge(self, bucket: _Bucket, now: float) -> bool:
+        """到点了，但还该不该问一次模型「他说完了吗」。"""
+        # 没接线（命令行入口 / 自检 / 老调用方）就一律不问，到点直接封。
+        # ⚠ 这一行不能少：`judge` 默认 False，漏了它就会变成
+        #   "谁都没接判定，但谁都不敢封批" —— 对方等 30 秒才收到回复。
+        if not self._judge:
+            return False
+        p = self.policy
+        if not p.judge_enabled:
+            return False
+        if bucket.judged >= max(0, int(p.judge_max_rounds)):
+            return False
+        # 顶到硬上限就别问了 —— 问完也没时间等
+        if now >= bucket.first_at + float(p.max_wait) - 1e-6:
+            return False
+        return True
+
     def tick(self, now: Optional[float] = None) -> List[Batch]:
         """取所有到期的批次。调用方应每 100~200ms 调一次。"""
         now = self._clock() if now is None else now
@@ -290,11 +385,70 @@ class MessageBatcher:
                     self._buckets.pop(chat_id, None)
                     continue
                 if now >= bucket.deadline:
+                    # 正在等判定 / 还该问一次模型：别抢封，交给 due() + verdict()
+                    if bucket.awaiting or self._should_judge(bucket, now):
+                        continue
                     reason = bucket.reason
                     if now - bucket.first_at >= self.policy.max_wait - 1e-6:
                         reason = "max_wait"
                     out.append(self._seal_locked(chat_id, bucket, reason, now))
         return out
+
+    # ------------------------------------------------------------------
+    def due(self, now: Optional[float] = None) -> List[Tuple[str, List[BatchMessage]]]:
+        """到点、且还该问模型的批次。**只报名，不阻塞。**
+
+        调用方（desktop 的 `_batch_loop`）拿到之后要放到后台线程里跑
+        `judge(chat_id, messages)`，再回来调 `verdict()`。
+        这里顺手把桶标成 awaiting —— 所以同一个会话不会有两个判定在飞。
+        """
+        now = self._clock() if now is None else now
+        out: List[Tuple[str, List[BatchMessage]]] = []
+        with self._lock:
+            for chat_id, bucket in list(self._buckets.items()):
+                if not bucket.messages or bucket.awaiting:
+                    continue
+                if now < bucket.deadline:
+                    continue
+                if not self._should_judge(bucket, now):
+                    continue
+                bucket.awaiting = True
+                out.append((chat_id, list(bucket.messages)))
+        return out
+
+    def verdict(self, chat_id: str, more: bool,
+                now: Optional[float] = None) -> Optional[Batch]:
+        """判定结果回来了：还有下一句就再等，说完了就立刻封批。
+
+        返回非 None 表示这一批可以处理了。
+        """
+        now = self._clock() if now is None else now
+        with self._lock:
+            bucket = self._buckets.get(chat_id)
+            if bucket is None or not bucket.awaiting:
+                # 判定期间对方又说话了（feed 已把 awaiting 清掉）：旧结论作废
+                return None
+            bucket.awaiting = False
+            if not more:
+                return self._seal_locked(chat_id, bucket, "judged", now)
+
+            bucket.judged += 1
+            cap = bucket.first_at + float(self.policy.max_wait)
+            nxt = min(now + max(1.0, float(self.policy.judge_extra)), cap)
+            if nxt <= now + 1e-6:
+                return self._seal_locked(chat_id, bucket, "max_wait", now)
+            bucket.deadline = nxt
+            bucket.reason = "judged_wait"
+            if self._on_log:
+                self._on_log(
+                    f"[倾听] 判定他还有下一句，再等 {nxt - now:.0f} 秒"
+                    f"（第 {bucket.judged} 次，上限 {self.policy.max_wait:.0f} 秒）")
+            return None
+
+    def set_policy(self, policy: ListenPolicy) -> None:
+        """换一份策略。面板改完立即生效，已攒的批次不受影响。"""
+        with self._lock:
+            self.policy = policy
 
     def _seal_locked(self, chat_id: str, bucket: _Bucket, reason: str, now: float) -> Batch:
         batch = Batch(
@@ -309,6 +463,8 @@ class MessageBatcher:
         bucket.last_at = 0.0
         bucket.deadline = 0.0
         bucket.reason = "quiet"
+        bucket.judged = 0
+        bucket.awaiting = False
         self._buckets.pop(chat_id, None)
         return batch
 

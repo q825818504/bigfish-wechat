@@ -836,8 +836,13 @@ def evolve_soul(changed_views: Any, summary: str = "", *,
 
 MOOD_STORE_NAME = "bigfish-mood"
 
-# 与 mood/index.js DEFAULTS 一致的默认值。只抄界面会改的那几项 ——
-# slots / 模式由 scope.json 推，界面不直接改。
+# 与 mood/index.js DEFAULTS 一致的默认值。
+# 这些键现在都有真实消费者（0.11.1 起）：
+#   moodBase / moodFloor / decayHalfHours → mood_judge.apply_mood_delta 的衰减
+#   injectMode / injectConfidence / sigMood / sigDim / injectPerDay → 注入文本
+#   autoJudge → desktop._judge_mood_async 的闸门
+# 以前 injectMode / sigMood / sigDim / injectConfidence / autoJudge 只有读写、
+# 没有读者，界面上是五个假旋钮。
 MOOD_DEFAULTS: Dict[str, Any] = {
     "moodBase": 70,
     "moodFloor": 0,

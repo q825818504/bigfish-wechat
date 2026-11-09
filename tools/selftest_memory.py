@@ -265,6 +265,50 @@ def t_search(tmp: str) -> None:
     check("预算生效（不自爆）", total <= 40 or len(small) <= 1, f"{total}")
 
 
+def t_chunk_hits(tmp: str) -> None:
+    """命中加权：只读连接写不进 chunk_hits（0.11.1 修）。
+
+    以前 `_bump_chunk_hits` 在检索用的 `mode=ro` 连接上 INSERT，
+    抛 "attempt to write a readonly database" 又被 except 吞掉，
+    于是这张表永远是空的、+0.15 的「以前帮上过忙」加权从没生效过。
+    这个用例同时钉住两件事：真的写进去了，以及重复命中会累加。
+    """
+    section("命中加权：检索要真的记进 chunk_hits")
+    db = os.path.join(tmp, "hits.sqlite3")
+    M.ensure_schema(db)
+    use_db(db)
+    V.capture_message("wechat:dad", "h1", "user", "我特别爱吃烧烤，最近老熬夜",
+                      db_path=db)
+
+    conn = sqlite3.connect(db)
+    n0 = conn.execute("SELECT COUNT(*) FROM chunk_hits").fetchone()[0]
+    conn.close()
+    check("初始没有命中记录", n0 == 0, str(n0))
+
+    hits = M.search_chunks(db, "dafeiyu", "烧烤", max_chars=2000)
+    check("检索有结果", bool(hits), str(hits))
+
+    conn = sqlite3.connect(db)
+    rows = [{"chunk": r[0], "hits": r[1]}
+            for r in conn.execute("SELECT chunk,hits FROM chunk_hits")]
+    conn.close()
+    check("检索后写进 chunk_hits", len(rows) == 1, str(rows))
+    check("命中计数 = 1", bool(rows) and rows[0]["hits"] == 1, str(rows))
+
+    M.search_chunks(db, "dafeiyu", "烧烤", max_chars=2000)
+    conn = sqlite3.connect(db)
+    h = conn.execute("SELECT hits FROM chunk_hits").fetchone()
+    conn.close()
+    check("再检索一次累加到 2", bool(h) and h[0] == 2, str(h and h[0]))
+
+    # 只记真的进了返回集的片段：查一个命中不到的词，不该新增行
+    M.search_chunks(db, "dafeiyu", "量子纠缠", max_chars=2000)
+    conn = sqlite3.connect(db)
+    n2 = conn.execute("SELECT COUNT(*) FROM chunk_hits").fetchone()[0]
+    conn.close()
+    check("没命中就不记", n2 == 1, str(n2))
+
+
 def t_cascade(tmp: str) -> None:
     section("级联：删消息不能留幽灵")
     db = os.path.join(tmp, "cascade.sqlite3")
@@ -1112,6 +1156,7 @@ def main() -> int:
         t_schema(tmp)
         t_facts(tmp)
         t_search(tmp)
+        t_chunk_hits(tmp)
         t_cascade(tmp)
         t_session_delete(tmp)
         t_anchor(tmp)

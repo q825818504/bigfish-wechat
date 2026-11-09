@@ -48,6 +48,28 @@ MOOD_STEP_DIVISOR = 3
 # 单根情绪的半衰期（分钟）。与 index.js 的 decay() 一致。
 DIM_HALF_LIFE_MIN = 90
 
+#: 数值 → 一句人话。阈值只有这一份 ——
+#: bridge_client.Mood.label 也走这里，否则心情页显示的和提示词里的会对不上。
+MOOD_LABELS: Tuple[Tuple[int, str], ...] = (
+    (85, "心情很好"),
+    (70, "心情不错"),
+    (55, "心情还行"),
+    (40, "有点平淡"),
+    (25, "情绪低"),
+    (0, "情绪很低"),
+)
+
+
+def label_of(value: Optional[float]) -> str:
+    """把 0..100 的心情值翻成一句人话。None 返回空串。"""
+    if value is None:
+        return ""
+    v = float(value)
+    for floor, text in MOOD_LABELS:
+        if v >= floor:
+            return text
+    return "情绪很低"
+
 SYSTEM_PROMPT = """你在扮演一个角色，帮她判断「这一轮聊完之后，她自己的心情发生了什么变化」。
 
 只输出一个 JSON 对象，不要任何其他文字、不要 Markdown 代码块。
@@ -192,7 +214,10 @@ def apply_mood_delta(
     b = _clamp(int(base if base is not None else cfg["moodBase"]), 0, 100)
     fl = _clamp(int(floor if floor is not None else cfg["moodFloor"]), 0, 100)
     half = _clamp(int(cfg.get("decayHalfHours") or 12), 1, 168)
-    per_day = max(0, int(cfg.get("injectPerDay") or 6))
+    # ⚠ 不能用 `or 6`：0 是合法值（= 不注入），但 0 or 6 == 6，
+    #   于是"关掉注入"会被悄悄改成"每天 6 次"。自检的「上限 0 = 不注入」钉的就是这个。
+    _per_day = cfg.get("injectPerDay")
+    per_day = 6 if _per_day is None else max(0, int(_per_day))
 
     now = int(time.time() * 1000)
 
@@ -262,6 +287,51 @@ def apply_mood_delta(
     s["lastNotedMood"] = s["mood"]
     s["minor"] = False
     s["kind"] = "judged"
+
+    # ── 2.5 注入文本：injectMode / injectConfidence / sigMood / sigDim ──
+    #
+    # 这一段以前不存在：`lastInjectedText` 只在初始化时写成空串，之后没人写。
+    # 于是 desktop 的「这会儿的状态」永远拿到空字符串 —— 心情值能改表达预算
+    # （policy），但从来没有一句话真的进过提示词。心情页上那四个旋钮
+    # 也就成了「能填、能存、没人读」。
+    #
+    # 三种模式：
+    #   off   —— 一个字都不注入（连上一条也撤掉）
+    #   label —— 只报"现在什么心情"
+    #   event —— 只报值得说的变化：心情动了 sigMood 格，或某根情绪动了 sigDim 格
+    # 每天最多换 injectPerDay 次说法；超了就把上一条撤掉，别再占提示词。
+    mode = str(cfg.get("injectMode") or "event")
+    min_conf = _clamp(int(cfg.get("injectConfidence") or 0), 0, 100)
+    sig_mood = _clamp(int(cfg.get("sigMood") or 3), 1, 30)
+    sig_dim = _clamp(int(cfg.get("sigDim") or 5), 1, 100)
+    today = time.strftime("%Y-%m-%d")
+
+    head = f"{label_of(s['mood'])}（{int(s['mood'])}/100）"
+    want = ""
+    if mode != "off" and int(s["lastConfidence"]) >= min_conf:
+        if mode == "label":
+            want = head
+        else:
+            big_mood = abs(step) >= sig_mood
+            big_dim = any(abs(int(delta_dims.get(k, 0))) >= sig_dim
+                          for k in MOOD_DIMS_ALL)
+            if big_mood or big_dim:
+                reason = str(s["lastReason"] or "").strip()
+                want = f"{head}｜{reason}" if reason else head
+
+    if mode == "off":
+        s["lastInjectedText"] = ""
+        s["injectedCount"] = 0
+    elif want:
+        used = (int(s.get("injectedCount") or 0)
+                if s.get("injectedDay") == today else 0)
+        if per_day <= 0 or used >= per_day:
+            s["lastInjectedText"] = ""
+        else:
+            s["injectedDay"] = today
+            s["injectedCount"] = used + 1
+            s["lastInjectedText"] = want
+            s["lastInjectedAt"] = now
 
     # ── 3. 时间线 ──
     tl = s.get("timeline") if isinstance(s.get("timeline"), list) else []
