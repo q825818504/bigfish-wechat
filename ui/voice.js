@@ -137,6 +137,8 @@ async function loadVoice() {
     const p = s.policy || {};
     $('#voiceStrategy').value = p.mode || 'preview';
     $('#voiceSendAs').value = p.send_as || 'file';
+    syncVoiceModes();
+    syncVoiceSendTag();
     $('#voiceProbability').value = p.probability ?? 0.2;
     $('#voiceCooldown').value = p.cooldown ?? 600;
     $('#voiceDailyLimit').value = p.daily_limit ?? 12;
@@ -351,3 +353,49 @@ $('#btnOpenSoundSettings')?.addEventListener('click', async () => {
   const r = JSON.parse(await S.bridge.open_voice_sound_settings());
   if (!r.ok) toast(r.error || '打不开声音设置');
 });
+
+/* ────────── 页内 tab 与策略卡 ────────── */
+
+function showVoicePane(name) {
+  document.querySelectorAll('#voiceTabs [data-voice-tab]').forEach((b) => {
+    b.classList.toggle('is-active', b.dataset.voiceTab === name);
+  });
+  document.querySelectorAll('[data-voice-pane]').forEach((p) => {
+    p.hidden = p.dataset.voicePane !== name;
+  });
+}
+
+const VOICE_MODE_LABEL = {
+  off: '关闭', request: '按需', auto: '自动判断',
+  probability: '按概率', always: '每条都发', preview: '预演',
+};
+
+function syncVoiceModes() {
+  const value = $('#voiceStrategy')?.value || 'preview';
+  document.querySelectorAll('#voiceModeGrid .voice-mode').forEach((b) => {
+    b.classList.toggle('is-active', b.dataset.mode === value);
+  });
+  setText('#voiceWhenTag', VOICE_MODE_LABEL[value] || value);
+}
+
+function syncVoiceSendTag() {
+  const value = $('#voiceSendAs')?.value || 'file';
+  const tag = $('#voiceSendTag');
+  if (tag) tag.textContent = value === 'bubble' ? '语音气泡' : '音频文件';
+}
+
+$('#voiceTabs')?.addEventListener('click', (e) => {
+  const tab = e.target.closest('[data-voice-tab]');
+  if (tab) showVoicePane(tab.dataset.voiceTab);
+});
+
+$('#voiceModeGrid')?.addEventListener('click', (e) => {
+  const card = e.target.closest('[data-mode]');
+  if (!card) return;
+  const sel = $('#voiceStrategy');
+  if (sel) sel.value = card.dataset.mode;
+  syncVoiceModes();
+});
+$('#voiceStrategy')?.addEventListener('change', syncVoiceModes);
+$('#voiceSendAs')?.addEventListener('change', syncVoiceSendTag);
+$('#btnVoiceTestTop')?.addEventListener('click', () => $('#btnVoiceTest')?.click());

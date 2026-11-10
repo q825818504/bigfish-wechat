@@ -1,8 +1,110 @@
 # 进度
 
-> 最后更新：2026-11-08 14:35（**0.10.6 hotfix：发送收尾缩进塌陷**）
+> 最后更新：2026-11-10 20:45（**0.12.1：已打包，准备提交/推送/发布**）
 
-## 最新：0.10.6 —— 发送收尾缩进塌陷（hotfix，未提交）
+## 最新：0.12.1 —— 补齐四处 UI 设计缺口（待发布）
+
+0.12.0 留了四处「视觉统一、结构未做完」：
+
+1. 印象页从单卡纵向改成人物列表 / 主卡 / 关系侧栏；
+2. 表情包选中一张后右侧常驻详情，双击仍打开完整编辑；
+3. 心情页改成左状态/维度/原话、右预算/余韵/参数；
+4. 声音页拆成三个页内 tab。
+
+同时做一轮新 UI ↔ 旧 JS / bridge 的只读审计，修掉错位与边界 bug。
+完成后升 0.12.1、跑全套自检、重新打 exe。
+
+### 落地与审计修复
+
+- `bigfish/desktop.py` 的 `get_mood()` 增加 `budget` / `afterglow`；
+  `get_today()` 拆 `day`（真实今天）与 `life_day`，跨天仍返回 plan；
+  `stop_engine()` 清零本轮计数；`open_path()` 对文件直接打开文件。
+- `ui/app.js` 修睡眠态、精力 chip、最近对话双写、页头保存监听、
+  今日失败提示、秒级时钟；新增 `selftest_today.py`。
+- `ui/stickers.js` 加单击选中 + 右侧常驻详情；`ui/voice.js` 加三 tab
+  与策略卡同步；`ui/index.html` 重排印象/表情/心情/声音。
+- 审计报告列出的 14 条里，确定的 UI 行为问题已修；剩下的是
+  “get_today 多返回字段” 和无数据页的占位，不影响功能。
+
+### 验证
+
+- `selftest_ui`：全部通过（新增今日日期、预算、人物列表、表情详情、声音 tab）
+- `selftest_today`：通过（日期分离 / 跨天 plan / 预算）
+- `selftest_ui_pages` 65/65、`selftest_scope_ui` 75/75、`test_no_leak` 30/30
+- 源码全套：25 通过 / 3 失败 / 1 跳过；3 项是开发环境 mood 空、
+  记忆桥接 0、模型 403，不属于 UI 回归。
+
+### 打包
+
+- 版本：`0.12.1`
+- `dist/BigFish/BigFish.exe` 7.9 MB；打包版自检报 0.12.1。
+- 打包版自检：20 通过 / 1 失败 / 1 跳过（非管理员写探针 / UIA）。
+- 数据指纹：8817 文件 / 1,828,968,784 字节，前后一致。
+- 便携包 `release/BigFish-0.12.1-portable.zip`：341 文件 / 200.5 MB，
+  SHA-256 `ae88b88a5b999cf630c82ac17c840f9cbabfb9c11608add4b9f2655279393974`。
+
+### 发布（进行中）
+
+- 待提交源码、UI 设计源和文档到 `main`；
+- 待创建并推送 annotated tag `v0.12.1`；
+- 待执行 `tools/make_release.py`，上传 zip + manifest；
+- 发布后回填 commit/tag/Release 结果。
+
+## 0.12.0 —— 生活气象观测 UI 重构（已打包）
+
+**用户要求**：按已经批准的设计稿把大肥鱼重构，不是再出 mock。
+设计稿在 `design/bigfish-ui/`，真实产品在 `ui/`。
+
+### 落地
+
+- 新增 `ui/redesign.css` 作为覆盖层，`style.css` 保留兼容路径。
+- `ui/index.html` 换成新壳层：深云杉侧栏、雾白工作区、顶栏日期/本机标识、
+  新的「她的今天」首屏；12 个页面数量不变。
+- `ui/app.js` 增加 `loadToday()` / `renderToday()` / 顶栏时钟 /
+  新会话行；原有 `refreshStatus()`、监听、发送、保存逻辑继续用原 id。
+- `bigfish/desktop.py` 新增只读 `get_today()`，返回生活状态、日程、心情、
+  天气缓存、日记、余韵和最近事件。
+- 设置 / 数据目录 / 插件用已有 DOM 排成双栏；数据页鲸落改为红色危险面。
+- 没有生活状态时 `get_today()` 返回 `energy=null`、`condition="还没有生活状态"`，
+  不拿默认精力冒充真实值。
+
+### 验证
+
+| 命令 | 结果 |
+|---|---|
+| `python tools/selftest_ui.py` | 全部通过（真实 Qt WebEngine，逐页 DOM） |
+| `python tools/selftest_ui_pages.py` | 65/65 |
+| `python tools/selftest_scope_ui.py` | 75/75 |
+| `python tools/test_no_leak.py` | 30/30 |
+| `python tools/check_slots.py` | 通过 |
+| `node --check ui/app.js` / `py_compile` | 通过 |
+
+### 版本与打包
+
+- `bigfish/__init__.py`：`0.11.2` → `0.12.0`
+- README 当前版本与安装包名同步到 0.12.0
+- 2026-11-10 07:29 执行 `python tools/deploy.py`：打包 → 覆盖程序 → 自检。
+  只覆盖程序文件，data / config 未动。
+- `dist/BigFish/BigFish.exe` 7.9 MB；打包版自检报版本 0.12.0，
+  20 通过 / 1 失败 / 1 跳过。
+  - 失败：非管理员下 `D:\大肥鱼\.bigfish-write-probe.tmp` Permission denied；
+  - 跳过：UIA 需要管理员。
+- 数据指纹前后一致：8817 文件 / 1,828,968,803 字节。
+- 便携包：`release/BigFish-0.12.0-portable.zip`，341 文件 / 200.5 MB，
+  SHA-256 `3247f8be28a9ac748fcf19c3615dc7437d9dd77822aaa57414346c1232c05ef3`；
+  清单 `release/BigFish-0.12.0-manifest.json`。
+- 源码 `python tools/selftest.py`：24 通过 / 3 失败 / 1 跳过。失败项是
+  开发环境 mood 为空、记忆桥接 0 条、模型 403，不涉及 UI 契约；
+  `selftest_ui` 与四条 UI/桥接测试均通过。
+
+### 设计上还没合并的
+
+- 印象页仍是单卡纵向；设计稿的三栏可以下一轮做。
+- 表情包还没有常驻详情侧栏。
+- 心情预算卡和七维图还没做成设计稿的横向组合。
+- 声音页仍是单页表单，没有拆成三个页内 tab。
+
+## 0.10.6 —— 发送收尾缩进塌陷（hotfix，未提交）
 
 **用户看到的现象**：微信里对方明明收到了两条，日志写
 「[发] 这一轮一条都没发出去」，而且成功日志 `[发] ...` 一行都没有。

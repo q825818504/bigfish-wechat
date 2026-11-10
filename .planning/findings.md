@@ -1,5 +1,19 @@
 # v0.11.0 发布审计发现
 
+## 2026-11-10 · 0.12.0 UI 重构
+
+- 设计稿在 `design/bigfish-ui/`；真实产品在 `ui/`。重构采用
+  `redesign.css` 覆盖层，不重写 `app.js` 业务。
+- 12 个页面和关键 id 没变；`selftest_ui_pages` 仍要求 12 个
+  `.nav-item[data-page]` 和 12 个 `.page[data-page]`。
+- 新桥接 `Backend.get_today()` 只读。`life.load()` 没生活状态时
+  `energy` 必须返回 `null`，否则界面会拿默认 78 冒充真实精力。
+- 设置页旧测试用的是已不存在的 `#cfgEndpoint`，实际输入框是
+  `#cfgBaseUrl`；作用域测试的 `FakeBackend` 需要 `account_id`。
+- 打包产物必须包含 `ui/redesign.css`；`packaging/bigfish.spec` 是整目录
+  收 `ui/`，`deploy.py` 还会同时刷 exe 同级和 `_internal/ui` 两份。
+
+
 ## 仓库与发布
 
 - 远端：`https://github.com/q825818504/bigfish-wechat.git`

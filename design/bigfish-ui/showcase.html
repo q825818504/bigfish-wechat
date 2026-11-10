@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>大肥鱼 · 生活气象观测 UI 设计</title>
+<style>
+  :root {
+    --ink: #172622; --muted: #5d7069; --faint: #68776f;
+    --paper: #f1f3ed; --surface: #fafbf6; --line: #d7e0d8;
+    --teal: #19443f; --teal-2: #2f6b61; --rain: #6f93a2;
+    --sun: #dcb25c; --leaf: #6b8a70; --rose: #b9756b;
+    --font: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+    --display: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 100%; height: 100%; }
+  body { background: var(--paper); color: var(--ink); font-family: var(--font); overflow: hidden; }
+  .board { width: 1600px; height: 1200px; padding: 46px 52px 28px; display: flex; flex-direction: column; }
+  .top { display: flex; align-items: flex-start; gap: 26px; flex: none; padding-bottom: 24px; }
+  .brand-mark { width: 58px; height: 58px; border-radius: 18px; overflow: hidden; flex: none; background: #dcebe4; }
+  .brand-mark img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .title-block { flex: 1; }
+  .title-block h1 { margin: 0; font-family: var(--display); font-size: 51px; font-weight: 650; line-height: 1.06; letter-spacing: -.05em; }
+  .title-block p { margin: 10px 0 0; color: var(--muted); font-size: 16px; line-height: 1.55; max-width: 700px; }
+  .top-meta { display: flex; align-items: center; gap: 8px; padding-top: 8px; color: var(--faint); font-size: 12px; white-space: nowrap; }
+  .top-meta .badge { color: #6f5828; background: #f2e7ce; padding: 4px 8px; border-radius: 6px; }
+  .top-meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--teal-2); }
+  .hero-grid { display: grid; grid-template-columns: minmax(0, 1.58fr) minmax(390px, .82fr); gap: 22px; flex: none; }
+  .shot-frame { border-radius: 18px; overflow: hidden; background: #fff; position: relative; }
+  .shot-frame.hero { height: 585px; }
+  .shot-frame.hero img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+  .hero-caption { position: absolute; left: 18px; bottom: 16px; background: rgba(20,50,45,.9); color: #f7fbf7; font-size: 11px; padding: 5px 8px; border-radius: 5px; }
+  .side { background: var(--teal); color: #eef6f0; border-radius: 18px; padding: 22px; height: 585px; display: flex; flex-direction: column; }
+  .side h2 { margin: 0; font-size: 21px; font-weight: 620; letter-spacing: -.03em; line-height: 1.35; }
+  .side p { margin: 10px 0 0; color: #c0d5cc; font-size: 12px; line-height: 1.65; }
+  .side-label { color: #9db9b1; font-size: 10px; margin-top: 20px; letter-spacing: .02em; }
+  .principle { display: grid; gap: 7px; margin-top: 8px; }
+  .principle div { display: flex; gap: 8px; color: #e0ece5; font-size: 11.5px; line-height: 1.5; }
+  .principle i { width: 5px; height: 5px; border-radius: 50%; background: var(--sun); display: block; margin-top: 6px; flex: none; }
+  .palette { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; margin-top: 9px; }
+  .swatch { height: 44px; border-radius: 7px; border: 1px solid rgba(255,255,255,.12); /* taste-skill-ignore: swatch boundary */ }
+  .swatch-row { display: flex; justify-content: space-between; gap: 8px; color: #a7c0b7; font-size: 8.5px; margin-top: 4px; }
+  .side .foot { margin-top: auto; padding-top: 18px; color: #a7c0b7; font-size: 9.5px; line-height: 1.55; border-top: 1px solid rgba(255,255,255,.13); /* taste-skill-ignore: board metadata boundary */ }
+  .screens { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 13px; margin-top: 22px; flex: 1; min-height: 0; }
+  .screen { min-width: 0; }
+  .screen .thumb { height: 180px; border-radius: 11px; overflow: hidden; background: #fff; border: 1px solid var(--line); /* taste-skill-ignore: screenshot frame */ }
+  .screen .thumb img { display: block; width: 100%; height: 100%; object-fit: cover; object-position: top center; }
+  .screen .cap { display: flex; align-items: center; gap: 5px; margin-top: 6px; color: var(--muted); font-size: 10px; }
+  .screen .cap b { color: var(--ink); font-weight: 600; font-size: 11px; }
+  .screen .cap .dot { width: 4px; height: 4px; border-radius: 50%; background: var(--teal-2); }
+  .footer { flex: none; display: flex; justify-content: space-between; align-items: flex-end; gap: 20px; padding-top: 17px; border-top: 1px solid var(--line); /* taste-skill-ignore: board footer boundary */ margin-top: 18px; }
+  .footer p { margin: 0; color: var(--faint); font-size: 10px; line-height: 1.5; }
+  .footer strong { display: block; color: var(--muted); font-size: 11px; font-weight: 600; margin-bottom: 2px; }
+  .screen-index { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; max-width: 650px; }
+  .screen-index span { color: var(--faint); background: rgba(25,68,63,.05); border-radius: 4px; padding: 2px 5px; font-size: 9px; }
+</style>
+</head>
+<body>
+<div class="board">
+  <header class="top">
+    <div class="brand-mark"><img src="assets/avatar.png" alt="大肥鱼"></div>
+    <div class="title-block">
+      <h1>大肥鱼 · 生活气象观测</h1>
+      <p>把“她此刻怎样、今天在做什么、为什么这样说”放进同一片天色。12 个功能板块完整保留，重新组织成一套温暖、清晰、可长期使用的桌面控制台。</p>
+    </div>
+    <div class="top-meta"><span class="badge">UI 设计提案</span><span class="dot"></span><span>1440×1000 · 12 页 / 23 个状态</span></div>
+  </header>
+
+  <main class="hero-grid">
+    <div class="shot-frame hero">
+      <img src="screens/01-overview.png" alt="大肥鱼概览页">
+      <span class="hero-caption">她的今天 · 情绪 / 精力 / 日光时间带 / 日程 / 最近发生</span>
+    </div>
+    <aside class="side">
+      <h2>不是模型后台，<br>是有人正在过日子。</h2>
+      <p>首屏先回答“她此刻怎样”，再进入灵魂、心情、记忆、印象、声音与系统。所有状态都来自真实产品结构，演示数据为合成夹具。</p>
+      <div class="side-label">设计原则</div>
+      <div class="principle">
+        <div><i></i><span>状态先于参数，日常感先于技术感。</span></div>
+        <div><i></i><span>情绪、日程与对话共用一条时间线。</span></div>
+        <div><i></i><span>重要操作清楚，隐私与危险操作分级。</span></div>
+        <div><i></i><span>所有空态、未保存、不可写与未知都可见。</span></div>
+      </div>
+      <div class="side-label">色彩与材质</div>
+      <div class="palette">
+        <div><div class="swatch" style="background:#153b38"></div><div class="swatch-row"><span>云杉</span><span>#153B38</span></div></div>
+        <div><div class="swatch" style="background:#e8efea"></div><div class="swatch-row"><span>雾纸</span><span>#E8EFEA</span></div></div>
+        <div><div class="swatch" style="background:#6f93a2"></div><div class="swatch-row"><span>雨蓝</span><span>#6F93A2</span></div></div>
+        <div><div class="swatch" style="background:#dcb25c"></div><div class="swatch-row"><span>晨光</span><span>#DCB25C</span></div></div>
+        <div><div class="swatch" style="background:#b9756b"></div><div class="swatch-row"><span>晚霞</span><span>#B9756B</span></div></div>
+      </div>
+      <div class="foot">字体：系统中文 UI 字族 · 数字使用等宽数位<br>控件：标准桌面输入、开关、表格与分页；天气图形只承担状态。</div>
+    </aside>
+  </main>
+
+  <section class="screens">
+    <div class="screen"><div class="thumb"><img src="screens/04-mood.png" alt="心情页"></div><div class="cap"><b>心情</b><span class="dot"></span><span>七维与表达预算</span></div></div>
+    <div class="screen"><div class="thumb"><img src="screens/03-soul.png" alt="灵魂页"></div><div class="cap"><b>灵魂</b><span class="dot"></span><span>人格与注入预览</span></div></div>
+    <div class="screen"><div class="thumb"><img src="screens/05-memory.png" alt="记忆页"></div><div class="cap"><b>记忆</b><span class="dot"></span><span>事实、来源与可见性</span></div></div>
+    <div class="screen"><div class="thumb"><img src="screens/07-stickers.png" alt="表情包页"></div><div class="cap"><b>表情包</b><span class="dot"></span><span>收藏与发送状态</span></div></div>
+    <div class="screen"><div class="thumb"><img src="screens/10-plugins.png" alt="插件页"></div><div class="cap"><b>插件</b><span class="dot"></span><span>身份序与实时注入</span></div></div>
+    <div class="screen"><div class="thumb"><img src="screens/08-voice.png" alt="声音页"></div><div class="cap"><b>声音</b><span class="dot"></span><span>出声策略与失败回退</span></div></div>
+  </section>
+
+  <footer class="footer">
+    <div><strong>完整界面覆盖</strong><p>所有示例内容均为合成数据；角色头像沿用现有资产，表情贴纸为 AI 生成示例。</p></div>
+    <div class="screen-index"><span>概览</span><span>会话</span><span>灵魂</span><span>心情</span><span>记忆</span><span>印象</span><span>表情包</span><span>声音</span><span>数据目录</span><span>插件</span><span>设置</span><span>日志</span></div>
+  </footer>
+</div>
+</body>
+</html>

@@ -469,6 +469,27 @@ def _bonds_of(db: str, owner: str, limit: int = 20) -> list:
         return []
 
 
+def _bond_events_of(db: str, owner: str, limit: int = 8) -> list:
+    """关系事件时间线，给印象页用。没有事件就返回空列表。"""
+    try:
+        from bigfish import bond as B
+
+        if not (db and owner):
+            return []
+        B.ensure_schema(db)
+        return [{
+            "id": it.get("id"),
+            "kind": it.get("kind") or "",
+            "kindLabel": B.EVENT_LABELS.get(it.get("kind") or "", "事件"),
+            "what": it.get("what") or "",
+            "evidence": it.get("evidence") or "",
+            "at": it.get("at") or 0,
+            "atText": ts_to_local(it.get("at") or 0),
+        } for it in B.list_events(db, "dafeiyu", owner, limit=limit)]
+    except Exception:
+        return []
+
+
 def _bond_block(owner: str) -> str:
     """关系卡：她怎么称呼这个人、有什么一直没说出口。
 
@@ -4623,9 +4644,160 @@ class Backend(QObject):
                 "dims": m.dims,
                 "updated": ts_to_local(m.updated_at) if m.updated_at else "",
             })
+            # 这一轮的预算不是界面算的：mood / energy / 余韵在回复链路里
+            # 真正怎么收紧，就在这里用同一套 policy 算给用户看。
+            try:
+                import time as _time
+                from bigfish import policy as _policy
+                from bigfish import life as _life
+                from bigfish import afterglow as _ag
+
+                st = _life.load()
+                energy = st.energy if st.day else None
+                pol = _policy.response_policy(
+                    mood=m.value, dims=m.dims, energy=energy,
+                    now=_time.time())
+                pol = _policy.apply_afterglow(
+                    pol, _ag.current_effect(now=_time.time()))
+                out["budget"] = {
+                    "parts": pol.max_parts,
+                    "chars": pol.max_chars,
+                    "silence": pol.silence_bias,
+                    "must_after": pol.must_reply_after,
+                    "tone": pol.tone_line,
+                    "reason": pol.reason,
+                    "energy": round(float(energy), 0) if energy is not None else None,
+                }
+                active = _ag.active(_ag.load(), now=_time.time())
+                out["afterglow"] = {
+                    "count": len(active),
+                    "text": _ag.summary(now=_time.time()) if active else "",
+                }
+            except Exception as exc:
+                out["budget"] = {"error": str(exc)}
             return json.dumps(out, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+    @Slot(result=str)
+    def get_today(self) -> str:
+        """她今天的一片生活：生活状态、日程、心情、日记与感知。
+
+        只读，不触发模型、不写盘。界面刷新不应该改变她的生活。
+        """
+        try:
+            import datetime as _dt
+            import time as _time
+            from bigfish import life as _life
+            from bigfish import senses as _senses
+            from bigfish import journal as _journal
+            from bigfish import afterglow as _ag
+            from bigfish.bridge_client import load_mood_only
+
+            now = _time.time()
+            local = _dt.datetime.fromtimestamp(now)
+            st = _life.load()
+            has_life = bool(st.day)
+
+            plan = []
+            # 跨天没醒/引擎没跑时，life.day 会停在昨天，但 plan 仍然是她
+            # 最后写的安排。这里不能按「plan_day == life.day」把它丢掉 ——
+            # 那会让早上第一眼看到「今天还没有排日程」，而磁盘上明明有。
+            # UI 用 plan_day 和真实今天比较，显示「安排来自前一天」。
+            if st.plan:
+                for item in st.plan:
+                    if not isinstance(item, dict):
+                        continue
+                    plan.append({
+                        "at": str(item.get("at") or ""),
+                        "what": str(item.get("what") or ""),
+                        "done": bool(item.get("done")),
+                        "done_by": str(item.get("done_by") or ""),
+                        "from": str(item.get("from") or ""),
+                        "shareable": item.get("shareable") is not False,
+                    })
+
+            def hm(ts):
+                try:
+                    return _dt.datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+                except Exception:
+                    return ""
+
+            mood = load_mood_only()
+            afterglow_items = []
+            try:
+                afterglow_items = _ag.active(_ag.load(), now=now)
+            except Exception:
+                pass
+
+            weather = ""
+            city = ""
+            try:
+                weather = _senses.cached_weather(now)
+                city = str(((_senses.load() or {}).get("weather") or {}).get("city") or "")
+            except Exception:
+                pass
+
+            days = []
+            journal_text = ""
+            journal_day = ""
+            try:
+                days = _journal.list_days(limit=7)
+                journal_day = days[0] if days else ""
+                if journal_day:
+                    journal_text = _journal.read(journal_day)
+            except Exception:
+                pass
+
+            return json.dumps({
+                "ok": True,
+                "now": local.isoformat(timespec="seconds"),
+                # day/weekday 是**真实今天**；life_day 才是她生活状态那天。
+                # 引擎整天没跑时二者不同，不能让顶栏和日程各说各的。
+                "day": local.strftime("%Y-%m-%d"),
+                "life_day": st.day or "",
+                "weekday": "一二三四五六日"[local.weekday()],
+                "greeting": ("早上好" if local.hour < 11 else
+                             "下午好" if local.hour < 18 else "晚上好"),
+                "life": {
+                    "asleep": bool(st.asleep) if has_life else False,
+                    "energy": round(float(st.energy), 0) if has_life else None,
+                    "doing": str(st.doing or "") if has_life else "",
+                    "condition": (_life.condition(st, now)
+                                  if has_life else "还没有生活状态"),
+                    "wake_at": hm(st.wake_at) if has_life else "",
+                    "bedtime": hm(st.bedtime) if has_life else "",
+                    "sleep_debt": round(float(st.sleep_debt or 0), 0),
+                    "plan_day": str(st.plan_day or ""),
+                    "trace": [
+                        {"at": hm(x.get("at")), "doing": str(x.get("doing") or "")}
+                        for x in (st.day_trace or [])[-4:]
+                        if isinstance(x, dict)
+                    ],
+                },
+                "plan": plan,
+                "mood": {
+                    "value": mood.value if mood else None,
+                    "label": mood.label if mood else "",
+                    "reason": mood.last_reason if mood else "",
+                    "updated": (ts_to_local(mood.updated_at)
+                                if mood and mood.updated_at else ""),
+                },
+                "afterglow": {
+                    "count": len(afterglow_items),
+                    "text": _ag.summary(now=now) if afterglow_items else "",
+                },
+                "weather": {"line": weather, "city": city},
+                "journal": {
+                    "day": journal_day,
+                    "text": journal_text[:1200],
+                    "days": days,
+                    "path": _journal.path_for(journal_day) if journal_day else "",
+                },
+                "recent": list(getattr(self, "_recent", [])[:4]),
+            }, ensure_ascii=False)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
 
     @Slot(str, result=str)
     def save_mood_config(self, payload: str) -> str:
@@ -5157,6 +5329,9 @@ class Backend(QObject):
                 # 关系卡跟着人走：它本来就是「我对这个人的认识」的一部分，
                 # 之前单独占一个侧栏板块，等于把同一件事说了两遍。
                 p["bonds"] = _bonds_of(db, p["owner"])
+                # 时间线只给真实事件（bond_events），没有就不返回；
+                # 前端不会用 bonds 现编一条“事件”。
+                p["events"] = _bond_events_of(db, p["owner"])
             # 主人置顶，其余按事实数排 —— 聊得多的人排前面
             people.sort(key=lambda p: (0 if p.get("isOwner") else 1,
                                        -int(p.get("facts") or 0)))
@@ -6281,14 +6456,13 @@ class Backend(QObject):
             if not p or not os.path.exists(p):
                 return json.dumps({"ok": False, "error": f"路径不存在：{p}"},
                                   ensure_ascii=False)
+            # 文件名给了就打开这个文件，目录才打开目录。
+            # 以前一律打开 dirname，点「打开 journal」只会停在文件夹，
+            # 用户还得自己从一堆日期里找那一篇。
             if sys.platform == "win32":
-                if os.path.isdir(p):
-                    os.startfile(p)  # noqa: S606
-                else:
-                    os.startfile(os.path.dirname(p))  # noqa: S606
+                os.startfile(p)  # noqa: S606
             else:
-                subprocess.Popen(["xdg-open", p if os.path.isdir(p)
-                                  else os.path.dirname(p)])
+                subprocess.Popen(["xdg-open", p])
             return json.dumps({"ok": True}, ensure_ascii=False)
         except Exception as exc:
             return json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False)
@@ -6959,6 +7133,10 @@ class Backend(QObject):
             self.worker.wait(6000)
             self.worker = None
         self.started_at = 0.0
+        # 停止后 recv/reply 是上一轮的累计值，不该继续挂在「未启动」旁边
+        # 像实时数字。下一轮 start_engine 会从 0 重新计。
+        self.recv_count = 0
+        self.reply_count = 0
 
     def _on_log(self, text: str, kind: str) -> None:
         self._log_seq += 1

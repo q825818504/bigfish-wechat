@@ -69,6 +69,7 @@ async function syncPluginNav() {
 S.stickers = { items: [], dir: '', enabled: false };
 S.pending = [];          // 待导入：[{path, name}]
 S.detailCode = '';       // 当前打开详情的表情代码
+S.stickerSelected = '';  // 右侧常驻详情选中的一张
 
 /* ────────── 读取 ────────── */
 
@@ -90,6 +91,14 @@ async function loadStickers() {
         ? '发表情<b style="color:var(--ok)">已开启</b>。开关和频率在 <a href="#" data-goto="plugins" style="color:var(--accent)">插件</a> 页的「表情包」里。'
         : '发表情<b style="color:var(--muted)">还没开启</b>。开关和频率在 <a href="#" data-goto="plugins" style="color:var(--accent)">插件</a> 页的「表情包」里 —— 这一页只管她手里有哪些牌，不管什么时候出。';
     }
+    const sendTag = $('#stickerSendTag');
+    if (sendTag) {
+      sendTag.className = 'tag ' + (d.enabled ? 'ok' : 'warn');
+      sendTag.textContent = d.enabled ? '已开启' : '未开启';
+    }
+    setText('#stickerSendNote', d.enabled
+      ? '她可以在聊天里发这些表情；频率、冷却和挑图方式在插件页。'
+      : '发表情还没开启；收藏仍然都在，随时可以回来改说明。');
 
     renderStickerGrid(d.items);
     fillThumbsInBackground(d.items);
@@ -141,6 +150,7 @@ function patchThumbSrcs(items) {
       el.src = stickerSrc(it.thumb);
       el.dataset.thumbed = '1';
     }
+    if (S.stickerSelected === it.code) selectSticker(it.code);
   }
 }
 
@@ -211,8 +221,41 @@ function stickerCardHtml(it) {
 function bindStickerCards(root) {
   root.querySelectorAll('.sticker-item:not([data-bound])').forEach((el) => {
     el.dataset.bound = '1';
+    el.addEventListener('click', () => selectSticker(el.dataset.code, false));
     el.addEventListener('dblclick', () => openStickerDetail(el.dataset.code));
   });
+}
+
+/* 右侧常驻详情：只用列表字段，不在这里额外调模型/读图。
+ * 完整说明仍然走双击弹窗；单击只是让库里“当前在看哪张”有落点。 */
+function selectSticker(code, scroll) {
+  const body = $('#stickerPreviewBody');
+  const empty = $('#stickerPreviewEmpty');
+  if (!body || !empty) return;
+  const it = (S.stickerItems || []).find((x) => x.code === code);
+  document.querySelectorAll('#stickerList .sticker-item').forEach((el) => {
+    el.classList.toggle('is-selected', !!it && el.dataset.code === it.code);
+  });
+  if (!it) {
+    S.stickerSelected = '';
+    body.hidden = true;
+    empty.hidden = false;
+    return;
+  }
+  S.stickerSelected = it.code;
+  body.hidden = false;
+  empty.hidden = true;
+  $('#stickerPreviewImg').src = stickerSrc(it.thumb || it.path);
+  setText('#stickerPreviewTitle', it.brief || '（没写说明）');
+  setText('#stickerPreviewDim', it.moodDimLabel || '未标情绪');
+  setText('#stickerPreviewIntensity', '强度 ' + Number(it.intensity || 3) + ' / 5');
+  setText('#stickerPreviewCode', it.code || '—');
+  setText('#stickerPreviewFile', it.file || '—');
+  setText('#stickerPreviewSize', stickerBytes(it.size));
+  if (scroll) {
+    const el = document.querySelector(`#stickerList .sticker-item[data-code="${it.code}"]`);
+    if (el) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
 }
 
 function stickerPageCount() {
@@ -234,6 +277,9 @@ function renderStickerPage(page) {
 
   box.innerHTML = slice.map(stickerCardHtml).join('');
   bindStickerCards(box);
+  const keep = S.stickerSelected
+    && S.stickerItems.some((it) => it.code === S.stickerSelected);
+  selectSticker(keep ? S.stickerSelected : (slice[0] && slice[0].code) || '');
   updateStickerPager();
   // 翻页后回到顶部，否则会停在上一页的位置，看起来像"少了一半"
   const sc = document.getElementById('pages');
@@ -251,6 +297,8 @@ function renderStickerGrid(items) {
       '<div class="empty-hint">还没有表情。点右上角「添加表情」放几张进来。<br>' +
       '<span style="opacity:.75">任意格式都行，导入时统一转 GIF —— ' +
       '只有 .gif 会被微信认成原生表情（会动、对方能长按添加）。</span></div>';
+    S.stickerSelected = '';
+    selectSticker('');
     updateStickerPager();
     return;
   }
@@ -276,12 +324,21 @@ function updateStickerPager() {
 
 $('#btnStickerPrev')?.addEventListener('click', () => renderStickerPage(S.stickerPage - 1));
 $('#btnStickerNext')?.addEventListener('click', () => renderStickerPage(S.stickerPage + 1));
+$('#btnStickerPreviewEdit')?.addEventListener('click', () => {
+  if (S.stickerSelected) openStickerDetail(S.stickerSelected);
+});
+$('#btnStickerPreviewTest')?.addEventListener('click', () => {
+  if (!S.stickerSelected) return toast('先选一张表情');
+  S.detailCode = S.stickerSelected;
+  testStickerSend();
+});
 
 /* ────────── 详情弹窗 ────────── */
 
 async function openStickerDetail(code) {
   const base = (S.stickers.items || []).find((x) => x.code === code);
   if (!base) return;
+  selectSticker(code);
   S.detailCode = code;
 
   // 先用列表里就有的字段把弹窗填上（不让用户看空白），

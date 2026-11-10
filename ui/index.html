@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>大肥鱼</title>
 <link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="redesign.css">
 </head>
 <body>
 
@@ -18,8 +19,9 @@
       </div>
       <div class="brand-text">
         <strong>大肥鱼</strong>
-        <span>微信</span>
+        <span>住在微信里的她</span>
       </div>
+      <span class="brand-version" id="brandVersion">v0.12.1</span>
     </div>
 
     <nav class="nav">
@@ -33,7 +35,7 @@
         <span>会话</span>
       </button>
 
-      <span class="nav-caption">大肥鱼</span>
+      <span class="nav-caption">她</span>
       <button class="nav-item" data-page="soul">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M12 20s-7-4.4-7-9a4 4 0 017-2.6A4 4 0 0119 11c0 4.6-7 9-7 9z"/></svg>
         <span>灵魂</span>
@@ -84,6 +86,7 @@
         <span id="statusText">未启动</span>
       </div>
       <div class="local-label" id="accountLabel">—</div>
+      <div class="privacy-label">所有内容只留在本机</div>
     </div>
   </aside>
 
@@ -93,9 +96,12 @@
       <div class="breadcrumb">
         <span>大肥鱼</span>
         <span class="sep">/</span>
-        <strong id="breadcrumb">概览</strong>
+        <strong id="breadcrumb">她的今天</strong>
       </div>
       <div class="topbar-actions">
+        <span class="local-badge">本机</span>
+        <span class="topbar-date" id="appDate">—</span>
+        <span class="topbar-clock" id="appClock">—</span>
         <button class="icon-btn" id="btnUpdate" title="检查更新" hidden>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 4v10m0 0l-3.2-3.2M12 14l3.2-3.2M5 17v2h14v-2"/></svg>
         </button>
@@ -107,110 +113,155 @@
 
     <main class="pages" id="pages">
 
-      <!-- ═══════ 概览 ═══════ -->
+      <!-- ═══════ 她的今天 ═══════ -->
       <section class="page is-active" data-page="overview">
         <div class="page-heading">
-          <div>
-            <h1>概览</h1>
-            <p>她在微信里的运行情况，一眼看清。</p>
+          <div class="page-heading-copy">
+            <h1>她的今天</h1>
+            <p>不是等你说话才存在的角色。先看看她此刻怎样，再决定要不要改什么。</p>
+            <div class="page-meta">
+              <span class="status-pill"><span class="dot"></span><span id="ovUpdated">—</span></span>
+              <span class="meta-sep">·</span>
+              <span id="ovMetaRuntime">本机运行</span>
+            </div>
           </div>
-          <div class="heading-side" id="ovUpdated">—</div>
+          <div class="heading-side">
+            <button class="btn btn-secondary" data-goto="chats"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16v10H8l-4 4V6z"/></svg> 查看会话</button>
+            <button class="btn btn-primary" id="btnRefreshOverview"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M20 11a8 8 0 10-2.3 5.7M20 5v6h-6"/></svg> 刷新状态</button>
+          </div>
         </div>
 
-        <div class="grid-2">
-          <!-- 主控卡 -->
-          <div class="card power-card">
-            <div class="power-top">
-              <div class="power-copy">
-                <div class="power-label">微信助手</div>
-                <div class="power-state" id="ovState">未启动</div>
-                <div class="power-hint" id="ovStateHint">登录并选择会话后，点右侧按钮启动。</div>
+        <div class="overview-layout">
+          <div class="overview-main">
+            <section class="today-hero">
+              <div class="hero-main">
+                <div class="hero-avatar"><img src="icon.png" alt="" draggable="false"></div>
+                <div class="hero-copy">
+                  <h2 id="ovGreeting">她正在过自己的今天。</h2>
+                  <p id="ovStateHint">登录并选择会话后，点右侧按钮启动。</p>
+                  <div class="hero-chips">
+                    <span class="hero-chip" id="ovCondition">生活状态加载中</span>
+                    <span class="hero-chip" id="ovEnergy">精力 —</span>
+                    <span class="hero-chip" id="ovWake">睡眠 —</span>
+                  </div>
+                </div>
+                <div class="hero-weather" id="ovWeatherWrap" hidden>
+                  <svg class="weather-glyph" viewBox="0 0 72 52" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M23 37h31a10 10 0 0 0 1.6-19.9A15.5 15.5 0 0 0 26 21.7 9 9 0 0 0 23 37Z"/>
+                    <path d="M17 43h34" opacity=".55"/>
+                  </svg>
+                  <strong id="ovWeatherValue">—</strong>
+                  <span id="ovWeatherCity">—</span>
+                </div>
               </div>
-              <button class="power-btn" id="btnPower" title="启动 / 停止">
-                <svg viewBox="0 0 24 24">
-                  <path d="M12 4v7" stroke-linecap="round"/>
-                  <path d="M7.5 6.8a8 8 0 1010 0" stroke-linecap="round"/>
-                </svg>
-              </button>
+              <div class="doing-strip">
+                <div class="doing-box">
+                  <span class="doing-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1M7.7 16.3l-2.1 2.1"/><circle cx="12" cy="12" r="3.2"/></svg></span>
+                  <span class="doing-copy">
+                    <span class="doing-label" id="ovDoingLabel">此刻在做</span>
+                    <span class="doing-text" id="ovDoing">还没有写下手头的事</span>
+                  </span>
+                  <span class="doing-time" id="ovDoingHint">—</span>
+                </div>
+              </div>
+            </section>
+
+            <div class="overview-lower">
+              <section class="card schedule-card">
+                <div class="card-title-row">
+                  <div><h2>今天的安排</h2><div class="card-title-note">醒来后排的几件小事</div></div>
+                  <span class="card-head-note" id="ovPlanNote">—</span>
+                </div>
+                <div id="ovPlanList" class="plan-list">
+                  <div class="empty plan-empty">
+                    <p>今天还没有排日程</p>
+                    <small>她醒来后会自动排三件小事，至少一件接着昨天。</small>
+                  </div>
+                </div>
+              </section>
+
+              <section class="card recent-card">
+                <div class="card-title-row">
+                  <div><h2>最近发生</h2><div class="card-title-note">每一条都带实际收发方向</div></div>
+                  <button class="text-link" data-goto="logs">查看全部</button>
+                </div>
+                <div id="ovRecent">
+                  <div class="empty plan-empty">
+                    <p>还没有对话</p>
+                    <small>启动之后，微信里来消息就会出现在这里。</small>
+                  </div>
+                </div>
+                <div class="recent-foot" id="ovRecentFoot"><span id="ovRecentState">等待消息</span><span>最后一条 —</span></div>
+              </section>
             </div>
-            <div class="power-bottom">
-              <span class="tag" id="ovPowerTag">等待启动</span>
-              <div style="display:flex;gap:6px">
-                <button class="btn btn-sm btn-ghost" id="btnOpenWechat" title="微信进程没在跑时把它启动起来">启动微信</button>
+
+            <div class="today-details">
+              <section class="card detail-note">
+                <div class="card-head"><h2>她留下的日记</h2><span class="card-head-note" id="ovJournalDate">—</span></div>
+                <p class="journal-excerpt" id="ovJournal">还没有日记。睡前写下的那篇只留在本机。</p>
+                <div class="detail-foot"><span>不进入提示词</span><button class="text-link" id="ovJournalOpen">打开 journal</button></div>
+              </section>
+              <section class="card detail-note warm">
+                <div class="card-head"><h2>今天的余韵</h2><span class="card-head-note">上一轮留下的</span></div>
+                <p class="journal-excerpt" id="ovAfterglow">还没有额外的感知；日子、天气和余韵会在这里出现。</p>
+                <div class="detail-foot"><span id="ovMoodLabel">心情 —</span><button class="text-link" id="ovMoodReason">看心情原话</button></div>
+              </section>
+              <section class="card detail-note">
+                <div class="card-head"><h2>运行小结</h2><span class="card-head-note">这不是指标</span></div>
+                <div id="ovSummary"><p class="journal-excerpt">启动后这里会显示正在监听的会话。</p></div>
+                <div class="detail-foot"><span>本机数据</span><button class="text-link" data-goto="plugins">看插件</button></div>
+              </section>
+            </div>
+          </div>
+
+          <aside class="overview-side">
+            <section class="card run-card">
+              <div class="run-top">
+                <div>
+                  <div class="run-state"><span class="live-dot" id="ovRunDot"></span><span id="ovState">未启动</span></div>
+                  <h2 class="run-title">她的微信</h2>
+                  <div class="run-sub" id="ovAccountChip">—</div>
+                </div>
+                <div class="run-time">运行时长<br><strong id="ovUptime">—</strong></div>
+              </div>
+              <div class="run-stats">
+                <div class="run-stat"><strong id="ovRecv">0</strong><span>收到消息</span></div>
+                <div class="run-stat"><strong id="ovReply">0</strong><span>已回复</span></div>
+                <div class="run-stat"><strong id="ovWatch">0</strong><span>监听中</span></div>
+              </div>
+              <div class="run-foot">
+                <span class="tag" id="ovPowerTag">等待启动</span>
+                <button class="power-btn" id="btnPower" title="启动 / 停止" aria-label="启动或停止">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v7" stroke-linecap="round"/><path d="M7.5 6.8a8 8 0 1010 0" stroke-linecap="round"/></svg>
+                  <span>启动</span>
+                </button>
+              </div>
+              <div class="run-actions">
+                <button class="btn btn-sm btn-secondary" id="btnOpenWechat">启动微信</button>
                 <button class="btn btn-sm btn-ghost" id="btnDiagnose">重新检测</button>
               </div>
-            </div>
-          </div>
+            </section>
 
-          <!-- 状态摘要 -->
-          <div class="card">
-            <div class="card-head"><h2>当前会话</h2></div>
-            <div class="check-list" id="ovSummary">
-              <div class="empty" style="padding:16px 0">
-                <p>启动后这里会显示正在监听的会话</p>
+            <section class="card env-card">
+              <div class="card-head"><h2>运行环境</h2><span class="card-head-note">运行中不代表发送通道就绪</span></div>
+              <div class="grid-3" id="checkGrid">
+                <div class="check-item" data-k="admin">
+                  <span class="check-icon"></span>
+                  <div><div class="check-name">管理员权限</div><div class="check-val">检测中…</div></div>
+                  <span></span>
+                </div>
               </div>
-            </div>
-          </div>
-        </div>
+              <button class="text-link env-recheck" id="btnRecheck">重新检测</button>
+            </section>
 
-        <!-- 连接检查 -->
-        <div class="card" style="margin-top:16px">
-          <div class="card-head">
-            <h2>连接检查</h2>
-            <button class="text-link" id="btnRecheck">重新检测</button>
-          </div>
-          <div class="grid-3" id="checkGrid">
-            <div class="check-item" data-k="admin">
-              <span class="check-icon"></span>
-              <div>
-                <div class="check-name">管理员权限</div>
-                <div class="check-val">检测中…</div>
-              </div>
-              <span></span>
-            </div>
-          </div>
-        </div>
-
-        <!-- 指标 -->
-        <div class="grid-3" style="margin-top:16px">
-          <div class="card">
-            <div class="metric-label">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 17l5-5 3 3 7-8"/></svg>
-              收到消息
-            </div>
-            <div class="metric-value" id="ovRecv">0<small>条</small></div>
-            <div class="metric-note">本次运行累计</div>
-          </div>
-          <div class="card">
-            <div class="metric-label">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 7h16v10H8l-4 4V7z"/></svg>
-              已回复
-            </div>
-            <div class="metric-value" id="ovReply">0<small>条</small></div>
-            <div class="metric-note">成功投递到微信</div>
-          </div>
-          <div class="card">
-            <div class="metric-label">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l2.5 2.5" stroke-linecap="round"/></svg>
-              运行时长
-            </div>
-            <div class="metric-value" id="ovUptime">—</div>
-            <div class="metric-note">距本次启动</div>
-          </div>
-        </div>
-
-        <!-- 最近对话 -->
-        <div class="card" style="margin-top:16px">
-          <div class="card-head">
-            <h2>最近对话</h2>
-            <button class="text-link" data-goto="logs">查看全部</button>
-          </div>
-          <div id="ovRecent">
-            <div class="empty">
-              <h3>还没有对话</h3>
-              <p>启动之后，微信里来消息就会显示在这里</p>
-            </div>
-          </div>
+            <section class="card quiet-card">
+              <div class="card-head"><h2>她注意到的</h2><span class="card-head-note">只读</span></div>
+              <div class="quiet-row"><span>今天</span><strong id="ovTodayLabel">—</strong></div>
+              <div class="quiet-row"><span>心情</span><strong id="ovMoodScore">—</strong></div>
+              <div class="quiet-row"><span>余韵</span><strong id="ovAfterglowCount">—</strong></div>
+              <div class="quiet-note" id="ovQuietNote">感知不会主动打扰你，只在她开口时成为背景。</div>
+            </section>
+          </aside>
         </div>
       </section>
 
@@ -222,8 +273,9 @@
             <p>打开右侧开关，只有打开的会话才会自动回复。</p>
           </div>
           <div class="heading-side">
-            <button class="btn btn-sm" id="btnPickAccount">选择账号</button>
-            <button class="btn btn-sm" id="btnLoadChats">刷新会话</button>
+            <button class="btn btn-sm btn-secondary" id="btnPickAccount">选择账号</button>
+            <button class="btn btn-sm btn-secondary" id="btnLoadChats">刷新会话</button>
+            <button class="btn btn-sm btn-primary" id="btnSaveWatchTop" disabled>保存监听</button>
           </div>
         </div>
 
@@ -385,112 +437,137 @@
         <div class="page-heading">
           <div>
             <h1>心情</h1>
-            <p>此刻怎样。由 DSH 每轮对话后判断，参数在这里改。</p>
+            <p>不是装饰分数。它会改变这一轮最多说几条、写多长、能不能不接话。</p>
           </div>
           <div class="heading-side" id="moodUpdated">—</div>
         </div>
 
-        <div class="card">
-          <div class="mood-hero">
-            <div class="mood-dial">
-              <svg viewBox="0 0 100 100">
-                <circle class="ring-bg" cx="50" cy="50" r="42"/>
-                <circle class="ring-fg" id="moodRing" cx="50" cy="50" r="42"
-                        stroke-dasharray="264" stroke-dashoffset="264"/>
-              </svg>
-              <div class="mood-value"><span id="moodScore">—</span></div>
-            </div>
-            <div class="mood-copy">
-              <div class="mood-title" id="moodLabel">加载中…</div>
-              <div class="mood-reason" id="moodReason"></div>
-            </div>
-          </div>
-        </div>
-
-        <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>情绪维度</h2></div>
-          <div class="dim-list" id="moodDims">
-            <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
-          </div>
-        </div>
-
-        <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>注入给她的原话</h2></div>
-          <div class="card-desc" style="margin-bottom:12px">
-            这段话会随每轮对话塞进 system prompt，是情绪真正影响她说话的地方。
-          </div>
-          <div class="soul-quote" id="moodInjected" style="font-size:12px;color:var(--muted)">—</div>
-        </div>
-
-        <div class="card" style="margin-top:16px">
-          <div class="card-head"><h2>判断参数</h2></div>
-          <div class="card-desc" style="margin-bottom:14px">
-            这些值决定「她会不会被这件事影响」以及「影响多久」。改完立即写盘。
-          </div>
-          <div class="form">
-            <div class="form-grid">
-              <div class="field">
-                <label>心情基线</label>
-                <input type="number" id="moodBase" min="30" max="100" step="1">
-                <small>没事发生时她回到的位置。默认 70。</small>
-              </div>
-              <div class="field">
-                <label>心情下限</label>
-                <input type="number" id="moodFloor" min="0" max="100" step="1">
-                <small>最低能掉到多少。0 = 不限制。</small>
-              </div>
-              <div class="field">
-                <label>平复半衰期（小时）</label>
-                <input type="number" id="moodDecay" min="1" max="168" step="1">
-                <small>12 小时 = 隔一夜还留着余温。</small>
-              </div>
-              <div class="field">
-                <label>每天最多说几次</label>
-                <input type="number" id="moodPerDay" min="0" max="50" step="1">
-                <small>心情进对话的额度上限。防止变成背景音。</small>
-              </div>
-              <div class="field">
-                <label>可信度门槛</label>
-                <input type="number" id="moodConf" min="0" max="100" step="1">
-                <small>判断可信度低于它只记账、不告诉她。</small>
-              </div>
-              <div class="field">
-                <label>显著涨跌（总心情）</label>
-                <input type="number" id="moodSigMood" min="1" max="30" step="1">
-                <small>够不着只记账。默认 3。</small>
-              </div>
-              <div class="field">
-                <label>显著涨跌（单根情绪）</label>
-                <input type="number" id="moodSigDim" min="1" max="100" step="1">
-                <small>某根情绪「突然一下」也算。默认 5。</small>
-              </div>
-              <div class="field">
-                <label>告诉她的方式</label>
-                <select id="moodInjectMode">
-                  <option value="off">off — 不告诉她</option>
-                  <option value="label">label — 只说心情</option>
-                  <option value="event">event — 说底子 + 是什么事</option>
-                </select>
-                <small>event 最像人；off 等于心情不进对话。</small>
+        <div class="mood-layout">
+          <div class="mood-main">
+            <div class="card mood-hero-card">
+              <div class="mood-hero">
+                <div class="mood-dial">
+                  <svg viewBox="0 0 100 100">
+                    <circle class="ring-bg" cx="50" cy="50" r="42"/>
+                    <circle class="ring-fg" id="moodRing" cx="50" cy="50" r="42"
+                            stroke-dasharray="264" stroke-dashoffset="264"/>
+                  </svg>
+                  <div class="mood-value"><span id="moodScore">—</span></div>
+                </div>
+                <div class="mood-copy">
+                  <div class="mood-title" id="moodLabel">加载中…</div>
+                  <div class="mood-reason" id="moodReason"></div>
+                </div>
               </div>
             </div>
-            <div class="switch-row">
-              <div class="switch-copy">
-                <strong>自动判断心情</strong>
-                <p>每轮对话后跑一次判断。关掉后心情只靠自然衰减。</p>
+
+            <div class="card mood-dims-card">
+              <div class="card-head">
+                <h2>情绪维度</h2>
+                <span class="card-head-note">0–100 · 同一标尺</span>
               </div>
-              <label class="switch-control">
-                <input type="checkbox" id="moodAutoJudge">
-                <span class="switch-track"></span>
-              </label>
+              <div class="dim-list" id="moodDims">
+                <div class="empty" style="padding:12px 0"><p>加载中…</p></div>
+              </div>
+            </div>
+
+            <div class="card mood-injected-card">
+              <div class="card-head"><h2>这句话会进下一轮</h2><span class="card-head-note">不报数值，只说感受与由头</span></div>
+              <div class="soul-quote" id="moodInjected" style="font-size:12px;color:var(--muted)">—</div>
             </div>
           </div>
-        </div>
 
-        <div class="save-bar">
-          <span class="save-hint" id="moodHint"></span>
-          <button class="btn btn-sm" id="btnMoodReset">重置心情到基线</button>
-          <button class="btn btn-primary" id="btnMoodSave">保存参数</button>
+          <aside class="mood-side">
+            <section class="card mood-budget-card">
+              <div class="card-head">
+                <h2>这一轮的预算</h2>
+                <span class="tag ok" id="moodBudgetState">—</span>
+              </div>
+              <div class="budget-grid">
+                <div class="budget-cell"><strong id="moodBudgetParts">—</strong><span>最多分条</span></div>
+                <div class="budget-cell"><strong id="moodBudgetChars">—</strong><span>整轮字数</span></div>
+                <div class="budget-cell"><strong id="moodBudgetSilence">—</strong><span>可以不接</span></div>
+                <div class="budget-cell"><strong id="moodBudgetMust">—</strong><span>不接后强制回</span></div>
+              </div>
+              <p class="budget-note" id="moodBudgetReason">心情、精力、时间和余韵会一起收紧这一轮。</p>
+            </section>
+
+            <section class="card mood-echo-card">
+              <div class="card-head">
+                <h2>余韵</h2>
+                <span class="tag" id="moodEchoTag">—</span>
+              </div>
+              <p id="moodEchoText">还没有余韵；上一轮的情绪没有留下额外修正。</p>
+            </section>
+
+            <section class="card mood-params-card">
+              <div class="card-head"><h2>判断参数</h2><span class="tag">立即写盘</span></div>
+              <div class="form">
+                <div class="form-grid">
+                  <div class="field">
+                    <label>心情基线</label>
+                    <input type="number" id="moodBase" min="30" max="100" step="1">
+                    <small>没事发生时她回到的位置。默认 70。</small>
+                  </div>
+                  <div class="field">
+                    <label>心情下限</label>
+                    <input type="number" id="moodFloor" min="0" max="100" step="1">
+                    <small>最低能掉到多少。0 = 不限制。</small>
+                  </div>
+                  <div class="field">
+                    <label>平复半衰期（小时）</label>
+                    <input type="number" id="moodDecay" min="1" max="168" step="1">
+                    <small>12 小时 = 隔一夜还留着余温。</small>
+                  </div>
+                  <div class="field">
+                    <label>每天最多说几次</label>
+                    <input type="number" id="moodPerDay" min="0" max="50" step="1">
+                    <small>心情进对话的额度上限。</small>
+                  </div>
+                  <div class="field">
+                    <label>可信度门槛</label>
+                    <input type="number" id="moodConf" min="0" max="100" step="1">
+                    <small>低于它只记账、不告诉她。</small>
+                  </div>
+                  <div class="field">
+                    <label>显著涨跌（总心情）</label>
+                    <input type="number" id="moodSigMood" min="1" max="30" step="1">
+                    <small>够不着只记账。默认 3。</small>
+                  </div>
+                  <div class="field">
+                    <label>显著涨跌（单根情绪）</label>
+                    <input type="number" id="moodSigDim" min="1" max="100" step="1">
+                    <small>某根情绪突然一下也算。默认 5。</small>
+                  </div>
+                  <div class="field">
+                    <label>告诉她的方式</label>
+                    <select id="moodInjectMode">
+                      <option value="off">off — 不告诉她</option>
+                      <option value="label">label — 只说心情</option>
+                      <option value="event">event — 说底子 + 是什么事</option>
+                    </select>
+                    <small>event 最像人；off 等于心情不进对话。</small>
+                  </div>
+                </div>
+                <div class="switch-row">
+                  <div class="switch-copy">
+                    <strong>自动判断心情</strong>
+                    <p>每轮对话后跑一次判断。关掉后心情只靠自然衰减。</p>
+                  </div>
+                  <label class="switch-control">
+                    <input type="checkbox" id="moodAutoJudge">
+                    <span class="switch-track"></span>
+                  </label>
+                </div>
+              </div>
+            </section>
+
+            <div class="save-bar mood-save-bar">
+              <span class="save-hint" id="moodHint"></span>
+              <button class="btn btn-sm" id="btnMoodReset">重置心情到基线</button>
+              <button class="btn btn-primary" id="btnMoodSave">保存参数</button>
+            </div>
+          </aside>
         </div>
       </section>
 
@@ -499,7 +576,7 @@
         <div class="page-heading">
           <div>
             <h1>记忆</h1>
-            <p>她记得的事。可以检索、翻页、删单条、删整个会话、导出备份。</p>
+            <p>她认定的事、原话、身份与主人都在这里；忘记一条结论，不等于删掉原话。</p>
           </div>
           <div class="heading-side" id="memCount">—</div>
         </div>
@@ -769,25 +846,26 @@
         <div class="page-heading">
           <div>
             <h1>印象</h1>
-            <p>她怎么看你，以及她准备替你对外说哪些事。</p>
+            <p>她怎么看你，以及她准备替你对外说哪些事。画像、评语和关系依据是三套不同的东西。</p>
           </div>
           <div class="heading-side" id="imprCount">—</div>
         </div>
 
-        <div class="card-desc" style="margin:0 0 14px">
-          <strong>这一页是给你审的。</strong>
-          右边那些「开放信息」，是她在别人问起你时<b>可以</b>说出口的内容。
-          觉得哪条不该外传，点删除 —— 那条会退回私密，原文和认识都还在，
-          只是她不再对别人提。
-          <br><br>
-          每个人的评语是<b>你手写的</b>，模型不参与。她不会自己往里写东西。
-        </div>
+        <div class="impr-layout">
+          <aside class="card impr-people">
+            <div class="card-head">
+              <h2>人物</h2>
+              <span class="tag" id="imprPeopleCount">—</span>
+            </div>
+            <div class="impr-people-list" id="imprTabs"></div>
+            <p class="impr-people-note">
+              一人一页。主人固定第一页。关系阶段只做描述，不是好感度，也不解锁任何权限。
+            </p>
+          </aside>
 
-        <!-- 横向分页：一人一页，主人永远第一页。
-             不是把所有人挤在一屏里 —— 那样一多就没法看了。 -->
-        <div class="subtabs" id="imprTabs"></div>
-        <div id="imprPanes">
-          <div class="empty"><p>读取中…</p></div>
+          <div class="impr-panes" id="imprPanes">
+            <div class="empty"><p>读取中…</p></div>
+          </div>
         </div>
       </section>
 
@@ -796,41 +874,77 @@
         <div class="page-heading">
           <div>
             <h1>表情包</h1>
-            <p>她手里有什么，就能发什么。没有的，她不会凭空变出来。</p>
+            <p>她手里有什么，就能发什么。开关与频率在插件页，这一页只管她的收藏。</p>
           </div>
           <div class="heading-side" id="stickerCount">—</div>
         </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h2>表情库</h2>
-            <div class="card-actions">
-              <button class="btn btn-sm" id="btnStickerOpenDir">打开目录</button>
-              <button class="btn btn-sm btn-primary" id="btnStickerAdd">添加表情</button>
+        <div class="sticker-layout">
+          <div class="sticker-main">
+            <div class="card">
+              <div class="card-head">
+                <h2>表情库</h2>
+                <div class="card-actions">
+                  <button class="btn btn-sm" id="btnStickerOpenDir">打开目录</button>
+                  <button class="btn btn-sm btn-primary" id="btnStickerAdd">添加表情</button>
+                </div>
+              </div>
+              <div class="card-desc" style="margin-bottom:12px">
+                任意格式的图片都可以放进来 —— 导入时统一转成 <b>GIF</b>，
+                因为只有 .gif 会被微信认成原生表情（对方能长按添加、会动）。<br>
+                <b>单击</b>在右侧看详情，<b>双击</b>打开完整编辑。
+              </div>
+              <div id="stickerList" class="sticker-grid">
+                <div class="empty-hint">还没有表情。点右上角「添加表情」放几张进来。</div>
+              </div>
+              <div id="stickerMoreBar" class="sticker-pager" hidden>
+                <button class="btn btn-sm" id="btnStickerPrev">‹ 上一页</button>
+                <span id="stickerMoreText"></span>
+                <button class="btn btn-sm" id="btnStickerNext">下一页 ›</button>
+              </div>
+            </div>
+
+            <div class="card" style="margin-top:16px" id="stickerHintCard">
+              <div class="card-desc" style="margin:0">
+                发表情的开关和频率在 <a href="#" data-goto="plugins" style="color:var(--accent)">插件</a> 页的「表情包」里 ——
+                这一页只管她手里有哪些牌，不管什么时候出。
+              </div>
             </div>
           </div>
-          <div class="card-desc" style="margin-bottom:12px">
-            任意格式的图片都可以放进来 —— 导入时统一转成 <b>GIF</b>，
-            因为只有 .gif 会被微信认成原生表情（对方能长按添加、会动）。<br>
-            <b>双击</b>一张表情可以看完整说明。
-          </div>
-          <div id="stickerList" class="sticker-grid">
-            <div class="empty-hint">还没有表情。点右上角「添加表情」放几张进来。</div>
-          </div>
-          <!-- 翻页条：固定一页 60 张，前后翻，不自动加载。
-               自动加载会让人"永远划不到底"，也说不出现在在第几屏。 -->
-          <div id="stickerMoreBar" class="sticker-pager" hidden>
-            <button class="btn btn-sm" id="btnStickerPrev">‹ 上一页</button>
-            <span id="stickerMoreText"></span>
-            <button class="btn btn-sm" id="btnStickerNext">下一页 ›</button>
-          </div>
-        </div>
 
-        <div class="card" style="margin-top:16px" id="stickerHintCard">
-          <div class="card-desc" style="margin:0">
-            发表情的开关和频率在 <a href="#" data-goto="plugins" style="color:var(--accent)">插件</a> 页的「表情包」里 ——
-            这一页只管她手里有哪些牌，不管什么时候出。
-          </div>
+          <aside class="sticker-side">
+            <section class="card sticker-preview-card" id="stickerPreviewCard">
+              <div class="card-head">
+                <h2>选中的一张</h2>
+                <span class="card-head-note">双击可打开完整说明</span>
+              </div>
+              <div class="empty sticker-preview-empty" id="stickerPreviewEmpty">
+                <p>从左边选一张表情</p>
+                <small>这里会显示她的概览、强度、文件和发送入口。</small>
+              </div>
+              <div id="stickerPreviewBody" hidden>
+                <div class="sticker-preview-image"><img id="stickerPreviewImg" alt=""></div>
+                <div class="sticker-preview-title" id="stickerPreviewTitle">—</div>
+                <div class="sticker-preview-meta">
+                  <span class="tag" id="stickerPreviewDim">—</span>
+                  <span class="tag" id="stickerPreviewIntensity">—</span>
+                  <span class="tag" id="stickerPreviewCode">—</span>
+                </div>
+                <div class="kv-row"><span>文件</span><code id="stickerPreviewFile">—</code></div>
+                <div class="kv-row"><span>大小</span><code id="stickerPreviewSize">—</code></div>
+                <div class="sticker-preview-actions">
+                  <button class="btn btn-sm" id="btnStickerPreviewEdit">编辑说明</button>
+                  <button class="btn btn-sm btn-primary" id="btnStickerPreviewTest">试发一张</button>
+                </div>
+              </div>
+            </section>
+
+            <section class="card sticker-send-card">
+              <div class="card-head"><h2>发送状态</h2><span class="tag" id="stickerSendTag">—</span></div>
+              <p class="card-desc" id="stickerSendNote">发表情开关在插件页；这里不重复一套设置。</p>
+              <button class="text-link" data-goto="plugins">去插件页看频率与冷却 →</button>
+            </section>
+          </aside>
         </div>
       </section>
 
@@ -839,231 +953,261 @@
         <div class="page-heading">
           <div>
             <h1>声音</h1>
-            <p>她自己的声音。接入参数和情绪参数都在这一页，改完点保存。</p>
+            <p>她自己的声音。接入、什么时候出声、失败怎么收尾，都在这一页。</p>
           </div>
-          <div class="heading-side" id="voiceState">—</div>
+          <div class="heading-side voice-heading-actions">
+            <span id="voiceState">—</span>
+            <button class="btn btn-sm" id="btnVoiceTestTop" type="button">测试声音</button>
+            <button class="btn btn-sm btn-primary" id="btnVoiceSave">保存声音</button>
+            <span class="save-hint" id="voiceSaveHint"></span>
+          </div>
         </div>
 
-        <div class="card" id="voiceDriverCard">
-          <div class="card-head">
-            <h2>语音气泡准备</h2>
-            <span class="tag" id="voiceDriverTag">检测中</span>
-          </div>
-          <div class="card-desc" style="margin-bottom:10px">
-            发微信语音气泡需要 <b>VB-CABLE</b> 虚拟声卡：本程序播放到
-            <b>CABLE Input</b>，微信麦克风选 <b>CABLE Output</b>。
-            驱动包已内置并做过 SHA256 校验，点一次安装即可，不用去官网找。
-          </div>
-          <div class="test-row">
-            <button class="btn btn-sm btn-primary" id="btnInstallVbCable" type="button">一键安装 VB-CABLE</button>
-            <button class="btn btn-sm" id="btnRefreshVoiceDevices" type="button">刷新声卡</button>
-            <button class="btn btn-sm" id="btnOpenSoundSettings" type="button">打开声音设置</button>
-            <span id="voiceDriverHint" class="test-result">正在检测…</span>
-          </div>
-          <small style="display:block;margin-top:8px;color:var(--muted);line-height:1.7">
-            安装会弹 Windows UAC；装完可能需要重启电脑/微信。VB-CABLE 是
-            VB-Audio Donationware，内置包保留官方 readme。
-          </small>
+        <div class="voice-tabs subtabs" id="voiceTabs">
+          <button class="subtab is-active" data-voice-tab="when">什么时候出声</button>
+          <button class="subtab" data-voice-tab="connect">接入与音色</button>
+          <button class="subtab" data-voice-tab="send">发送与回退</button>
         </div>
 
-        <div class="card">
-          <div class="card-head">
-            <h2>模型接入</h2>
-            <span class="tag" id="voiceTag">未配置</span>
-          </div>
-          <div class="form">
-            <div class="form-grid">
-              <div class="field full">
-                <label>接口地址</label>
-                <input type="text" id="voiceBaseUrl" placeholder="https://api.breeze.blue">
-                <small>Breeze 固定是 <code>https://api.breeze.blue</code>；换别家时改这里和模型。</small>
-              </div>
-              <div class="field full">
-                <label>API Key</label>
-                <div class="key-row">
-                  <input type="password" id="voiceApiKey" placeholder="brz_…" autocomplete="off">
-                  <a href="https://breezeblue.ai/app/developer/api-keys" target="_blank" rel="noreferrer">去哪拿？</a>
+        <div class="voice-pane" data-voice-pane="when">
+          <div class="card">
+            <div class="card-head">
+              <h2>什么时候出声</h2>
+              <span class="tag" id="voiceWhenTag">自动判断</span>
+            </div>
+            <div class="card-desc" style="margin-bottom:14px">
+              命中语音后只发语音，不会再发同内容文字。模型明确写 <code>[[voice]]</code> 时不受概率限制。
+            </div>
+            <select id="voiceStrategy" class="voice-strategy-native" aria-label="声音策略">
+              <option value="off">关闭：只发文字</option>
+              <option value="request">只在我要求时</option>
+              <option value="auto">自动判断（模型标记 + 概率）</option>
+              <option value="probability">按概率</option>
+              <option value="always">每条都发（测试）</option>
+              <option value="preview">预演：只记日志，不出声</option>
+            </select>
+            <div class="voice-mode-grid" id="voiceModeGrid">
+              <button class="voice-mode" data-mode="off"><strong>关闭</strong><small>只发文字</small></button>
+              <button class="voice-mode" data-mode="request"><strong>按需</strong><small>你明确要求时</small></button>
+              <button class="voice-mode" data-mode="auto"><strong>自动判断</strong><small>场景 + 概率</small></button>
+              <button class="voice-mode" data-mode="probability"><strong>按概率</strong><small>固定命中率</small></button>
+              <button class="voice-mode" data-mode="always"><strong>每条都发</strong><small>只用于测试</small></button>
+              <button class="voice-mode" data-mode="preview"><strong>预演</strong><small>只记日志，不出声</small></button>
+            </div>
+
+            <div class="form" style="margin-top:18px">
+              <div class="form-grid">
+                <div class="field">
+                  <label>自动判断的命中率</label>
+                  <input type="number" id="voiceProbability" step="0.05" min="0" max="1">
+                  <small>0.2 = 五次里大约一次。模型明确写 [[voice]] 时不受它限制。</small>
                 </div>
-                <small>Key 只存本机 <code>config.json</code>，不会进插件配置导出。</small>
+                <div class="field">
+                  <label>同一会话冷却（秒）</label>
+                  <input type="number" id="voiceCooldown" step="30" min="0" max="86400">
+                  <small>两条语音之间至少隔多久。0 = 不冷却。</small>
+                </div>
+                <div class="field">
+                  <label>每天上限（条）</label>
+                  <input type="number" id="voiceDailyLimit" step="1" min="0" max="999">
+                  <small>0 = 不限。控制积分消耗的最后一道闸。</small>
+                </div>
+                <div class="field">
+                  <label>连续语音上限（条）</label>
+                  <input type="number" id="voiceConsecutive" step="1" min="0" max="20">
+                  <small>连着几条语音后强制换文字。0 = 不限。</small>
+                </div>
+                <div class="field">
+                  <label>语音最长字数</label>
+                  <input type="number" id="voicePolicyMaxChars" step="10" min="10" max="400">
+                  <small>默认 220 字，约 45–50 秒；合成后超过 50 秒也会自动改文字。</small>
+                </div>
+                <div class="field full">
+                  <label>场景</label>
+                  <div class="voice-checks">
+                    <label><input type="checkbox" class="voice-scene" data-scenes="sweet,warm,missing,comfort">亲密 / 撒娇 / 想念 / 安慰</label>
+                    <label><input type="checkbox" class="voice-scene" data-scenes="low,hurt,tired,worry,neglected">低落 / 受伤 / 累 / 担心</label>
+                    <label><input type="checkbox" class="voice-scene" data-scenes="happy,good_news">开心 / 好消息</label>
+                    <label><input type="checkbox" class="voice-scene" data-scenes="neutral,apology,proactive,guest">日常 / 道歉 / 主动</label>
+                    <label><input type="checkbox" class="voice-scene" data-scenes="late_night,morning_wake">深夜 / 刚醒</label>
+                    <label><input type="checkbox" class="voice-scene" data-scenes="conflict">拌嘴 / 冲突</label>
+                  </div>
+                  <small>没勾的场景一律发文字。拌嘴默认不勾：文字更稳，也不容易把气话念成撒娇。</small>
+                </div>
               </div>
-              <div class="field">
-                <label>模型</label>
-                <select id="voiceModel">
-                  <option value="breeze-tts-2-multilingual">Breeze TTS 2 Multilingual</option>
-                  <option value="breeze-tts-2">Breeze TTS 2</option>
-                </select>
-                <small>多语言版支持 51 种语言，中文也在内。</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="voice-pane" data-voice-pane="connect" hidden>
+          <div class="card">
+            <div class="card-head">
+              <h2>模型接入</h2>
+              <span class="tag" id="voiceTag">未配置</span>
+            </div>
+            <div class="form">
+              <div class="form-grid">
+                <div class="field full">
+                  <label>接口地址</label>
+                  <input type="text" id="voiceBaseUrl" placeholder="https://api.breeze.blue">
+                  <small>Breeze 固定是 <code>https://api.breeze.blue</code>；换别家时改这里和模型。</small>
+                </div>
+                <div class="field full">
+                  <label>API Key</label>
+                  <div class="key-row">
+                    <input type="password" id="voiceApiKey" placeholder="brz_…" autocomplete="off">
+                    <a href="https://breezeblue.ai/app/developer/api-keys" target="_blank" rel="noreferrer">去哪拿？</a>
+                  </div>
+                  <small>Key 只存本机 <code>config.json</code>，不会进插件配置导出。</small>
+                </div>
+                <div class="field">
+                  <label>模型</label>
+                  <select id="voiceModel">
+                    <option value="breeze-tts-2-multilingual">Breeze TTS 2 Multilingual</option>
+                    <option value="breeze-tts-2">Breeze TTS 2</option>
+                  </select>
+                  <small>多语言版支持 51 种语言，中文也在内。</small>
+                </div>
+                <div class="field">
+                  <label>音色 ID</label>
+                  <input type="text" id="voiceVoice" placeholder="voc_…">
+                  <small>在 Breeze 控制台克隆/挑选后填这里；音色是身份，别每轮换。</small>
+                </div>
+                <div class="field">
+                  <label>语言</label>
+                  <input type="text" id="voiceLanguage" placeholder="zh" maxlength="2">
+                  <small>中文填 <code>zh</code>。</small>
+                </div>
+                <div class="field">
+                  <label>音色基线</label>
+                  <select id="voiceProfile"></select>
+                  <small>薄荷是明亮少女音：低落时不逼它压低嗓子，而是收住亮度。</small>
+                </div>
+                <div class="test-row">
+                  <button class="btn btn-sm" id="btnVoiceTest" type="button">测试连接</button>
+                  <span id="voiceTestResult" class="test-result">只查模型列表，不合成、不消耗积分。</span>
+                </div>
               </div>
-              <div class="field">
-                <label>音色 ID</label>
-                <input type="text" id="voiceVoice" placeholder="voc_…">
-                <small>在 Breeze 控制台克隆/挑选后填这里；音色是身份，别每轮换。</small>
-              </div>
-              <div class="field">
-                <label>语言</label>
-                <input type="text" id="voiceLanguage" placeholder="zh" maxlength="2">
-                <small>中文填 <code>zh</code>。</small>
-              </div>
-              <div class="field">
-                <label>音色基线</label>
-                <select id="voiceProfile"></select>
-                <small>薄荷是明亮少女音：低落时不逼它压低嗓子，而是收住亮度。</small>
+            </div>
+          </div>
+
+          <div class="card" style="margin-top:18px">
+            <div class="card-head"><h2>表达参数</h2><span class="tag">合成层</span></div>
+            <div class="form">
+              <div class="form-grid">
+                <div class="field">
+                  <label>语速</label>
+                  <input type="number" id="voiceSpeed" step="0.01" min="0.5" max="2">
+                  <small>固定 1.00；情绪靠 instructions 和停顿，不用它快进/慢放。</small>
+                </div>
+                <div class="field">
+                  <label>Guidance</label>
+                  <input type="number" id="voiceGuidance" step="0.1" min="1" max="10">
+                  <small>越高越贴情境指令。情绪戏 1–3；日常 1–2。</small>
+                </div>
+                <div class="field">
+                  <label>音量</label>
+                  <input type="number" id="voiceVolume" step="0.01" min="0.01" max="2">
+                  <small>保持 1.0；超过 1 可能削波。</small>
+                </div>
+                <div class="field">
+                  <label>最长一轮（字）</label>
+                  <input type="number" id="voiceMaxChars" step="10" min="20" max="1000">
+                  <small>超过就只发文字，避免念成播报。</small>
+                </div>
+                <div class="field">
+                  <label>缓存上限（MB）</label>
+                  <input type="number" id="voiceCacheMb" step="10" min="0" max="5000">
+                  <small>同一句不重复合成；超了按最旧清。</small>
+                </div>
+                <div class="field">
+                  <label>超时（秒）</label>
+                  <input type="number" id="voiceTimeout" step="1" min="5" max="180">
+                  <small>超时不会自动重试，避免重复扣积分。</small>
+                </div>
               </div>
               <div class="test-row">
-                <button class="btn btn-sm" id="btnVoiceTest" type="button">测试连接</button>
-                <span id="voiceTestResult" class="test-result">只查模型列表，不合成、不消耗积分。</span>
+                <button class="btn btn-sm" id="btnVoiceClearCache" type="button">清空声音缓存</button>
+                <span id="voiceCacheInfo" class="test-result">—</span>
               </div>
             </div>
           </div>
         </div>
 
-        <div class="card">
-          <div class="card-head"><h2>表达参数</h2></div>
-          <div class="form">
-            <div class="form-grid">
-              <div class="field">
-                <label>语速</label>
-                <input type="number" id="voiceSpeed" step="0.01" min="0.5" max="2">
-                <small>固定 1.00；情绪靠 instructions 和停顿，不用它快进/慢放。</small>
-              </div>
-              <div class="field">
-                <label>Guidance</label>
-                <input type="number" id="voiceGuidance" step="0.1" min="1" max="10">
-                <small>越高越贴情境指令。情绪戏 1–3；日常 1–2。</small>
-              </div>
-              <div class="field">
-                <label>音量</label>
-                <input type="number" id="voiceVolume" step="0.01" min="0.01" max="2">
-                <small>保持 1.0；超过 1 可能削波。</small>
-              </div>
-              <div class="field">
-                <label>最长一轮（字）</label>
-                <input type="number" id="voiceMaxChars" step="10" min="20" max="1000">
-                <small>超过就只发文字，避免念成播报。</small>
-              </div>
-              <div class="field">
-                <label>缓存上限（MB）</label>
-                <input type="number" id="voiceCacheMb" step="10" min="0" max="5000">
-                <small>同一句不重复合成；超了按最旧清。</small>
-              </div>
-              <div class="field">
-                <label>超时（秒）</label>
-                <input type="number" id="voiceTimeout" step="1" min="5" max="180">
-                <small>超时不会自动重试，避免重复扣积分。</small>
-              </div>
+        <div class="voice-pane" data-voice-pane="send" hidden>
+          <div class="card" id="voiceDriverCard">
+            <div class="card-head">
+              <h2>语音气泡准备</h2>
+              <span class="tag" id="voiceDriverTag">检测中</span>
+            </div>
+            <div class="card-desc" style="margin-bottom:10px">
+              发微信语音气泡需要 <b>VB-CABLE</b> 虚拟声卡：本程序播放到
+              <b>CABLE Input</b>，微信麦克风选 <b>CABLE Output</b>。
+              驱动包已内置并做过 SHA256 校验，点一次安装即可，不用去官网找。
             </div>
             <div class="test-row">
-              <button class="btn btn-sm" id="btnVoiceClearCache" type="button">清空声音缓存</button>
-              <span id="voiceCacheInfo" class="test-result">—</span>
+              <button class="btn btn-sm btn-primary" id="btnInstallVbCable" type="button">一键安装 VB-CABLE</button>
+              <button class="btn btn-sm" id="btnRefreshVoiceDevices" type="button">刷新声卡</button>
+              <button class="btn btn-sm" id="btnOpenSoundSettings" type="button">打开声音设置</button>
+              <span id="voiceDriverHint" class="test-result">正在检测…</span>
+            </div>
+            <small style="display:block;margin-top:8px;color:var(--muted);line-height:1.7">
+              安装会弹 Windows UAC；装完可能需要重启电脑/微信。VB-CABLE 是
+              VB-Audio Donationware，内置包保留官方 readme。
+            </small>
+          </div>
+
+          <div class="card" style="margin-top:18px">
+            <div class="card-head"><h2>发送形式与回退</h2><span class="tag" id="voiceSendTag">音频文件</span></div>
+            <div class="form">
+              <div class="form-grid">
+                <div class="field">
+                  <label>发送形式</label>
+                  <select id="voiceSendAs">
+                    <option value="file">音频文件（稳，推荐先跑）</option>
+                    <option value="bubble">微信语音气泡（实验性，需 VB-CABLE）</option>
+                  </select>
+                  <small>气泡会按住微信录音键 + 把音频播进 CABLE Input；文件不需要虚拟声卡。</small>
+                </div>
+                <div class="field">
+                  <label>虚拟声卡播放端</label>
+                  <select id="voiceDevice"><option value="">— 未选择 —</option></select>
+                  <small id="voiceDeviceHint">选 <b>CABLE Input</b>；微信麦克风要选 <b>CABLE Output</b>。只在气泡模式用。</small>
+                </div>
+                <div class="field">
+                  <label>微信录音快捷键</label>
+                  <input type="text" id="voiceHotkey" placeholder="Ctrl+Alt" autocomplete="off">
+                  <small>必须和微信「设置 → 快捷键 → 发语音」完全一致；程序负责按住和松开。</small>
+                </div>
+                <div class="field full">
+                  <label>内容过滤</label>
+                  <div class="voice-checks">
+                    <label><input type="checkbox" id="voiceFilterUrl">含链接 → 文字</label>
+                    <label><input type="checkbox" id="voiceFilterCode">含代码 → 文字</label>
+                    <label><input type="checkbox" id="voiceFilterTable">表格 → 文字</label>
+                    <label><input type="checkbox" id="voiceFilterList">清单 → 文字</label>
+                    <label><input type="checkbox" id="voiceTagOverride">允许模型写 [[voice]] / [[text]]</label>
+                    <label><input type="checkbox" id="voiceFallback">语音失败补文字</label>
+                  </div>
+                  <small>代码、网址、表格念出来没有意义；模型标记不会被对方看到。</small>
+                </div>
+                <div class="field full">
+                  <label>范围</label>
+                  <div class="voice-checks">
+                    <label><input type="checkbox" id="voiceGroup">群里也发语音</label>
+                    <label><input type="checkbox" id="voiceOwnerOnly">只对主人发</label>
+                  </div>
+                  <small>群聊默认关闭。群里语音文件没有 @ 关系，别人也不知道在念给谁。</small>
+                </div>
+              </div>
+              <p class="voice-note">
+                <b>只要命中语音，就只发语音，不再发同内容文字</b>；语音上限 50 秒
+                （微信上限 60 秒，留 10 秒容错）。<br>
+                默认发送音频文件；语音气泡需要虚拟声卡 + UIA 录音，失败不会重试，
+                避免对方收到两遍。
+              </p>
             </div>
           </div>
-        </div>
-
-        <div class="card">
-          <div class="card-head"><h2>什么时候出声</h2></div>
-          <div class="form">
-            <div class="form-grid">
-              <div class="field">
-                <label>策略</label>
-                <select id="voiceStrategy">
-                  <option value="off">关闭：只发文字</option>
-                  <option value="request">只在我要求时</option>
-                  <option value="auto">自动判断（模型标记 + 概率）</option>
-                  <option value="probability">按概率</option>
-                  <option value="always">每条都发（测试）</option>
-                  <option value="preview">预演：只记日志，不出声</option>
-                </select>
-                <small>默认预演。命中语音后只发语音，不会再发同内容文字。</small>
-              </div>
-              <div class="field">
-                <label>发送形式</label>
-                <select id="voiceSendAs">
-                  <option value="file">音频文件（稳，推荐先跑）</option>
-                  <option value="bubble">微信语音气泡（实验性，需 VB-CABLE）</option>
-                </select>
-                <small>气泡会按住微信录音键 + 把音频播进 CABLE Input；文件不需要虚拟声卡。</small>
-              </div>
-              <div class="field">
-                <label>虚拟声卡播放端</label>
-                <select id="voiceDevice"><option value="">— 未选择 —</option></select>
-                <small id="voiceDeviceHint">选 <b>CABLE Input</b>；微信麦克风要选 <b>CABLE Output</b>。只在气泡模式用。</small>
-              </div>
-              <div class="field">
-                <label>微信录音快捷键</label>
-                <input type="text" id="voiceHotkey" placeholder="Ctrl+Alt" autocomplete="off">
-                <small>必须和微信「设置 → 快捷键 → 发语音」完全一致；程序负责按住和松开。</small>
-              </div>
-              <div class="field">
-                <label>自动判断的命中率</label>
-                <input type="number" id="voiceProbability" step="0.05" min="0" max="1">
-                <small>0.2 = 五次里大约一次。模型明确写 [[voice]] 时不受它限制。</small>
-              </div>
-              <div class="field">
-                <label>冷却（秒）</label>
-                <input type="number" id="voiceCooldown" step="30" min="0" max="86400">
-                <small>同一会话两条语音之间至少隔多久。0 = 不冷却。</small>
-              </div>
-              <div class="field">
-                <label>每天上限（条）</label>
-                <input type="number" id="voiceDailyLimit" step="1" min="0" max="999">
-                <small>0 = 不限。控制积分消耗的最后一道闸。</small>
-              </div>
-              <div class="field">
-                <label>连续语音上限（条）</label>
-                <input type="number" id="voiceConsecutive" step="1" min="0" max="20">
-                <small>连着几条语音后强制换文字。0 = 不限。</small>
-              </div>
-              <div class="field">
-                <label>语音最长字数</label>
-                <input type="number" id="voicePolicyMaxChars" step="10" min="10" max="400">
-                <small>默认 220 字，约 45–50 秒；合成后超过 50 秒也会自动改文字。</small>
-              </div>
-              <div class="field full">
-                <label>场景</label>
-                <div class="voice-checks">
-                  <label><input type="checkbox" class="voice-scene" data-scenes="sweet,warm,missing,comfort">亲密 / 撒娇 / 想念 / 安慰</label>
-                  <label><input type="checkbox" class="voice-scene" data-scenes="low,hurt,tired,worry,neglected">低落 / 受伤 / 累 / 担心</label>
-                  <label><input type="checkbox" class="voice-scene" data-scenes="happy,good_news">开心 / 好消息</label>
-                  <label><input type="checkbox" class="voice-scene" data-scenes="neutral,apology,proactive,guest">日常 / 道歉 / 主动</label>
-                  <label><input type="checkbox" class="voice-scene" data-scenes="late_night,morning_wake">深夜 / 刚醒</label>
-                  <label><input type="checkbox" class="voice-scene" data-scenes="conflict">拌嘴 / 冲突</label>
-                </div>
-                <small>没勾的场景一律发文字。拌嘴默认不勾：文字更稳，也不容易把气话念成撒娇。</small>
-              </div>
-              <div class="field full">
-                <label>内容过滤</label>
-                <div class="voice-checks">
-                  <label><input type="checkbox" id="voiceFilterUrl">含链接 → 文字</label>
-                  <label><input type="checkbox" id="voiceFilterCode">含代码 → 文字</label>
-                  <label><input type="checkbox" id="voiceFilterTable">表格 → 文字</label>
-                  <label><input type="checkbox" id="voiceFilterList">清单 → 文字</label>
-                  <label><input type="checkbox" id="voiceTagOverride">允许模型写 [[voice]] / [[text]]</label>
-                  <label><input type="checkbox" id="voiceFallback">语音失败补文字</label>
-                </div>
-                <small>代码、网址、表格念出来没有意义；模型标记不会被对方看到。</small>
-              </div>
-              <div class="field full">
-                <label>范围</label>
-                <div class="voice-checks">
-                  <label><input type="checkbox" id="voiceGroup">群里也发语音</label>
-                  <label><input type="checkbox" id="voiceOwnerOnly">只对主人发</label>
-                </div>
-                <small>群聊默认关闭。群里语音文件没有 @ 关系，别人也不知道在念给谁。</small>
-              </div>
-            </div>
-            <p class="voice-note">
-              <b>只要命中语音，就只发语音，不再发同内容文字</b>；语音上限 50 秒
-              （微信上限 60 秒，留 10 秒容错）。<br>
-              当前发送形式是 <b>音频文件</b>，不是微信原生语音气泡。个人微信协议不支持
-              发语音消息；要做语音气泡得用虚拟声卡 + UIA 录音，链路另开。
-              所以默认「先文字，再语音」：对方不点文件也能看懂内容。
-            </p>
-          </div>
-        </div>
-
-        <div class="save-bar">
-          <span class="save-hint" id="voiceSaveHint"></span>
-          <button class="btn btn-primary" id="btnVoiceSave">保存声音设置</button>
         </div>
       </section>
 
@@ -1072,12 +1216,12 @@
         <div class="page-heading">
           <div>
             <h1>数据目录</h1>
-            <p>默认在程序旁边的 <code>data\</code>，想放别处随时能改。</p>
+            <p>一个数据目录就是一份她。换目录、搬家、清空和鲸落，后果必须一眼看懂。</p>
           </div>
           <div class="heading-side" id="dataRootTag">—</div>
         </div>
 
-        <div class="card">
+        <div class="card data-root-card">
           <div class="card-head"><h2>所在位置</h2></div>
           <div class="card-desc" style="margin-bottom:14px">
             默认是安装目录下的 <code>data\</code>。换到别的盘也行 ——
@@ -1109,7 +1253,7 @@
           <div class="card-desc" style="margin-top:12px" id="dataRootHint"></div>
         </div>
 
-        <div class="card" style="margin-top:16px">
+        <div class="card data-layout-card" style="margin-top:16px">
           <div class="card-head">
             <h2>这里就是她</h2>
             <span class="tag" id="layoutTag">—</span>
@@ -1123,7 +1267,7 @@
           </div>
         </div>
 
-        <div class="card" style="margin-top:16px">
+        <div class="card data-wipe-card" style="margin-top:16px">
           <div class="card-head"><h2>清空</h2></div>
           <div class="card-desc" style="margin-bottom:14px">
             <strong>她还在，只是忘了。</strong>
@@ -1138,7 +1282,7 @@
           <div class="card-desc" style="margin-top:12px" id="wipeHint"></div>
         </div>
 
-        <div class="card is-whale" style="margin-top:16px">
+        <div class="card is-whale data-whale-card" style="margin-top:16px">
           <div class="card-head">
             <h2>鲸落</h2>
             <span class="tag" id="whaleTag">不可逆</span>
@@ -1171,7 +1315,7 @@
         <div class="page-heading">
           <div>
             <h1>插件</h1>
-            <p>她由哪些部分拼起来。关掉的插件不再影响她说话，数据仍在。</p>
+            <p>她由哪些部分拼起来。关掉只停止影响，不删除它的数据；开关只有你能改。</p>
           </div>
           <div class="heading-side" id="plugStoreHint">—</div>
         </div>
@@ -1284,11 +1428,11 @@
         <div class="page-heading">
           <div>
             <h1>设置</h1>
-            <p>改完点底部保存。</p>
+            <p>模型、自动回复和诊断都从这里进。改动有保存保护，失败会留在页面上。</p>
           </div>
         </div>
 
-        <div class="card">
+        <div class="card settings-model-card">
           <div class="card-head">
             <h2>模型</h2>
             <span class="tag" id="modelTag">—</span>
@@ -1348,7 +1492,7 @@
           </div>
         </div>
 
-        <div class="card">
+        <div class="card settings-reply-card">
           <div class="card-head"><h2>自动回复</h2></div>
           <div class="form">
             <div class="form-grid">
@@ -1396,12 +1540,12 @@
           </div>
         </div>
 
-        <div class="save-bar">
+        <div class="save-bar settings-save-bar">
           <span class="save-hint" id="saveHint"></span>
           <button class="btn btn-primary" id="btnSave">保存设置</button>
         </div>
 
-        <div class="card" style="margin-top:16px">
+        <div class="card settings-about-card" style="margin-top:16px">
           <div class="card-head">
             <h2>关于</h2>
             <span class="tag" id="aboutVersion">—</span>
@@ -1440,7 +1584,7 @@
         <div class="page-heading">
           <div>
             <h1>日志</h1>
-            <p>运行时的实时输出。</p>
+            <p>她是怎样回应的，都能在这里找到原因。预算、余韵、主动和声音不是四条装饰线。</p>
           </div>
         </div>
 

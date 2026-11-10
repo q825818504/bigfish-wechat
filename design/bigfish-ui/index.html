@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>大肥鱼 · 她的今天</title>
+<link rel="icon" href="assets/avatar.png">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<svg class="svg-sprite" aria-hidden="true">
+  <symbol id="i-overview" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></symbol>
+  <symbol id="i-chats" viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-8 7.5 8.5 8.5 0 0 1-3-.5L4 20l1.2-4A7.5 7.5 0 1 1 20 11.5Z"/><path d="M8.5 10.5h7M8.5 13.5h4.5"/></symbol>
+  <symbol id="i-soul" viewBox="0 0 24 24"><path d="M12 20.2S4.5 16 4.5 10.2A4.2 4.2 0 0 1 12 7.5a4.2 4.2 0 0 1 7.5 2.7c0 5.8-7.5 10-7.5 10Z"/><path d="M9.2 11.3c.8-.8 1.7-1.1 2.8-1.1s2 .3 2.8 1.1"/></symbol>
+  <symbol id="i-mood" viewBox="0 0 24 24"><path d="M12 4.2v2M5.6 7.6l1.4 1.4M18.4 7.6 17 9M4.2 14h2M17.8 14h2"/><path d="M7.5 18.2h9a3.2 3.2 0 0 0 .2-6.4 3.6 3.6 0 0 0-6.8-1.2A3 3 0 0 0 7.5 18.2Z"/></symbol>
+  <symbol id="i-memory" viewBox="0 0 24 24"><path d="M9.5 4.5H7a3 3 0 0 0-3 3v9a3 3 0 0 0 3 3h2.5M14.5 4.5H17a3 3 0 0 1 3 3v9a3 3 0 0 1-3 3h-2.5M9.5 3.2v17.6M14.5 3.2v17.6M6.5 9h2M15.5 9h2M6.5 14h2M15.5 14h2"/></symbol>
+  <symbol id="i-impression" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.2"/><path d="M5.5 20a6.5 6.5 0 0 1 13 0"/><path d="M17.7 4.2 18.4 6l1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8Z"/></symbol>
+  <symbol id="i-stickers" viewBox="0 0 24 24"><path d="M20 11.5V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v10a3 3 0 0 0 3 3h4.5"/><path d="M20 11.5a8.5 8.5 0 0 1-8.5 8.5 8.5 8.5 0 0 0 8.5-8.5Z"/><path d="M8 10h.01M12.5 10h.01M8.5 13.8c.8.8 1.6 1.2 2.5 1.2"/></symbol>
+  <symbol id="i-voice" viewBox="0 0 24 24"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M8.5 21h7"/></symbol>
+  <symbol id="i-data" viewBox="0 0 24 24"><ellipse cx="12" cy="5.5" rx="7.5" ry="3"/><path d="M4.5 5.5v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6M4.5 11.5v6c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-6"/></symbol>
+  <symbol id="i-plugins" viewBox="0 0 24 24"><path d="M8 3.5v5M16 3.5v5M6 8.5h12v2a6 6 0 0 1-6 6v0a6 6 0 0 1-6-6v-2ZM12 16.5v4"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h8M16 7h4M4 17h4M12 17h8M4 12h3M11 12h9"/><circle cx="14" cy="7" r="2"/><circle cx="10" cy="17" r="2"/><circle cx="7" cy="12" r="2"/></symbol>
+  <symbol id="i-logs" viewBox="0 0 24 24"><path d="M5 5.5h14v13H5z"/><path d="M8 9h3M8 12h6M8 15h4M14.5 9h1.5"/></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m7 9.5 5 5 5-5"/></symbol>
+  <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9.5 7 5 5-5 5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 4.5 4.5"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3v8"/><path d="M7.2 6.6a8 8 0 1 0 9.6 0"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="m9 6 9 6-9 6V6Z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="m8 12 2.8 2.8L16.5 9"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5 21 20H3L12 3.5Z"/><path d="M12 9v5M12 17h.01"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="4" y="5.5" width="16" height="14" rx="2.5"/><path d="M8 3.5v4M16 3.5v4M4 10h16"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2.5"/><path d="M8 10V7.5a4 4 0 0 1 8 0V10M12 14v2.5"/></symbol>
+  <symbol id="i-lock-open" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="10" rx="2.5"/><path d="M8 10V7.5a4 4 0 0 1 7.5-2M12 14v2.5"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4.5 7h15M9 7V4.5h6V7M6.5 7l1 13h9l1-13M10 11v5M14 11v5"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 11l4.5 4.5 4.5-4.5M5 20h14"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V5M7.5 9 12 4.5 16.5 9M5 20h14"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 6.5h6l2 2h9v10.5h-17V6.5Z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3.5h8l4 4v13H6v-17Z"/><path d="M14 3.5v4h4M9 12h6M9 15.5h6"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="m4.5 16.5-.8 3.8 3.8-.8L19 8a2.3 2.3 0 0 0-3.3-3.3L4.5 16.5Z"/><path d="m14.5 6 3.5 3.5"/></symbol>
+  <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M5 6h14M5 12h14M5 18h14"/><circle cx="9" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="18" r="2"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 24 24"><path d="M3.5 12s3.1-5.5 8.5-5.5 8.5 5.5 8.5 5.5-3.1 5.5-8.5 5.5S3.5 12 3.5 12Z"/><circle cx="12" cy="12" r="2.5"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3.5 20 6v5c0 5-3.5 8-8 9.5C7.5 19 4 16 4 11V6l8-2.5Z"/><path d="m8.5 12 2.3 2.3 4.7-4.6"/></symbol>
+  <symbol id="i-wave" viewBox="0 0 24 24"><path d="M3 12h2l1.5-4 2.5 9 2.5-13 2.5 17 2.5-11 1.5 2h4"/></symbol>
+  <symbol id="i-volume" viewBox="0 0 24 24"><path d="M4.5 10v4h3l4 3.5v-11l-4 3.5h-3Z"/><path d="M15 9.5a3.5 3.5 0 0 1 0 5M17.5 7a7 7 0 0 1 0 10"/></symbol>
+  <symbol id="i-headphones" viewBox="0 0 24 24"><path d="M4.5 13v-1a7.5 7.5 0 0 1 15 0v1"/><rect x="3.5" y="12.5" width="4" height="6" rx="2"/><rect x="16.5" y="12.5" width="4" height="6" rx="2"/></symbol>
+  <symbol id="i-smile" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8.5 14c.9 1.2 2 1.8 3.5 1.8s2.6-.6 3.5-1.8M9 9.5h.01M15 9.5h.01"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6 7 7M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></symbol>
+  <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M6.5 18h11a3.5 3.5 0 0 0 .2-7A4.5 4.5 0 0 0 9.2 9.7 3.8 3.8 0 0 0 6.5 18Z"/></symbol>
+  <symbol id="i-send" viewBox="0 0 24 24"><path d="m3.5 4 17 8-17 8 2.2-8L3.5 4Z"/><path d="M5.7 12h14.8"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5H5v11h3"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6 7v5l-4 2v-7L4 5Z"/></symbol>
+  <symbol id="i-arrow-up-right" viewBox="0 0 24 24"><path d="M7 17 17 7M8 7h9v9"/></symbol>
+  <symbol id="i-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+  <symbol id="i-mic-off" viewBox="0 0 24 24"><path d="m4 4 16 16M9 5.8V6a3 3 0 0 1 6 0v5a3 3 0 0 1-.6 1.8M9 10v1a3 3 0 0 0 4.2 2.8"/><path d="M5.5 11.5a6.5 6.5 0 0 0 9.2 6M12 18v3"/></symbol>
+</svg>
+
+<div class="app-shell" data-ui>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-avatar"><img src="assets/avatar.png" alt="大肥鱼头像"></div>
+      <div class="brand-copy">
+        <strong>大肥鱼</strong>
+        <span>住在微信里的她</span>
+      </div>
+      <span class="brand-version">v0.11.2</span>
+    </div>
+
+    <nav class="nav" aria-label="主导航">
+      <div class="nav-group">
+        <span class="nav-label">运行</span>
+        <button class="nav-item is-active" data-page="overview"><svg class="icon"><use href="#i-overview"/></svg><span>概览</span></button>
+        <button class="nav-item" data-page="chats"><svg class="icon"><use href="#i-chats"/></svg><span>会话</span><span class="nav-count">2</span></button>
+      </div>
+      <div class="nav-group">
+        <span class="nav-label">她</span>
+        <button class="nav-item" data-page="soul"><svg class="icon"><use href="#i-soul"/></svg><span>灵魂</span></button>
+        <button class="nav-item" data-page="mood"><svg class="icon"><use href="#i-mood"/></svg><span>心情</span></button>
+        <button class="nav-item" data-page="memory"><svg class="icon"><use href="#i-memory"/></svg><span>记忆</span><span class="nav-count">37</span></button>
+        <button class="nav-item" data-page="impression"><svg class="icon"><use href="#i-impression"/></svg><span>印象</span><span class="nav-count">2</span></button>
+        <button class="nav-item" data-page="stickers"><svg class="icon"><use href="#i-stickers"/></svg><span>表情包</span><span class="nav-count">18</span></button>
+        <button class="nav-item" data-page="voice"><svg class="icon"><use href="#i-voice"/></svg><span>声音</span><span class="nav-dot"></span></button>
+      </div>
+      <div class="nav-group">
+        <span class="nav-label">系统</span>
+        <button class="nav-item" data-page="data"><svg class="icon"><use href="#i-data"/></svg><span>数据目录</span></button>
+        <button class="nav-item" data-page="plugins"><svg class="icon"><use href="#i-plugins"/></svg><span>插件</span><span class="nav-count">8/9</span></button>
+        <button class="nav-item" data-page="settings"><svg class="icon"><use href="#i-settings"/></svg><span>设置</span></button>
+        <button class="nav-item" data-page="logs"><svg class="icon"><use href="#i-logs"/></svg><span>日志</span></button>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="live-row"><span class="live-dot"></span><strong>运行中</strong><span>发送通道就绪</span></div>
+      <div class="account-row"><span class="account-avatar">示</span><div><strong>示例账号</strong><span>wxid_demo · 微信 4.1.15.53</span></div><button class="icon-btn icon-btn--dark" data-action="account" title="切换账号"><svg class="icon"><use href="#i-chevron-down"/></svg></button></div>
+      <p class="privacy-note"><svg class="icon"><use href="#i-shield"/></svg>所有内容只留在本机</p>
+    </div>
+  </aside>
+
+  <div class="workspace">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="wordmark">大肥鱼</span>
+        <span class="crumb-sep">/</span>
+        <strong id="crumb-title">她的今天</strong>
+      </div>
+      <div class="topbar-right">
+        <span class="demo-chip">界面示例 · 非真实数据</span>
+        <span class="today-stamp"><svg class="icon"><use href="#i-calendar"/></svg><span>11月9日 周一</span><span class="stamp-time">09:42</span></span>
+        <button class="icon-btn" data-action="refresh" title="刷新界面"><svg class="icon"><use href="#i-refresh"/></svg></button>
+        <button class="icon-btn" data-action="notifications" title="运行提醒"><span class="notification-dot"></span><svg class="icon"><use href="#i-alert"/></svg></button>
+      </div>
+    </header>
+
+    <main class="page-scroll" id="page-root" tabindex="-1"></main>
+  </div>
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root" class="toast-root" aria-live="polite"></div>
+
+<script src="data.js"></script>
+<script src="pages.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

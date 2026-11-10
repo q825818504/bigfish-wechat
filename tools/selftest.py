@@ -434,6 +434,10 @@ item("长大", lambda: _run_unit("selftest_growth.py"))
 # 这类冲突不会报错，只会让她说出一句莫名其妙的话。
 item("接话与补一句", lambda: _run_unit("selftest_afterthought.py"))
 item("界面契约", lambda: _run_unit("selftest_ui_pages.py"))
+# 今日桥接：真实今天 vs life.day、跨天 plan、心情预算的四个数。
+# 2026-11-10 审计发现旧实现把两者混成一个 day，跨天后页面会把
+# 昨天写成“今天”，并把昨天的日程整段丢掉。
+item("今日桥接", lambda: _run_unit("selftest_today.py"))
 # 发送收尾体检：2026-11-08 线上"微信收到了、日志说这一轮一条都没发出去"。
 # 根因是缩进塌陷 —— 整段收尾（记忆库 / 心情 / 成功日志）活埋在 except 里，
 # 语法完全合法、不报错，只能查语法树。

@@ -5,7 +5,7 @@
 她记得你说过什么，心情会被对话改变，会主动找你，也会在你长时间不回时往回收；
 每天睡前给自己排第二天的日程，写一篇只存在本机的日记。声音、表情、说法都是可拆的插件。
 
-**当前版本 `0.11.0`** · [更新日志](CHANGELOG.md) · [文档目录](docs/)
+**当前版本 `0.12.1`** · [更新日志](CHANGELOG.md) · [文档目录](docs/)
 
 > 本文里的名字、会话、Key、音色 ID 都是占位示例。真实配置只存在你的电脑上。
 > 发布包不包含 `config.json`、`settings.json`、`plugins.json` 或任何聊天数据。
@@ -15,7 +15,7 @@
 ## 快速开始
 
 ```
-1. 解压 BigFish-0.11.0-portable.zip 到任意目录
+1. 解压 BigFish-0.12.1-portable.zip 到任意目录
 2. 右键 BigFish.exe → 以管理员身份运行
 3. 「会话」页选微信号、勾选要听的会话
 4. 「设置」页填模型接口和 Key
@@ -371,7 +371,7 @@ python tools\make_release.py        创建 GitHub Release 并上传附件
 发布包生成后应抽查：
 
 ```cmd
-python -c "import zipfile; z=zipfile.ZipFile('release/BigFish-0.11.0-portable.zip'); print([n for n in z.namelist() if 'config.json' in n or '/data/' in n])"
+python -c "import zipfile; z=zipfile.ZipFile('release/BigFish-0.12.1-portable.zip'); print([n for n in z.namelist() if 'config.json' in n or '/data/' in n])"
 ```
 
 输出应为空列表。

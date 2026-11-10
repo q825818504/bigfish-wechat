@@ -13,12 +13,15 @@ const S = {
   chats: [],
   watching: new Set(),
   soul: null,
+  today: null,
+  todayAsleep: false,
+  journalPath: '',
 };
 
 window.S = S;
 
 const PAGE_TITLES = {
-  overview: '概览', chats: '会话', soul: '灵魂',
+  overview: '她的今天', chats: '会话', soul: '灵魂',
   mood: '心情', memory: '记忆', impression: '印象',
   stickers: '表情包', voice: '声音', data: '数据目录',
   plugins: '插件', settings: '设置', logs: '日志',
@@ -142,6 +145,7 @@ function go(page) {
   $$('.page').forEach((p) => p.classList.toggle('is-active', p.dataset.page === page));
   setText('#breadcrumb', PAGE_TITLES[page] || page);
 
+  if (page === 'overview') loadToday();
   if (page === 'soul' && !S.soul) loadSoul();
   if (page === 'mood') loadMood();
   if (page === 'memory') { loadMemoryStats(); loadMemory(''); loadMemorySessions(); loadMemoryHealth(); loadFacts(0); loadOwners(); loadPersons(); loadPoolSummary(); }
@@ -224,24 +228,189 @@ function renderChecks(items) {
   }
 }
 
+function recentItemHtml(m) {
+  const out = m.dir === 'out';
+  const bubble = `<div class="recent-bubble ${out ? 'is-reply' : ''}">
+    <span class="bubble-sender">${out ? '她' : esc(m.who || '对方')}</span>${esc(m.text || '')}
+  </div>`;
+  return `<div class="recent-item ${out ? 'is-out' : ''}">
+    <div class="recent-meta">
+      <span class="name">${esc(m.who || (out ? '她' : '对方'))}</span>
+      <span class="time">${out ? '她的回复' : '收到'}</span>
+    </div>
+    ${out ? `<div class="recent-reply-row">${bubble}</div>` : bubble}
+  </div>`;
+}
+
 function renderRecent(items) {
   const box = $('#ovRecent');
+  if (!box) return;
   if (!items || !items.length) {
-    box.innerHTML = `<div class="empty"><h3>还没有对话</h3>
-      <p>启动之后，微信里来消息就会显示在这里</p></div>`;
+    box.innerHTML = `<div class="empty plan-empty">
+      <p>还没有对话</p>
+      <small>启动之后，微信里来消息就会出现在这里。</small>
+    </div>`;
+    setText('#ovRecentState', '等待消息');
     return;
   }
-  box.innerHTML = items.map((m) => `
-    <div class="note-item" style="padding:9px 0;border-bottom:1px solid var(--border-soft)">
-      <div style="flex:1;min-width:0">
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:3px">
-          <span class="memory-role ${m.dir === 'out' ? 'assistant' : ''}">${esc(m.who)}</span>
-          <span class="memory-time">${esc(m.dir === 'out' ? '回复' : '收到')}</span>
-        </div>
-        <div style="font-size:12px;color:var(--text)">${esc(m.text)}</div>
-      </div>
-    </div>`).join('');
+  box.innerHTML = `<div class="recent-list">${items.map(recentItemHtml).join('')}</div>`;
+  setText('#ovRecentState', `最近 ${items.length} 条`);
+  const foot = $('#ovRecentFoot');
+  if (foot) {
+    const last = foot.lastElementChild;
+    if (last) last.textContent = '最后一条 ' + (items[0].who || '—');
+  }
 }
+
+function renderTodayPlan(d) {
+  const box = $('#ovPlanList');
+  if (!box) return;
+  const plan = (d.plan || []).filter((x) => x && x.what);
+  const note = $('#ovPlanNote');
+  const day = d.day || '';
+  const planDay = (d.life && d.life.plan_day) || '';
+  if (!plan.length) {
+    box.innerHTML = `<div class="empty plan-empty">
+      <p>今天还没有排日程</p>
+      <small>她醒来后会自动排几件小事，至少一件接着昨天。</small>
+    </div>`;
+    if (note) note.textContent = '还没有今天的安排';
+    return;
+  }
+  if (note) {
+    note.textContent = !planDay
+      ? '安排没有日期'
+      : (planDay === day ? '今天的安排' : `安排来自 ${planDay}`);
+  }
+  const asleep = !!(d.life && d.life.asleep);
+  const now = new Date();
+  const minute = now.getHours() * 60 + now.getMinutes();
+  const mins = plan.map((x) => {
+    const m = /^(\\d{1,2}):(\\d{2})$/.exec(String(x.at || ''));
+    return m ? Number(m[1]) * 60 + Number(m[2]) : -1;
+  });
+  let nowIdx = -1;
+  plan.forEach((x, i) => { if (!x.done && mins[i] >= 0 && mins[i] <= minute) nowIdx = i; });
+  box.innerHTML = plan.map((x, i) => {
+    // 睡着了就不存在“现在在做”这件事；手头的事由 life.doing 单独说。
+    const isNow = !asleep && i === nowIdx;
+    const state = x.done ? (x.done_by === 'elapsed' ? '已过去' : '做完了') : (isNow ? '现在在做' : '');
+    const from = x.from === 'yesterday' ? '接着昨天' : x.from === 'fact' ? '来自记得的事' : '她自己排的';
+    return `<div class="plan-item ${x.done ? 'is-done' : ''} ${isNow ? 'is-now' : ''}">
+      <span class="plan-time">${esc(x.at || '—')}</span>
+      <span class="plan-dot"></span>
+      <div class="plan-copy"><div class="plan-title">${esc(x.what)}</div><div class="plan-meta">${from}</div></div>
+      <span class="plan-state">${state}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderToday(d) {
+  if (!d || !d.ok) return;
+  S.today = d;
+  const life = d.life || {};
+  const mood = d.mood || {};
+  const weather = d.weather || {};
+  const journal = d.journal || {};
+  const afterglow = d.afterglow || {};
+  const greeting = d.greeting || '';
+  const asleep = !!life.asleep;
+  const condition = life.condition || '生活状态未知';
+  // 条件里已经有「（精力 78）」时不再把同一个数塞进两个 chip。
+  const conditionShort = String(condition).replace(/（[^）]*精力[^）]*）/g, '').trim();
+
+  setText('#ovGreeting', asleep
+    ? `${greeting}，她睡着了。`
+    : `${greeting}，她正在过自己的今天。`);
+  setText('#ovCondition', conditionShort);
+  setText('#ovEnergy', life.energy != null ? `精力 ${life.energy}` : '精力 —');
+  setText('#ovWake', asleep ? `约 ${life.wake_at || '—'} 醒` : (life.wake_at ? `醒来 ${life.wake_at}` : '睡眠 —'));
+  S.todayAsleep = asleep;
+  setText('#ovDoingLabel', asleep ? '此刻' : '此刻在做');
+  setText('#ovDoing', asleep ? '她已经睡了' : (life.doing || '还没有写下手头的事'));
+  setText('#ovDoingHint', asleep
+    ? (life.wake_at ? `约 ${life.wake_at} 醒` : '睡着')
+    : (life.doing ? '来自生活状态' : '—'));
+  setText('#ovTodayLabel', `${d.day || '—'} · 周${d.weekday || '—'}`);
+  setText('#ovMoodScore', mood.value != null ? `${mood.value} · ${mood.label || ''}` : '—');
+  setText('#ovMoodLabel', mood.value != null ? `心情 ${mood.value} · ${mood.label || ''}` : '心情 —');
+  setText('#ovAfterglowCount', afterglow.count ? `${afterglow.count} 条` : '无');
+  // 两处都取 afterglow.text 会同一段话出现两次；右侧只给“有没有余韵”的
+  // 摘要，原文留在「今天的余韵」卡里。
+  setText('#ovQuietNote', afterglow.count
+    ? '上一轮余韵还在，原文在「今天的余韵」。'
+    : (weather.line ? `今天没有额外余韵。${weather.city || '本地'}：${weather.line}` : '今天没有额外余韵。'));
+  setText('#ovAfterglow', afterglow.text || '还没有额外的感知；日子、天气和余韵会在这里出现。');
+  const moodReasonBtn = $('#ovMoodReason');
+  if (moodReasonBtn) moodReasonBtn.title = mood.reason || '去心情页看这句话的来源';
+  setText('#ovMetaRuntime', weather.line
+    ? `${weather.city || '本地'} · ${weather.line}`
+    : '本机生活状态');
+  $('#ovMetaRuntime')?.classList.remove('is-error');
+
+  const ww = $('#ovWeatherWrap');
+  if (ww) {
+    ww.hidden = !weather.line;
+    if (weather.line) {
+      const parts = String(weather.line).split(/[，,]/);
+      setText('#ovWeatherValue', parts[0] || weather.line);
+      setText('#ovWeatherCity', weather.city || '');
+    }
+  }
+
+  const jday = journal.day || '';
+  setText('#ovJournalDate', jday || '还没有日记');
+  setText('#ovJournal', journal.text
+    ? String(journal.text).replace(/^#+\\s*/gm, '').replace(/\\*\\*/g, '').slice(0, 400)
+    : '还没有日记。睡前写下的那篇只留在本机。');
+  S.journalPath = journal.path || '';
+
+  renderTodayPlan(d);
+  renderRecent(d.recent || []);
+}
+
+async function loadToday() {
+  if (!S.bridge || !S.bridge.get_today) return;
+  try {
+    const d = JSON.parse(await S.bridge.get_today());
+    if (d.ok) {
+      renderToday(d);
+    } else {
+      S.todayAsleep = false;
+      setText('#ovMetaRuntime', '生活状态读取失败');
+      $('#ovMetaRuntime')?.classList.add('is-error');
+    }
+  } catch (e) {
+    // 不要静默：陈旧内容 + 每 2 秒“更新于”会让人以为数据是新的。
+    S.todayAsleep = false;
+    setText('#ovMetaRuntime', '生活状态读取失败');
+    $('#ovMetaRuntime')?.classList.add('is-error');
+  }
+}
+
+function tickClock() {
+  const d = new Date();
+  const wd = '日一二三四五六'[d.getDay()];
+  setText('#appDate', `${d.getMonth() + 1}月${d.getDate()}日 周${wd}`);
+  setText('#appClock', [d.getHours(), d.getMinutes()]
+    .map((n) => String(n).padStart(2, '0')).join(':'));
+}
+
+$('#btnRefreshOverview')?.addEventListener('click', async () => {
+  await refreshStatus();
+  await loadToday();
+  toast('已刷新');
+});
+
+$('#ovJournalOpen')?.addEventListener('click', async () => {
+  if (!S.bridge || !S.journalPath) return toast('还没有可打开的日记');
+  try {
+    const r = JSON.parse(await S.bridge.open_path(S.journalPath));
+    if (r && r.error) toast(r.error);
+  } catch (e) { toast('打开失败'); }
+});
+
+$('#ovMoodReason')?.addEventListener('click', () => go('mood'));
 
 async function refreshStatus() {
   if (!S.bridge) return;
@@ -250,7 +419,11 @@ async function refreshStatus() {
     S.running = !!s.running;
 
     const pb = $('#btnPower');
-    pb.classList.toggle('is-on', s.running);
+    if (pb) {
+      pb.classList.toggle('is-on', s.running);
+      const label = pb.querySelector('span');
+      if (label) label.textContent = s.running ? '停止' : '启动';
+    }
 
     // 运行中但发送通道不可用 = 只监听不发送。必须当场说，
     // 否则用户以为启动成功了，等她回话等到天亮（2026-11-08 现场）。
@@ -261,21 +434,35 @@ async function refreshStatus() {
     setText('#ovStateHint', s.running
       ? (sendDown
           ? (s.error || '微信窗口没打开：现在只监听、不发送。打开微信窗口后会自动恢复。')
-          : '她在听着。微信里有人说话就会回。')
+          : (S.todayAsleep
+              ? '她已经睡了；这会儿不会主动开口。'
+              : '她在听着。微信里有人说话就会回。'))
       : (s.error || '登录并选择会话后，点右侧按钮启动。'));
     setText('#statusText', s.running
       ? (sendDown ? '发不出去' : '运行中')
       : (s.error ? '出错' : '未启动'));
     setDot(s.running && !sendDown ? 'on' : (s.error || sendDown ? 'err' : ''));
+    const runDot = $('#ovRunDot');
+    if (runDot) {
+      runDot.className = 'live-dot ' + (s.running && !sendDown ? 'is-ok' : (s.error || sendDown ? 'is-err' : 'is-off'));
+      const rs = runDot.closest('.run-state');
+      if (rs) {
+        rs.classList.toggle('is-running', !!s.running && !sendDown);
+        rs.classList.toggle('is-error', !!(s.error || sendDown));
+      }
+    }
 
     const tag = $('#ovPowerTag');
-    tag.textContent = s.running
-      ? (sendDown ? '只监听 · 不发送' : `监听 ${s.watching || 0} 个会话`)
-      : '等待启动';
-    tag.className = 'tag' + (s.running && !sendDown ? ' ok' : '');
+    if (tag) {
+      tag.textContent = s.running
+        ? (sendDown ? '只监听 · 不发送' : `监听 ${s.watching || 0} 个会话`)
+        : '等待启动';
+      tag.className = 'tag' + (s.running && !sendDown ? ' ok' : '');
+    }
 
-    $('#ovRecv').innerHTML = `${s.recv ?? 0}<small>条</small>`;
-    $('#ovReply').innerHTML = `${s.reply ?? 0}<small>条</small>`;
+    setText('#ovRecv', String(s.recv ?? 0));
+    setText('#ovReply', String(s.reply ?? 0));
+    setText('#ovWatch', String(s.watching ?? 0));
     setText('#ovUptime', s.running ? (s.uptime || '0秒') : '—');
     // 账号标签统一由 refreshAccountLabel 管：它调 current_account，
     // 能拿到"未选择"、wxid、昵称三种状态。这里不再直接用 s.account ——
@@ -284,7 +471,8 @@ async function refreshStatus() {
     setText('#ovUpdated', '更新于 ' + hhmmss());
 
     if (s.diagnose) renderChecks(s.diagnose);
-    if (s.recent) renderRecent(s.recent);
+    // 最近对话只由 get_today 统一绘制。status.recent 的截断长度不同，
+    // 每 2 秒重画会让列表在 4 条 / 12 条之间跳变。
 
     // 补日志：信号可能因为界面还没连上而丢失，这里按 seq 补齐
     if (s.logs && s.logs.length) {
@@ -297,14 +485,13 @@ async function refreshStatus() {
 
     // 概览右侧摘要
     const sum = $('#ovSummary');
-    if (s.running && s.watching) {
-      sum.innerHTML = `<div class="check-item ok">
-        <span class="check-icon">${CHECK_ICONS.ok}</span>
-        <div><div class="check-name">正在监听</div>
-        <div class="check-val">${s.watching} 个会话</div></div><span></span></div>`;
-    } else {
-      sum.innerHTML = `<div class="empty" style="padding:16px 0">
-        <p>启动后这里会显示正在监听的会话</p></div>`;
+    if (sum) {
+      if (s.running) {
+        sum.innerHTML = `<div class="quiet-row"><span>正在监听</span><strong>${s.watching || 0} 个会话</strong></div>
+          <div class="quiet-row"><span>发送通道</span><strong>${sendDown ? '只监听' : '就绪'}</strong></div>`;
+      } else {
+        sum.innerHTML = `<p class="journal-excerpt">启动后这里会显示正在监听的会话。</p>`;
+      }
     }
   } catch (e) { /* 静默 */ }
 }
@@ -330,7 +517,11 @@ $('#btnPower').addEventListener('click', async () => {
   }
 });
 
-$('#btnRefresh').addEventListener('click', () => { refreshStatus(); toast('已刷新'); });
+$('#btnRefresh').addEventListener('click', () => {
+  refreshStatus();
+  if ($('.page[data-page="overview"]')?.classList.contains('is-active')) loadToday();
+  toast('已刷新');
+});
 $('#btnRecheck').addEventListener('click', async () => {
   if (!S.bridge) return;
   const d = JSON.parse(await S.bridge.diagnose());
@@ -407,20 +598,24 @@ function renderChats() {
     });
   }
 
+  const KIND_LABEL = { contact: '私聊', group: '群聊', official: '公众号', system: '系统' };
   const rows = S.chats.filter((c) => (c.kind || 'contact') === active);
   box.innerHTML = rows.map((c) => {
     const on = S.watching.has(c.username);
     const initial = (c.name || '?').trim().charAt(0).toUpperCase();
-    const unread = c.unread ? ` · ${c.unread > 99 ? '99+' : c.unread} 条未读` : '';
-    return `<div class="chat-row${on ? ' is-on' : ''}" data-chat="${esc(c.username)}">
+    const kind = KIND_LABEL[c.kind || 'contact'] || '会话';
+    const unread = c.unread ? `${c.unread > 99 ? '99+' : c.unread} 条未读` : '没有未读';
+    return `<div class="chat-row${on ? ' is-on' : ''}" data-chat="${esc(c.username)}" role="button" aria-pressed="${on}">
       <span class="chat-avatar">${esc(initial)}</span>
-      <div style="min-width:0">
-        <div class="chat-name">${esc(c.name)}</div>
-        <div class="chat-sub">${unread || '—'}</div>
+      <div class="chat-main">
+        <div class="chat-name">${esc(c.name)}<span class="chat-kind">${kind}</span></div>
+        <div class="chat-sub">${unread}</div>
       </div>
+      <span class="chat-type">${kind}</span>
+      <span class="chat-scope">${on ? '持续监听' : '未监听'}</span>
       <button class="chat-gear" data-gear="${esc(c.username)}"
               title="这个会话的单独设置" aria-label="这个会话的单独设置">⚙</button>
-      <span class="chat-toggle"></span>
+      <span class="chat-toggle" aria-hidden="true"></span>
     </div>`;
   }).join('');
 
@@ -682,11 +877,19 @@ async function saveScope() {
  */
 function updateWatchBar() {
   setText('#watchCount', S.watching.size + ' 个');
+  const dirty = !!S.watchDirty;
   const btn = $('#btnSaveWatch');
   if (btn) {
-    btn.disabled = !S.watchDirty;
-    btn.textContent = S.watchDirty ? '保存修改' : '已保存';
-    btn.classList.toggle('btn-primary', !!S.watchDirty);
+    btn.disabled = !dirty;
+    btn.textContent = dirty ? '保存修改' : '已保存';
+    btn.classList.toggle('btn-primary', dirty);
+  }
+  const top = $('#btnSaveWatchTop');
+  if (top) {
+    top.disabled = !dirty;
+    top.textContent = dirty ? '保存修改' : '已保存';
+    top.classList.toggle('btn-primary', dirty);
+    top.classList.toggle('btn-secondary', !dirty);
   }
   const hint = $('#watchHint');
   if (hint) {
@@ -733,14 +936,17 @@ async function refreshAccountLabel() {
   try {
     const d = JSON.parse(await S.bridge.current_account());
     const el = $('#accountLabel');
+    const hero = $('#ovAccountChip');
     if (!el) return;
     if (d.open) {
       const show = d.nick || d.wxid || d.account;
       el.textContent = show + (d.nick && d.nick !== d.wxid ? '' : '');
       el.title = 'wxid: ' + (d.wxid || d.account);
+      if (hero) hero.textContent = show + ' · 当前账号';
     } else {
       el.textContent = '未选择账号';
       el.title = '点「选择账号」挑一个微信';
+      if (hero) hero.textContent = '还没有选择微信账号';
     }
   } catch (e) { /* 静默 */ }
 }
@@ -836,6 +1042,7 @@ async function doLoadChats() {
 
 $('#btnPickAccount').addEventListener('click', pickAccount);
 if ($('#btnSaveWatch')) $('#btnSaveWatch').addEventListener('click', saveWatch);
+if ($('#btnSaveWatchTop')) $('#btnSaveWatchTop').addEventListener('click', saveWatch);
 $('#btnLoadChats').addEventListener('click', doLoadChats);
 document.addEventListener('click', (e) => {
   const a = e.target.closest('[data-acc]');
@@ -1230,6 +1437,23 @@ async function loadMood() {
         <span class="dim-val">${(p * 100).toFixed(0)}%</span>
       </div>`;
     }).join('') || '<div class="empty"><p>（无数据）</p></div>';
+
+    const b = d.budget || {};
+    setText('#moodBudgetParts', b.parts != null ? b.parts : '—');
+    setText('#moodBudgetChars', b.chars != null ? b.chars : '—');
+    setText('#moodBudgetSilence', b.silence != null ? Number(b.silence).toFixed(2) : '—');
+    setText('#moodBudgetMust', b.must_after != null ? b.must_after + ' 次' : '—');
+    const budgetState = $('#moodBudgetState');
+    if (budgetState) {
+      budgetState.textContent = d.value == null ? '—' : '生效中';
+      budgetState.className = 'tag ' + (d.value == null ? '' : 'ok');
+    }
+    const why = [b.reason, b.tone].filter(Boolean).join('；');
+    setText('#moodBudgetReason', why || '心情、精力、时间和余韵会一起收紧这一轮。');
+
+    const echo = d.afterglow || {};
+    setText('#moodEchoTag', echo.count ? `${echo.count} 条` : '—');
+    setText('#moodEchoText', echo.text || '还没有余韵；上一轮的情绪没有留下额外修正。');
 
     fillMoodConfig(d.config || {});
   } catch (e) {
@@ -1989,6 +2213,7 @@ function renderImprTabs() {
   if (!box) return;
   if (!IMPR.people.length) {
     box.innerHTML = '';
+    setText('#imprPeopleCount', '0 人');
     const panes = $('#imprPanes');
     if (panes) {
       panes.innerHTML = '<div class="empty"><h3>还没有人</h3>' +
@@ -2003,11 +2228,23 @@ function renderImprTabs() {
   if (!IMPR.active || !sorted.some((p) => p.owner === IMPR.active)) {
     IMPR.active = sorted[0].owner;
   }
+  setText('#imprPeopleCount', sorted.length + ' 人');
   box.innerHTML = sorted.map((p) => {
-    const cls = p.owner === IMPR.active ? ' is-active' : '';
-    const star = p.isOwner ? ' ★' : '';
-    return '<button class="subtab' + cls + '" data-impr="' + esc(p.owner) + '">' +
-      esc(p.name || p.owner) + star + '</button>';
+    const active = p.owner === IMPR.active ? ' is-active' : '';
+    const name = p.name || p.owner;
+    const initial = String(name).trim().charAt(0) || '人';
+    const note = String(p.note || '').trim();
+    const sub = note
+      ? note.slice(0, 34)
+      : `${p.facts || 0} 条认识 · ${p.private || 0} 条私密`;
+    return '<button class="impr-person' + active + '" data-impr="' +
+      esc(p.owner) + '">' +
+      '<span class="impr-avatar">' + esc(initial) + '</span>' +
+      '<span class="impr-person-copy"><strong>' + esc(name) +
+      (p.isOwner ? ' <span class="tag ok">主人</span>' : '') +
+      '</strong><small>' + esc(sub) + '</small></span>' +
+      '<span class="impr-person-count">' + (p.facts || 0) + '</span>' +
+      '</button>';
   }).join('');
 }
 
@@ -2032,8 +2269,8 @@ function renderImprPanes() {
       '还没有她会说出去的事。<br>' +
       '去「记忆 → 她认定的事」，把想公开的那条改成「可共享」并选一个话题。</p></div>';
 
-  box.innerHTML =
-    '<div class="card">' +
+  const main =
+    '<div class="card impr-main-card">' +
     '<div class="card-head"><h2>' + esc(p.name || p.owner) +
     (p.isOwner ? ' <span class="health-tag ok">主人</span>' : '') + '</h2>' +
     '<span class="tag">' + p.facts + ' 条认识 / ' + p.private + ' 条私密</span></div>' +
@@ -2043,7 +2280,6 @@ function renderImprPanes() {
     // 这是她**自己**从事实归纳的一段话，每轮都会带进提示词。
     // 和下面「你手写的评语」区别：那段她看不见，这段她天天在用。
     buildProfileBlock(p) +
-    buildBondBlock(p) +
 
     '<div class="field full" style="margin-bottom:16px">' +
     '<label>你怎么看这段关系（手写，模型不参与，她也不看）</label>' +
@@ -2061,6 +2297,37 @@ function renderImprPanes() {
     '</div>' +
     '<div class="open-list">' + openRows + '</div>' +
     '</div>';
+
+  const side =
+    '<aside class="impr-side">' +
+    '<div class="card impr-bond-card">' + buildBondBlock(p) + '</div>' +
+    buildEventTimeline(p) +
+    '<div class="card impr-rules">' +
+    '<div class="card-head"><h2>她会不会说出去</h2><span class="tag">规则</span></div>' +
+    '<div class="rule-row"><span>会说</span><p>爱好、作息、性格、口头禅、称呼；还必须在开放话题白名单里。</p></div>' +
+    '<div class="rule-row"><span>不会说</span><p>住址、工作、行程、身体、金钱、家人、联系人、年龄、情绪和近况。</p></div>' +
+    '<div class="rule-row"><span>依据</span><p>关系卡每一条都必须能在原话里找到出处；找不到就写不进来。</p></div>' +
+    '</div>' +
+    '</aside>';
+
+  box.innerHTML = '<div class="impr-workspace">' + main + side + '</div>';
+}
+
+function buildEventTimeline(p) {
+  const events = p.events || [];
+  if (!events.length) return '';
+  const rows = events.map((e) => (
+    '<div class="event-row">' +
+    '<span class="event-dot"></span>' +
+    '<div class="event-copy"><span class="event-kind">' + esc(e.kindLabel || '事件') +
+    '</span><strong>' + esc(e.what || '') + '</strong>' +
+    (e.evidence ? '<small>依据：「' + esc(e.evidence) + '」</small>' : '') +
+    '</div>' +
+    '<time>' + esc(e.atText || '') + '</time>' +
+    '</div>')).join('');
+  return '<div class="card impr-timeline-card">' +
+    '<div class="card-head"><h2>关系时间线</h2><span class="tag">' +
+    events.length + ' 条</span></div>' + rows + '</div>';
 }
 
 function buildProfileBlock(p) {
@@ -3624,41 +3891,42 @@ async function onBridgeReady(b) {
   if (b.chat_event) {
     b.chat_event.connect((who, text, dir) => {
       const box = $('#ovRecent');
-      if (box.querySelector('.empty')) box.innerHTML = '';
-      const el = document.createElement('div');
-      el.className = 'note-item';
-      el.style.padding = '9px 0';
-      el.style.borderBottom = '1px solid var(--border-soft)';
-      el.innerHTML = `<div style="flex:1;min-width:0">
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:3px">
-          <span class="memory-role ${dir === 'out' ? 'assistant' : ''}">${esc(who)}</span>
-          <span class="memory-time">${dir === 'out' ? '回复' : '收到'}</span>
-        </div>
-        <div style="font-size:12px">${esc(text)}</div></div>`;
-      box.prepend(el);
-      while (box.children.length > 10) box.removeChild(box.lastChild);
+      if (!box) return;
+      if (box.querySelector('.empty') || !box.querySelector('.recent-list')) {
+        box.innerHTML = '<div class="recent-list"></div>';
+      }
+      const list = box.querySelector('.recent-list');
+      list.insertAdjacentHTML('afterbegin', recentItemHtml({ who, text, dir }));
+      while (list.children.length > 8) list.removeChild(list.lastChild);
+      setText('#ovRecentState', '刚刚有一条新消息');
     });
   }
 
+  tickClock();
   await loadSettings();
   await refreshAccountLabel();
   await refreshStatus();
+  await loadToday();
 
   // 侧边栏要看插件开没开 —— 表情包是插件，关着就不该有那一项。
   // 必须在首屏渲染之前跑完，否则会先闪一下再消失。
   if (typeof syncPluginNav === 'function') await syncPluginNav();
 
   setInterval(refreshStatus, 2000);
+  setInterval(loadToday, 60000);
+  setInterval(tickClock, 1000);
 
   // 版本号 + 启动时静默检查一次更新
   try {
     const v = JSON.parse(await b.get_version());
     setText('#aboutVersion', 'v' + (v.version || '?'));
+    setText('#brandVersion', 'v' + (v.version || '?'));
   } catch (e) { /* 忽略 */ }
   setTimeout(() => checkUpdate(false), 2500);
 }
 
 window.addEventListener('DOMContentLoaded', () => {
+  tickClock();
   pushLog('界面已载入');
   bootBridge();
 });

@@ -50,6 +50,16 @@ expect("overview", "状态文字", "document.querySelector('#ovState').textConte
        lambda v: v.strip() != "", "不能为空")
 expect("overview", "账号标签", "document.querySelector('#accountLabel').textContent",
        lambda v: v.strip() != "—", "不能是占位符")
+expect("overview", "今日问候", "document.querySelector('#ovGreeting').textContent",
+       lambda v: v.strip() not in ("", "她正在过自己的今天。", "生活状态加载中"), "今日桥接要真的回填")
+expect("overview", "生活状态", "document.querySelector('#ovCondition').textContent",
+       lambda v: v.strip() not in ("", "生活状态加载中"), "生活状态要真的回填")
+expect("overview", "今日日期用真实今天", """(() => {
+  const d = new Date();
+  const s = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0')
+    + '-' + String(d.getDate()).padStart(2, '0');
+  return document.querySelector('#ovTodayLabel').textContent.includes(s);
+})()""", lambda v: str(v).lower() == "true", "不能用 life.day 顶替真实今天")
 expect("overview", "自检项数", "document.querySelectorAll('#checkGrid .check-item').length",
        lambda v: int(float(v)) >= 6, "至少 6 项")
 expect("overview", "自检有结果", """(() => {
@@ -123,6 +133,8 @@ expect("mood", "注入方式回填", "document.querySelector('#moodInjectMode').
        lambda v: v.strip() in ("off", "label", "event"), "要是三者之一")
 expect("mood", "保存按钮", "!!document.querySelector('#btnMoodSave')",
        lambda v: v is True, "按钮存在")
+expect("mood", "预算卡", "!!document.querySelector('#moodBudgetParts')",
+       lambda v: v is True, "这一轮预算要有落点")
 
 # ── 记忆 ──
 # 同上：清了就是空的，"没有统计"是正常状态。断言控件有响应。
@@ -189,6 +201,10 @@ expect("stickers", "库有提示", "document.querySelector('#stickerList').textC
 # 「有几张」的内容检查放到下面插件开着的那组里。
 expect("stickers", "有数量标签", "!!document.querySelector('#stickerCount')",
        lambda v: v is True, "顶部要有个地方显示张数")
+expect("stickers", "有常驻详情", "!!document.querySelector('#stickerPreviewCard')",
+       lambda v: v is True, "选中一张要有右侧详情")
+expect("stickers", "有选中详情控件", "!!document.querySelector('#stickerPreviewBody')",
+       lambda v: v is True, "详情容器存在")
 # 关键设计：表情包是插件，侧边栏那一项要跟着开关走。
 # 断言的是**两者一致**，不是"一定隐藏" —— 插件开着时它就该出现。
 expect("stickers", "导航跟随插件开关", """(() => {
@@ -249,7 +265,7 @@ expect("stickers", "后端槽位已注册",
        lambda v: v is True, "槽位要挂在 bridge 上")
 
 # ── 设置 ──
-expect("settings", "接口地址", "document.querySelector('#cfgEndpoint').value",
+expect("settings", "接口地址", "document.querySelector('#cfgBaseUrl').value",
        lambda v: v.strip() != "", "要回填")
 expect("settings", "模型ID", "document.querySelector('#cfgModel').value",
        lambda v: v.strip() != "", "要回填")
@@ -259,6 +275,19 @@ expect("settings", "版本号", "document.querySelector('#aboutVersion').textCon
 # ── 会话（需要点击加载）──
 expect("chats", "加载按钮", "!!document.querySelector('#btnLoadChats')",
        lambda v: v is True, "按钮存在")
+expect("chats", "页头保存监听", "!!document.querySelector('#btnSaveWatchTop')",
+       lambda v: v is True, "页头主按钮存在")
+
+# ── 印象 / 声音的新结构 ──
+expect("impression", "人物列表",
+       "document.querySelectorAll('#imprTabs .impr-person').length",
+       lambda v: int(float(v)) >= 1, "人物要能在左栏切换")
+expect("voice", "三个页内 tab",
+       "document.querySelectorAll('#voiceTabs [data-voice-tab]').length",
+       lambda v: int(float(v)) == 3, "至少三个 tab")
+expect("voice", "策略卡",
+       "document.querySelectorAll('#voiceModeGrid .voice-mode').length",
+       lambda v: int(float(v)) == 6, "六个策略选项")
 
 
 class Runner:

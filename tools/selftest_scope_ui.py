@@ -91,6 +91,8 @@ class FakeBackend:
     def __init__(self):
         self._reader = None
         self.account = "wxid_bot_fixture"
+        self.account_id = self.account
+        self.account_nick = ""
 
     _scope_context = D.Backend._scope_context
     _scope_rows = D.Backend._scope_rows
