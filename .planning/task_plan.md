@@ -5,9 +5,9 @@
 > 卡住的话跑一次 `python tools/setup-git-token.py`。
 
 
-> 2026-11-10 20:45 更新（**v0.12.1：已打包，准备提交/推送/发布**）
+> 2026-11-10 20:55 更新（**v0.12.1：已发布 GitHub Release**）
 
-## v0.12.1：补齐四处 UI 设计缺口（已完成，待发布）
+## v0.12.1：补齐四处 UI 设计缺口（已完成，已发布）
 
 用户要求把 0.12.0 里明确留下的四处继续做完，并审计新 UI 与旧逻辑的错位。
 范围：
@@ -40,11 +40,14 @@
 - 便携包：`release/BigFish-0.12.1-portable.zip`（341 文件 / 200.5 MB，
   SHA-256 `ae88b88a5b999cf630c82ac17c840f9cbabfb9c11608add4b9f2655279393974`）
 
-### 发布（进行中）
+### 发布（完成）
 
-- 待：提交源码/设计稿、推送 `main`、创建 `v0.12.1` tag、
-  用 `tools/make_release.py` 上传便携包与清单。
-- 发布完成后把 commit hash / tag / Release 地址回填到这里与 `progress.md`。
+- 主分支提交：`bf8f90d v0.12.1：补齐 UI 四处设计缺口，修跨天与状态错位`
+- Tag：`v0.12.1`（annotated，已推送）
+- Release：`#440353168`，https://github.com/q825818504/bigfish-wechat/releases/tag/v0.12.1
+- 附件：`BigFish-0.12.1-portable.zip`（210,240,387 bytes，200.5 MB）、
+  `BigFish-0.12.1-manifest.json`（643 bytes）
+- API 核验：`draft=false`、`prerelease=false`、两个附件 `state=uploaded`。
 
 ## v0.12.0：生活气象观测 UI 重构（已完成，已打包）
 
