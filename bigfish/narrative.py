@@ -86,7 +86,9 @@ SYSTEM = """你在帮一个角色做睡前的复盘。她今天和你聊过天�
     {"about":"他"或"我","from":"以前怎么看（可空）","to":"现在怎么看","why":"今天的哪件事让她这么想"}
   from/to 各不超过 40 字，why 不超过 40 字。
 - relation_events：**今天你们之间发生了什么**，0~2 条。每条：
-    {"kind":"warm|conflict|promise|first|repair|unsaid","what":"发生了什么（不超过 30 字）","evidence":"今天的原话片段（可为空）"}
+    {"kind":"warm|conflict|promise|first|repair|unsaid","what":"发生了什么（不超过 30 字）","evidence":"今天的原话片段（可为空）","due":"（仅 promise）原话里的日期短语"}
+  `due` 只给 promise 用：把对方说的日期**原样抄进来**（「下周三」「11月20日」
+  「明天」）。没有日期就留空 —— **不要自己算日子，也不要编一个期限**。
   `unsaid` 只用一种情况：你今天**想说但咽回去**的话。
   判据是材料里看得到你停顿、改口，或者明明有话却只回了个很短的句子。
   没有这种痕迹就别写 —— 编出来的"欲言又止"比直说还假。
@@ -321,6 +323,10 @@ def parse(raw: str) -> Tuple[Dict[str, Any], str]:
                 "kind": kind,
                 "what": what,
                 "evidence": _clip(row.get("evidence"), 80),
+                # 只有 promise 需要日期；其余 kind 带了也不写库。
+                # 日期短语原样保留（"下周三"），由 future.parse_due 解析 ——
+                # 模型不负责算时间戳，它只负责把原话里的日期抄对。
+                "due": _clip(row.get("due"), 20),
             })
             if len(out["relation_events"]) >= MAX_EVENTS:
                 break
@@ -385,10 +391,20 @@ def apply_result(result: Dict[str, Any], *, soul_path: Optional[str],
 
     if db:
         for ev in result.get("relation_events") or []:
+            # 约定要能"到期"：原话里的日期短语在这里解析成时间戳。
+            # 解析不出就是 0（不是有期限的事），不会凭空造一个日子。
+            _due = 0.0
+            if str(ev.get("kind") or "") == "promise":
+                try:
+                    from bigfish import future as F
+
+                    _due = F.parse_due(ev.get("due") or "", t)
+                except Exception:
+                    _due = 0.0
             ok, why = B.append_event(
                 db, bank, owner, kind=ev.get("kind"),
                 what=ev.get("what"), evidence=ev.get("evidence") or "",
-                at=t)
+                at=t, due_at=_due)
             if ok:
                 receipt["events"] += 1
             elif why not in ("exists",):

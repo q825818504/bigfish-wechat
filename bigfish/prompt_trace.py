@@ -205,6 +205,55 @@ def record(*, cfg: Any, system: str, user: str, response: str = "",
 
 
 # ══════════════════════════════════════════════════════════════════
+#  决策快照（T-6）
+# ══════════════════════════════════════════════════════════════════
+def record_decision(*, chat: str, candidates: List[Dict[str, Any]],
+                    picked: Optional[Dict[str, Any]] = None,
+                    score: float = 0.0, hit: int = 0, roll: int = 0,
+                    penalty: float = 1.0,
+                    extra: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """写一份"她为什么开口 / 为什么没开口"的快照。**不抛异常**。
+
+    为什么需要：`record()` 只记"她看到了什么"（prompt），不记"她怎么选的"。
+    候选分数、`hit` 概率、骰子点数只在一行日志里，过了就没了 ——
+    而"她为什么没回我"是这个项目最高频的疑问。
+    """
+    try:
+        if not enabled():
+            return None
+        now = time.time()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+        stamp += f"-{int((now % 1) * 1000):03d}-{next(_seq) % 100000:05d}"
+        name = f"{stamp}-{_safe_name(chat)}-decision.json"
+        path = os.path.join(trace_dir(), name)
+        payload: Dict[str, Any] = {
+            "kind": "decision",
+            "at": now,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "chat": chat,
+            "score": round(float(score), 2),
+            "hit": int(hit),
+            "roll": int(roll),
+            "penalty": round(float(penalty), 3),
+            "picked": picked or {},
+            "candidates": candidates,
+        }
+        if extra:
+            payload.update(extra)
+
+        def work() -> None:
+            with _write_lock:
+                _write(payload, path)
+                _prune(keep_count())
+
+        threading.Thread(target=work, name="bigfish-trace-decision",
+                         daemon=True).start()
+        return path
+    except Exception:
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════
 #  查
 # ══════════════════════════════════════════════════════════════════
 def recent(limit: int = 20) -> List[Dict[str, Any]]:

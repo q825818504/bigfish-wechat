@@ -1206,6 +1206,31 @@ class EngineWorker(QThread):
         #   以前这里只存 (座位, 正文)，写快照时标题被填成空串，
         #   于是「她这轮看到了什么」只能看到一个总字数。
         _sections = [(860, "人格", _persona_text)]
+        # 861 · 这一周 —— 周叙事的一句话（weekly.apply_result 写的）。
+        # 和 862「以前」分开：周更近、更具体，且只有一句；日叙事可以有很多条。
+        try:
+            _week = self.soul.week_line()
+            if _week:
+                _sections.append((861, "这一周", "\n## 这一周\n\n" + _week))
+        except Exception as exc:
+            self._log(f"[人格] 周叙事渲染失败（跳过）：{exc}", "")
+        # 862 · 以前 —— 她自己过过的那些天（`soul.history` 的 day_summary）。
+        #
+        # 为什么单开一段、不塞进人格：
+        #   人格文本要过 `tools/test_persona_parity.py`（Python/Node 逐字一致），
+        #   Node 侧没有这段；而且「我是谁」和「我过过什么」本来就该分开 ——
+        #   前者是常量，后者每天在长。
+        #
+        # 为什么现在才加：`day_summary` 以前只写进磁盘给界面看，
+        #   没有任何注入路径。她"有年表但不读年表"，问"这几天干嘛了"
+        #   只能从今天的日程拼。
+        try:
+            _past = self.soul.history_lines()
+            if _past:
+                _sections.append(
+                    (862, "以前", "\n## 以前\n\n" + "\n".join(_past)))
+        except Exception as exc:
+            self._log(f"[人格] 年表渲染失败（跳过）：{exc}", "")
         if ctx.mood and ctx.mood.injected_text.strip():
             _sections.append((900, "这会儿的状态",
                               "\n## 这会儿的状态\n\n"
@@ -2245,6 +2270,23 @@ class EngineWorker(QThread):
                         self._log(
                             f"[余韵] {item.get('kind')}：{item.get('residue')}",
                             "think")
+                        # T-5：冲突落一条「旧账」，跨天留着（7 天后过期）。
+                        # afterglow 的 4 小时只管"这一轮还堵着"；
+                        # 人不会 4 小时就忘 —— 昨天那句难听的，今天还带着。
+                        if str(item.get("kind")) == "conflict":
+                            try:
+                                from bigfish import bond as _B
+
+                                _B.append_event(
+                                    self._db(), "dafeiyu",
+                                    str(getattr(self.e, "owner_id", "") or ""),
+                                    kind="unresolved",
+                                    what=str(item.get("residue")
+                                             or "闹了点别扭")[:60],
+                                    evidence=str(user_text or "")[:200],
+                                    at=time.time())
+                            except Exception as _exc:
+                                self._log(f"[旧账] 记不下来（无妨）：{_exc}", "")
                 except Exception as exc:
                     self._log(f"[余韵] 写入失败：{exc}", "")
             except Exception as exc:
@@ -3641,16 +3683,42 @@ class EngineWorker(QThread):
 
         _gen_queue: "_queue.Queue" = _queue.Queue(maxsize=64)
 
-        def _enqueue_gen(msg) -> None:
-            """把一条消息丢给生成 worker。**不阻塞** —— 队列满就丢并记一笔。
+        def _spill_gen(msg) -> None:
+            """队列等不到位时落盘，不静默丢。
 
-            睡醒补回也走这里：那条消息同样要过模型、同样会占一个生成位，
-            但不该把调用方（主循环）按住。
+            为什么不是"再记一行日志就算了"：
+              日志在用户眼里等于"她没回"，而落盘的东西重启后还能捞回来。
+              一行的代价换一条消息，值得。
             """
             try:
-                _gen_queue.put_nowait(msg)
-            except _queue.Full:
-                self._log("[并发] 生成队列已满，这条补回的消息丢了", "err")
+                import json as _json
+
+                from bigfish import vault as _vault
+
+                p = os.path.join(_vault.resolve_data_root(), "gen-spill.jsonl")
+                with open(p, "a", encoding="utf-8") as f:
+                    f.write(_json.dumps({
+                        "at": time.time(),
+                        "chat_id": str(getattr(msg, "chat_id", "") or ""),
+                        "text": str(getattr(msg, "text", "") or "")[:2000],
+                    }, ensure_ascii=False) + "\n")
+            except Exception as exc:
+                self._log(f"[并发] 落盘也失败：{exc}", "err")
+
+        def _enqueue_gen(msg) -> None:
+            """把一条消息丢给生成 worker。**调用方永不阻塞**。
+
+            队列满时不再直接丢（v0.13.2 审计：`maxsize=64` 满即丢，
+            用户感知是"她没回"，日志里只有一行）：
+              1. 起一个短命线程在后台等位，最多 8 秒；
+              2. 8 秒仍满，落盘 `gen-spill.jsonl`，重启后可捞。
+
+            逻辑抽到 `bigfish/concurrency.py`：闭包里的分支没法在测试里
+            构造"队列满"，抽出来才能证明它真的不丢（见 selftest_concurrency）。
+            """
+            from bigfish.concurrency import enqueue_or_spill
+
+            enqueue_or_spill(_gen_queue, msg, log=self._log, spill=_spill_gen)
         _outbox: "_queue.Queue" = _queue.Queue()
         _chat_locks: dict = {}
         _chat_locks_guard = threading.Lock()

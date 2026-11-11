@@ -1157,3 +1157,66 @@ UIA 是 COM/STA 的东西。跨线程调用会踩"偶尔发不出去、偶尔发
 
 `day` 用 `life.day` 不是 `day_key(now)`：入睡点会跨午夜，
 用日历天的话 23:50 写的日记会记到第二天名下，而 `day_trace` 是前一天的。
+
+---
+
+## v0.13.3：跨天叙事与代价
+
+> 0.11–0.13.2 的架构增量（声音、并发三段、UI 覆盖层、`catch_up`、
+> `neighbors`）尚未补进本文件 —— 这是已知文档债，见 `task_plan.md`。
+> 本节只记 0.13.3 新增的部分。
+
+### 新增模块
+
+| 模块 | 职责 | 关键约束 |
+|---|---|---|
+| `weekly.py` | 周叙事：7 天轨迹 → 五段 → `soul.history(kind=week_summary)` | 素材 <3 天不写；允许全空；失败 `mark_done` 防重试 |
+| `future.py` | 期待账本：日期解析 / 到期查询 / 兑现 | 解析不出 → 0（不记期待）；只认原话里的日期短语 |
+| `concurrency.py` | 队列满时不丢（从 `desktop._run()` 闭包抽出） | 调用方永不阻塞；等位 8 秒；仍满落盘 |
+
+### 新增状态
+
+| 位置 | 字段 | 用途 |
+|---|---|---|
+| `life.json` | `history_trace` | 跨天 7 天轨迹（`day_trace` 仍只服务今天） |
+| `life.json` | `weekly_day` | 上次写周叙事的日期 |
+| `memory.sqlite3` | `bond_events.due_at` | 约定到期（epoch ms） |
+| `memory.sqlite3` | `bond_events.kind=unresolved` | 没解开的别扭（7 天过期） |
+
+### 注入座位（860–9990）
+
+| 座位 | 名称 | 来源 | 预算 |
+|---|---|---|---|
+| 860 | 人格 | `soul.render_persona()` | — |
+| **861** | **这一周** | `soul.week_line()` | 1 句（≤80 字） |
+| **862** | **以前** | `soul.history_lines()` | 8 条 / 250 字 |
+| 870+ | 生活 / 目标 / 关系 | 插件 | — |
+| 900 | 这会儿的状态 | `mood.injected_text` | — |
+| 905 | 这一轮的说话方式 | `policy` | — |
+| 9990 | 末尾守卫 | `plugins/guard.py` | — |
+
+**顺序即语义**：人格 → 这周 → 以前 → 生活 → 状态 → 说话方式 → 守卫。
+861/862 放在 870 之前，是因为"我是谁/我过过什么"比"我今天在做什么"更靠近身份。
+
+### 数据流
+
+```
+refresh_doing ──► day_trace（今天，隔天清空）
+      │                  └──► 日记素材
+      └──────────► history_trace（7 天）
+                          └──► weekly（7 天一次）──► soul.history(week_summary)
+                                                          └──► 座位 861
+
+plan.expire_plan ──► touched? ──► done / abandoned
+                                      └──► own_loops ──► 主动候选（tone, 70）
+
+afterglow conflict ──► bond_events(unresolved) ──► 主动候选（tone, 76）──► 7 天过期
+promise + due ──► future.upcoming ──► 主动候选（topic, 86）──► 提过不再提
+主动掷骰 ──► prompt_trace.record_decision ──► prompts/*-decision.json
+```
+
+### 为什么 `history_trace` 不和 `day_trace` 合并
+
+`day_trace` 的语义是"今天"：`plan_day` 隔天清空它，日记只写今天。
+周叙事要 7 天，不能被隔天清掉。合并会让两边语义互相污染 ——
+"今天的轨迹"里出现前天的 doing，日记就会写错。

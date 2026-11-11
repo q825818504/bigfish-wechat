@@ -79,8 +79,13 @@ EVENT_CONFLICT = "conflict"  # 摩擦：拌嘴、被推开、没说开的别扭
 EVENT_PROMISE = "promise"    # 约定：谁答应了谁什么
 EVENT_FIRST = "first"        # 第一次：第一次一起做某件事
 EVENT_REPAIR = "repair"      # 修复：道歉、和好、把话说开
+#: 没解开的别扭（T-5）。它**不是** narrative 能写的事件类型：
+#: 由 afterglow 判到 conflict 时自动落一条，7 天后过期。
+#: 和 EVENT_CONFLICT 的区别：conflict 是"这一轮发生了什么"，
+#: unresolved 是"这件事还欠着"——前者 4 小时就散，后者跨天。
+EVENT_UNRESOLVED = "unresolved"
 EVENT_KINDS = (EVENT_WARM, EVENT_CONFLICT, EVENT_PROMISE, EVENT_FIRST,
-               EVENT_REPAIR)
+               EVENT_REPAIR, EVENT_UNRESOLVED)
 
 EVENT_LABELS = {
     EVENT_WARM: "靠近",
@@ -88,6 +93,7 @@ EVENT_LABELS = {
     EVENT_PROMISE: "约定",
     EVENT_FIRST: "第一次",
     EVENT_REPAIR: "和好",
+    EVENT_UNRESOLVED: "没解开的别扭",
 }
 
 STATUS_ACTIVE = "active"
@@ -136,7 +142,10 @@ CREATE TABLE IF NOT EXISTS bond_events (
     what        TEXT NOT NULL,
     evidence    TEXT NOT NULL DEFAULT '',
     at          INTEGER NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL DEFAULT 'active'
+    status      TEXT NOT NULL DEFAULT 'active',
+    -- 约定/待办什么时候到期（epoch 毫秒）。0 = 不是有期限的事。
+    -- T-2：让"下周三体检"有地方放，到期前能被主动开口捞出来。
+    due_at      INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS bond_events_uniq
     ON bond_events(bank, owner, kind, what);
@@ -155,6 +164,13 @@ def ensure_schema(db: str) -> None:
         conn = connect(db)
         try:
             conn.executescript(SCHEMA_SQL)
+            # 老库加列：SQLite 的 ADD COLUMN 是 O(1)，只做加法。
+            # 重复执行会抛 "duplicate column name"，忽略即可（幂等）。
+            try:
+                conn.execute(
+                    "ALTER TABLE bond_events ADD COLUMN due_at INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
             conn.commit()
         finally:
             conn.close()
@@ -269,7 +285,8 @@ def upsert_bond(db: str, bank: str, owner: str, *, kind: str, text: str,
 
 def append_event(db: str, bank: str, owner: str, *, kind: str,
                  what: str, evidence: str = "",
-                 at: Optional[float] = None) -> Tuple[bool, str]:
+                 at: Optional[float] = None,
+                 due_at: float = 0.0) -> Tuple[bool, str]:
     """记一条关系事件（p1-6）。返回 (是否新增, 原因)。
 
     和 `upsert_bond` 的区别：
@@ -304,9 +321,10 @@ def append_event(db: str, bank: str, owner: str, *, kind: str,
         if row:
             return False, "exists"
         conn.execute(
-            "INSERT INTO bond_events(bank,owner,kind,what,evidence,at,status) "
-            "VALUES(?,?,?,?,?,?,'active')",
-            (bank, owner, kind, what, evidence[:500], stamp))
+            "INSERT INTO bond_events(bank,owner,kind,what,evidence,at,status,due_at) "
+            "VALUES(?,?,?,?,?,?,'active',?)",
+            (bank, owner, kind, what, evidence[:500], stamp,
+             int(float(due_at or 0) * 1000)))
         conn.commit()
         return True, "added"
     except Exception as exc:
@@ -319,8 +337,8 @@ def append_event(db: str, bank: str, owner: str, *, kind: str,
 
 
 def list_events(db: str, bank: str, owner: str, *,
-                limit: int = 20) -> List[Dict[str, Any]]:
-    """最近的关系事件，新的在前。"""
+                limit: int = 20, kind: str = "") -> List[Dict[str, Any]]:
+    """最近的关系事件，新的在前。`kind` 非空时只取那一类。"""
     if not db:
         return []
     try:
@@ -335,9 +353,15 @@ def list_events(db: str, bank: str, owner: str, *,
         except Exception:
             return []
     try:
-        rows = conn.execute(
-            "SELECT * FROM bond_events WHERE bank=? AND owner=? AND status='active' "
-            "ORDER BY at DESC LIMIT ?", (bank, owner, int(limit))).fetchall()
+        sql = ("SELECT * FROM bond_events WHERE bank=? AND owner=? "
+               "AND status='active'")
+        args: List[Any] = [bank, owner]
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        sql += " ORDER BY at DESC LIMIT ?"
+        args.append(int(limit))
+        rows = conn.execute(sql, tuple(args)).fetchall()
         return [dict(r) for r in rows]
     except Exception:
         return []

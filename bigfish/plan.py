@@ -562,6 +562,16 @@ def layout(items: List[Dict[str, Any]], *, wake_at: float,
             # 排不下就不排。她的一天不是待办清单，塞不进去就是今天没空。
             continue
 
+        # 做这件事要花多少体力（T-4）。每小时 20 点，最少 8、最多 35。
+        #
+        # 为什么上限是 35 而不是 25：25 会让 45 分钟以上的事全部封顶，
+        # 于是"下楼买点菜"和"收拾一上午屋子"一样贵 —— 那就失去区分度了。
+        # 35 大约等于"精力 100 时能连做三件正事"。
+        #
+        # 为什么放在 layout 而不是让模型给：模型不知道她的精力曲线，
+        # 也给不准数字；它只该判断"做什么"，成本是代码算的（和落点一样）。
+        row["cost"] = int(max(8, min(35, round(dur / 60.0 * 20))))
+
         row["start"] = _hhmm(_minutes_local(placed))
         row["end"] = _hhmm(_minutes_local(placed + dur))
         row["at"] = row["start"]        # 兼容：UI 和旧代码只看 at

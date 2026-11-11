@@ -854,6 +854,127 @@ def candidate_recall(st: ProactiveState, *, chat_id: str, now: float,
         anchor_at=float(fid))
 
 
+def candidate_due(st: ProactiveState, *, chat_id: str, now: float,
+                  owner: str = "", tier: str = "",
+                  db_path: str = "") -> Optional[Candidate]:
+    """到期/临近的约定 —— "明天体检"，今天该提一句（T-2）。
+
+    和 recall 的分工：
+        recall  他提过、1.5–10 天没结果 → "后来怎么样了？"
+        due     有明确日期、快到了     → "明天就是了吧？"
+
+    分数 86：高于 recall(84)，低于生日(88) —— 有日期的约定比模糊的惦记更该说。
+    提过一次就不再提：anchor 用 `event_id + 1e9`，与 fact id 分开命名空间。
+    """
+    if not (owner and tier and db_path):
+        return None
+    try:
+        from bigfish import future as F
+
+        rows = F.upcoming(db_path, "dafeiyu", owner, now=now)
+    except Exception:
+        return None
+
+    for row in rows:
+        try:
+            eid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not eid:
+            continue
+        anchor = float(eid) + 1_000_000_000.0
+        if any(abs(float(a) - anchor) < 1 for a in st.used_anchors):
+            continue
+        line = F.due_line(row, now=now)
+        if not line:
+            continue
+        return Candidate(
+            source="due", chat_id=chat_id, score=86.0, layer="topic",
+            reason=f"你们说好的事快到了：{line}",
+            material={"due": line, "event_id": eid},
+            anchor_at=anchor)
+    return None
+
+
+def candidate_own_loop(st: ProactiveState, *, chat_id: str, now: float,
+                       life_state: Any = None) -> Optional[Candidate]:
+    """她今天想做没做成的事 —— 她自己的未了之事（T-3）。
+
+    和 open_loop / recall 的区别：
+        open_loop  对方的话头（"等我忙完"）
+        recall     对方提过的事（"下周三体检"）
+        own_loop   **她自己**想做的事（"想收拾屋子，没顾上"）
+
+    只作 tone（情绪底色），不作 topic：她自己的小事不必拿来当话题，
+    但它会影响这一轮的语气 —— 和"今天有点烦"同一个位置。
+    """
+    if life_state is None:
+        return None
+    try:
+        from bigfish import life as L
+
+        loops = L.own_loops(life_state, limit=3)
+    except Exception:
+        return None
+    if not loops:
+        return None
+    # 一天最多一次：反复说"我没收拾屋子"就变成自责表演了。
+    if _hours_since(st.source_last.get("own_loop", 0), now) < 20:
+        return None
+    what = str(loops[0]).strip()
+    if not what:
+        return None
+    return Candidate(
+        source="own_loop", chat_id=chat_id, score=70.0, layer="tone",
+        reason=f"今天想{what}，没顾上",
+        material={"own_loop": what},
+        tone_text=f"今天想{what}，没顾上")
+
+
+def candidate_unresolved(st: ProactiveState, *, chat_id: str, now: float,
+                         owner: str = "", tier: str = "",
+                         db_path: str = "") -> Optional[Candidate]:
+    """没解开的别扭 —— 跨天的旧账（T-5）。
+
+    `afterglow` 的 conflict 只有 4 小时：它管的是"这一轮还堵着"。
+    但人不会 4 小时就忘 —— 昨天你说话难听，今天她会带着这点旧账，
+    开口时语气不一样，甚至提一句"上次那事"。
+
+    7 天后自动过期：不留永久怨气（那是另一个东西，不是人）。
+    只作 tone：旧账影响语气，不该变成每次开口的主题。
+    """
+    if not (owner and tier and db_path):
+        return None
+    try:
+        from bigfish import bond as B
+
+        rows = B.list_events(db_path, "dafeiyu", owner,
+                             kind="unresolved", limit=5)
+    except Exception:
+        return None
+
+    for row in rows:
+        try:
+            at = float(row.get("at") or 0) / 1000.0
+            eid = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not at or (now - at) > 7 * 86400:
+            continue
+        what = " ".join(str(row.get("what") or "").split())[:40]
+        if not what:
+            continue
+        anchor = float(eid) + 2_000_000_000.0
+        if any(abs(float(a) - anchor) < 1 for a in st.used_anchors):
+            continue
+        return Candidate(
+            source="unresolved", chat_id=chat_id, score=76.0, layer="tone",
+            reason=f"上次那点别扭还没说开：{what}",
+            material={"unresolved": what},
+            tone_text="心里还有点没过去的事", anchor_at=anchor)
+    return None
+
+
 def collect(st: ProactiveState, *, chat_id: str, now: float, me: str,
             life_state: Any, last_peer_at: float,
             dates: Optional[List[Dict[str, Any]]] = None,
@@ -879,6 +1000,12 @@ def collect(st: ProactiveState, *, chat_id: str, now: float, me: str,
     add(candidate_silence, st, chat_id=chat_id, now=now, last_peer_at=last_peer_at)
     add(candidate_whim, st, chat_id=chat_id, now=now, life_state=life_state)
     add(candidate_recall, st, chat_id=chat_id, now=now, owner=owner,
+        tier=tier, db_path=db_path)
+    add(candidate_due, st, chat_id=chat_id, now=now, owner=owner,
+        tier=tier, db_path=db_path)
+    add(candidate_own_loop, st, chat_id=chat_id, now=now,
+        life_state=life_state)
+    add(candidate_unresolved, st, chat_id=chat_id, now=now, owner=owner,
         tier=tier, db_path=db_path)
     # p0-1：连着两批没回之后的那句"你最近很忙吗"。
     # 它排在最后 add，但分数 78 会自己排上去。

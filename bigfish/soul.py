@@ -49,6 +49,10 @@ class Soul:
     values_raw: List[Dict[str, Any]] = field(default_factory=list)
     traits: Dict[str, int] = field(default_factory=dict)
     self_notes: List[str] = field(default_factory=list)
+    #: 灵魂的演化年表（复盘每天往这里写一条）。**不参与 render_persona** ——
+    #: 原因见 `history_lines()` 的注释：Node 侧不渲染它，Python 侧渲染了
+    #: 就会破坏两侧人格一致性（tools/test_persona_parity.py）。
+    history: List[Dict[str, Any]] = field(default_factory=list)
     revision: int = 0
     source_path: str = ""
     scope: str = ""
@@ -113,6 +117,64 @@ class Soul:
     def _quote(s: str) -> str:
         return f"「{s}」" if s else ""
 
+    def week_line(self) -> str:
+        """「这一周」的一句话。没有就返回空串（调用方整段不出现）。
+
+        和 `history_lines()` 分开的原因：一个是"以前"（日），
+        一个是"这一周"（周）。混在一段里，读起来像"这周也在以前里"，
+        而且周叙事更近、更该单独占一个座位（861）。
+        """
+        for item in reversed(self.history or []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("kind") or "") != "week_summary":
+                continue
+            week = item.get("week") if isinstance(item.get("week"), dict) else {}
+            text = " ".join(str(week.get("week") or "").split())[:60]
+            if not text:
+                continue
+            day = str(item.get("day") or "").strip()
+            return f"（{day}）这周：{text}" if day else f"这周：{text}"
+        return ""
+
+    def history_lines(self, limit: int = 8, max_chars: int = 250) -> List[str]:
+        """「以前」——她自己过过的那些天，压成几行。
+
+        为什么只取 `day_summary`、不取 `evolved`：
+          evolved 已经进了 `selfNotes`（"（11-11）关于工作：以前…现在…"），
+          这里再渲染一遍就是同一句话出现两次 —— 占预算，也让她像在复读。
+          `day_summary` 目前**没有任何注入路径**（复盘写了、界面看了、
+          她本人读不到），这条是补上"她有以前"的最小缺口。
+
+        为什么是 8 条、250 字：
+          8 天约等于"最近一周半"，够回答"你这几天干嘛了"；
+          250 字约 150 token，相对 2400 字的记忆预算只占一成。
+
+        为什么不在 `render_persona()` 里：
+          人格文本要过 `tools/test_persona_parity.py`（Python 与 Node
+          必须逐字一致），Node 侧没有这段。所以它由调用方（desktop 的
+          compose）作为**独立座位 862** 注入，两侧各自决定要不要带。
+        """
+        out: List[str] = []
+        used = 0
+        for item in reversed(self.history or []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("kind") or "") != "day_summary":
+                continue
+            text = " ".join(str(item.get("text") or "").split())
+            if not text:
+                continue
+            day = str(item.get("day") or "").strip()
+            line = f"（{day}）那天：{text[:40]}" if day else f"那天：{text[:40]}"
+            if used + len(line) > max_chars:
+                break
+            out.append(line)
+            used += len(line)
+            if len(out) >= limit:
+                break
+        return list(reversed(out))
+
     @classmethod
     def from_dict(cls, d: Dict[str, Any], path: str = "") -> "Soul":
         """从原始 JSON 构造。
@@ -159,6 +221,10 @@ class Soul:
         notes = [str(x).strip() for x in (src.get("selfNotes") or [])
                  if isinstance(x, str) and str(x).strip()]
 
+        # 年表原样保留（读不归一化）；脏条目在 history_lines() 里跳过，
+        # 而不是在这里删 —— 读的时候改结构，写回去就丢数据了。
+        history = [x for x in (src.get("history") or []) if isinstance(x, dict)]
+
         try:
             revision = int(src.get("revision") or 0)
         except (TypeError, ValueError):
@@ -173,6 +239,7 @@ class Soul:
             values_raw=values_raw,
             traits=traits,
             self_notes=notes,
+            history=history,
             revision=revision,
             source_path=path,
             scope=str(src.get("scope") or ""),

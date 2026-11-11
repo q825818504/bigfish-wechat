@@ -154,6 +154,10 @@ class World:
         self._plan_tried_day = ""
         #: p1-5/p1-6：睡前复盘是否在跑。一天只跑一次。
         self._narrative_busy = False
+        #: T-1b：周叙事是否在跑。七天一次，失败也要 mark_done。
+        #: 在 __init__ 里显式初始化（而不是靠 getattr 兜底）：
+        #: 状态字段"第一次用到才出现"会让调试时 `vars(world)` 少一项。
+        self._weekly_busy = False
         #: 睡前道别：今天说过没有。说一句就够，不重复。
         self._goodnight_busy = False
         self._goodnight_day = ""
@@ -208,6 +212,13 @@ class World:
             self._maybe_narrative(now)
         except Exception as exc:
             self._log(f"[复盘] 检查失败：{exc}", "")
+
+        # T-1b：周叙事。七天一次，把七天的轨迹压成"这一周"。
+        # 放在复盘之后：先写今天的看法，再决定这周值不值得写。
+        try:
+            self._maybe_weekly(now)
+        except Exception as exc:
+            self._log(f"[周叙事] 检查失败：{exc}", "")
 
         # 睡前道别。放在 tick 而不是 tick_active：
         # 它是作息的一部分（到点要睡），不是"她还想找你说话"。
@@ -742,6 +753,102 @@ class World:
         threading.Thread(target=work, daemon=True,
                          name="bf-narrative").start()
 
+    def _maybe_weekly(self, now: float) -> None:
+        """周叙事：七天一次，把七天的轨迹压成"这一周"（T-1b）。
+
+        为什么需要：`day_trace` 隔天清空、日记不进提示词、复盘写的是
+        "看法变了什么"——她过了七天，但没有"这七天"这个对象。
+
+        为什么在后台线程：一次模型调用，不能卡住 tick（tick 里她还在回消息）。
+
+        ⚠ 失败要 `mark_done`：`due()` 会一直为真，不标记就是每 5 秒重试
+          一次，直到用户发现账单（复盘在 0.13.1 踩过同样的坑）。
+        """
+        if getattr(self, "_weekly_busy", False):
+            return
+        life = self._life()
+        try:
+            from bigfish import weekly as W
+
+            if not W.due(life, now):
+                return
+        except Exception:
+            return
+
+        self._weekly_busy = True
+        mcfg = self._mcfg()
+        db = self._db()
+        owner = str(getattr(self.e, "owner_id", "") or "")
+        day = str(getattr(life, "day", "") or "")
+
+        def work() -> None:
+            try:
+                from bigfish import bond as B
+                from bigfish import life as L
+                from bigfish import replier as R
+                from bigfish import weekly as W
+
+                events = []
+                try:
+                    events = B.list_events(db, "dafeiyu", owner, limit=8)
+                except Exception:
+                    events = []
+
+                mats = W.build_materials(life, now=now, events=events,
+                                         owner=owner)
+                enough, why = W.has_material(mats)
+                if not enough:
+                    self._log(f"[周叙事] 素材不够，不写（{why}）", "think")
+                    W.mark_done(life, day=day)
+                    L.save(life, force=True)
+                    return
+
+                _sys, user = W.build_request(mats)
+                raw = R.call_model(mcfg, _sys, user)
+                parsed, err = W.parse(raw)
+                if not parsed:
+                    self._log(f"[周叙事] 这周没写出来（{err}）", "think")
+                    W.mark_done(life, day=day)
+                    L.save(life, force=True)
+                    return
+
+                ok, werr = W.apply_result(None, parsed, now=now)
+                if not ok:
+                    self._log(f"[周叙事] 写入失败：{werr}", "err")
+                    W.mark_done(life, day=day)
+                    L.save(life, force=True)
+                    return
+
+                W.mark_done(life, day=day)
+                L.save(life, force=True)
+                # 灵魂刚被改过，内存副本要刷新（与复盘同一处理）。
+                try:
+                    from bigfish.soul import load_soul
+
+                    self.e.soul = load_soul()
+                except Exception:
+                    pass
+                self._log(f"[周叙事] 这周：{parsed.get('week')}", "in")
+            except Exception as exc:
+                self._log(f"[周叙事] 失败（这周不再试）：{exc}", "err")
+                try:
+                    from bigfish import life as _L
+                    from bigfish import weekly as _W
+
+                    _W.mark_done(life, day=day)
+                    _L.save(life, force=True)
+                except Exception:
+                    pass
+            finally:
+                self._weekly_busy = False
+
+        try:
+            threading.Thread(target=work, daemon=True,
+                             name="bf-weekly").start()
+        except Exception as exc:
+            self._weekly_busy = False
+            self._log(f"[周叙事] 线程起不来：{exc}", "err")
+
     def _maybe_goodnight(self, now: float) -> None:
         """到点了，她困了，跟你说一声就去睡。
 
@@ -829,8 +936,17 @@ class World:
             finally:
                 self._goodnight_busy = False
 
-        threading.Thread(target=work, daemon=True,
-                         name="bf-goodnight").start()
+        # ⚠ start() 本身也会抛（线程数耗尽 / 解释器正在退出）。
+        # 置位和启动之间没有别的兜底：一旦这里抛，`_goodnight_busy`
+        # 就永远是 True —— 道别功能从此静默失效，而日志里只有一行
+        # "生成失败"都没有（异常发生在 work 之外）。
+        # 2026-11-11 审计发现，补 try/finally。
+        try:
+            threading.Thread(target=work, daemon=True,
+                             name="bf-goodnight").start()
+        except Exception as exc:
+            self._goodnight_busy = False
+            self._log(f"[道别] 线程启动失败，已复位：{exc}", "err")
 
     def _remember_diary(self, day: str, text: str, *, db: str,
                         owner: str) -> None:
@@ -1382,6 +1498,25 @@ class World:
 
         P.note_roll(pro, now)
         roll = random.randint(1, 100)
+        # T-6：把"这一轮怎么选的"落盘 —— 候选、选中、命中率、骰子。
+        # 命中/没中都要写：没中的时候用户最需要解释。
+        try:
+            from bigfish import prompt_trace as _PT
+
+            _PT.record_decision(
+                chat=chat_id,
+                candidates=[{"source": c.source, "score": round(float(c.score), 1),
+                             "layer": c.layer, "reason": c.reason}
+                            for c in cands],
+                picked={"topic": topic.source if topic else "",
+                        "tone": tone.source if tone else "",
+                        "source": source},
+                score=score, hit=hit, roll=roll,
+                penalty=P.penalty(pro, now=now),
+                extra={"why": why, "used_sources": used_sources,
+                       "miss_streak": int(getattr(pro, "miss_streak", 0) or 0)})
+        except Exception:
+            pass
         tail = f"｜{source}" + (f"，{why}" if why else "")
         if roll > hit:
             P.note_miss(pro)

@@ -162,6 +162,11 @@ SPENT_THRESHOLD = 12.0               # 低于这个是"强撑"
 #: 状态写盘的最小间隔（秒）—— 变了才写，别 5 秒一次
 SAVE_MIN_INTERVAL = 30.0
 
+#: 跨天轨迹保留几天（周叙事用）。7 天 = 一个自然周。
+TRACE_HISTORY_DAYS = 7
+#: 跨天轨迹最多几条（防一天内 doing 抖动把文件写大）。
+TRACE_HISTORY_MAX = 200
+
 # （这里以前有个 RESUME_GAP_HOURS = 26.0 —— "多久没动过就算很久"。
 #  它配的是"超过 26 小时就当成一次冷启动"的特判，而那个特判会把一整段
 #  时间当成"醒着"推进，于是关一晚上软件、第二天早上打开，她 09:xx 才睡。
@@ -316,6 +321,11 @@ class LifeState:
     narrative_day: str = ""
     #: 今天的日记写到哪一天了。一天一篇，重写同一天会覆盖。
     journal_day: str = ""
+    #: 最近一次写周叙事是哪天（YYYY-MM-DD）。空 = 还没写过。
+    #:
+    #: 为什么用日期而不是"上次时间戳"：和 narrative_day / journal_day 同构，
+    #: 重启、跨天、补算都不需要额外换算；也方便在界面直接显示"上次：11-11"。
+    weekly_day: str = ""
     #: 今天做过的事（按时段记，最多 12 条）。
     #:
     #: 为什么需要：日记要写"今天我是怎么过的"，只有一个当前 `doing`
@@ -323,6 +333,14 @@ class LifeState:
     #: 煮面、泡茶、楼下小孩、整理柜子。它不是在撒谎，是**没材料**。
     #: 把一天里 doing 的变化记下来，它就有真实的锚点可写。
     day_trace: List[Dict[str, Any]] = field(default_factory=list)
+    #: 跨天保留的轨迹（最多 7 天），只服务"周叙事"。
+    #:
+    #: 为什么和 day_trace 分开：day_trace 的语义是"今天"，`plan_day`
+    #: 隔天会清空它（日记只写今天）；而"这周我是怎么过的"需要 7 天的
+    #: 材料，不能被隔天清掉。两份分开，语义互不污染。
+    #:
+    #: 结构：{"at": epoch, "day": "YYYY-MM-DD", "doing": "..."}
+    history_trace: List[Dict[str, Any]] = field(default_factory=list)
     #: 今天身上有点什么。空串 = 没什么特别的感觉。
     #:
     #: 为什么不是一个"健康系统"：人每天都有一点小毛病 —— 眼睛干、腰酸、
@@ -388,7 +406,9 @@ def _fingerprint(state: LifeState) -> str:
          state.plan_day,
          state.narrative_day,
          state.journal_day,
-         json.dumps(state.day_trace, ensure_ascii=False, sort_keys=True)],
+         state.weekly_day,
+         json.dumps(state.day_trace, ensure_ascii=False, sort_keys=True),
+         json.dumps(state.history_trace, ensure_ascii=False, sort_keys=True)],
         ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -438,9 +458,19 @@ def load(root: Optional[str] = None) -> LifeState:
         state.narrative_day = ""
     if not isinstance(state.journal_day, str):
         state.journal_day = ""
+    if not isinstance(state.weekly_day, str):
+        state.weekly_day = ""
     if not isinstance(state.day_trace, list):
         state.day_trace = []
     state.day_trace = [x for x in state.day_trace if isinstance(x, dict)][-12:]
+    if not isinstance(state.history_trace, list):
+        state.history_trace = []
+    # 只留最近 7 天：老条目对"这周"没有意义，还会把文件越写越大。
+    _cut = time.time() - TRACE_HISTORY_DAYS * 86400
+    state.history_trace = [
+        x for x in state.history_trace
+        if isinstance(x, dict) and float(x.get("at") or 0) >= _cut
+    ][-TRACE_HISTORY_MAX:]
     if not isinstance(state.day, str):
         state.day = ""
     if not isinstance(state.doing, str):
@@ -983,7 +1013,14 @@ def expire_plan(state: LifeState, now: float) -> int:
             continue
         if minute > end:
             item["done"] = True
-            item["done_by"] = "elapsed"
+            if item.get("touched"):
+                item["done_by"] = "elapsed"
+            else:
+                # 区间过完但从来没做过 —— 这不是"做完"，是"没顾上"。
+                # 单独标一个字段而不是改 done_by：现有渲染/测试都按
+                # done_by=="elapsed" 判"过去了"，改它会连带改掉一堆文案。
+                item["abandoned"] = True
+                item["done_by"] = "elapsed"
             # 和 mark_plan_done 对齐：那条写 done_at，这条以前不写。
             try:
                 item["done_at"] = float(now)
@@ -1164,6 +1201,24 @@ def set_plan(state: LifeState, items: List[Dict[str, Any]], *,
     state.plan_day = str(day or "")
 
 
+def own_loops(state: LifeState, *, limit: int = 5) -> List[str]:
+    """今天没做成的事（abandoned）。给她自己，也给主动开口用。
+
+    为什么单独一个函数：`plan_for_prompt` 只渲染前 6 条，
+    没做成的那条可能排在后面 —— 而"想做没做"恰恰是最该被记住的。
+    """
+    out: List[str] = []
+    for item in (state.plan or []):
+        if not isinstance(item, dict) or not item.get("abandoned"):
+            continue
+        what = str(item.get("what") or "").strip()
+        if what:
+            out.append(what)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def plan_for_prompt(state: LifeState, *, now: float,
                     limit: int = 6) -> str:
     """给提示词的一段：今天打算做什么。
@@ -1185,8 +1240,14 @@ def plan_for_prompt(state: LifeState, *, now: float,
     entries = entries[:limit]
     lines = []
     for item in entries:
-        mark = ("（过去了）" if item.get("done_by") == "elapsed"
-                else "（做完了）" if item.get("done") else "")
+        # 三种状态分开写：做完了 / 没顾上 / 还没到。
+        # 以前"没顾上"也被写成「过去了」—— 那是把失败伪装成完成（T-3）。
+        if item.get("abandoned"):
+            mark = "（没顾上）"
+        elif item.get("done"):
+            mark = "（做完了）"
+        else:
+            mark = ""
         # 碰见谁跟在后面，用括号 —— 它是这件事的副产物，不是另一件事。
         # 写成两个列表项会被模型当成"两件要做的事"。
         meet = item.get("meet")
@@ -1206,8 +1267,9 @@ def plan_for_prompt(state: LifeState, *, now: float,
     if not lines:
         return ""
     return ("## 你今天打算做的\n\n" + "\n".join(lines)
-            + "\n\n（这是你自己排的。已经过去又没做的就过去了，"
-              "不用解释、不用补做；还没到的别提前说成正在做。）")
+            + "\n\n（这是你自己排的。做完了就说做完了；没顾上就承认没顾上，"
+              "不用补做，但**别把没做的说成做完了**。"
+              "还没到的别提前说成正在做。）")
 
 
 def goodnight_due(state: LifeState, now: float, last_touch: float, *,
@@ -1283,6 +1345,40 @@ def journal_due(state: LifeState, now: float, *,
     return bedtime - float(before) <= now < bedtime + float(grace)
 
 
+def _note_trace(state: LifeState, now: float, doing: str) -> None:
+    """记一条轨迹：今天的给日记，跨天的给周叙事。
+
+    为什么两处写入合成一个函数：
+      以前 `refresh_doing` 里有两段几乎一样的 trace 代码（起床流程一个、
+      正常时段一个），任何一处漏改就会"周叙事少半天"。抽出来，
+      以后加字段只改这里。
+
+    ⚠ 不抛：轨迹是"素材"，素材写失败不该让她停止生活。
+    """
+    try:
+        text = str(doing or "").strip()
+        if not text:
+            return
+        trace = [x for x in (state.day_trace or []) if isinstance(x, dict)]
+        if not trace or str(trace[-1].get("doing")) != text:
+            trace.append({"at": float(now), "doing": text})
+        state.day_trace = trace[-12:]
+
+        h = [x for x in (getattr(state, "history_trace", None) or [])
+             if isinstance(x, dict)]
+        day = day_key(now)
+        last = h[-1] if h else None
+        # 同一天同一件事只记一次（跨时段可能抽到同一句）
+        if not (last and str(last.get("doing")) == text
+                and str(last.get("day")) == day):
+            h.append({"at": float(now), "day": day, "doing": text})
+        cutoff = float(now) - TRACE_HISTORY_DAYS * 86400
+        h = [x for x in h if float(x.get("at") or 0) >= cutoff][-TRACE_HISTORY_MAX:]
+        state.history_trace = h
+    except Exception:
+        pass
+
+
 def refresh_doing(state: LifeState, now: float) -> bool:
     """跨时段才换事。返回是否变了。
 
@@ -1331,18 +1427,47 @@ def refresh_doing(state: LifeState, now: float) -> bool:
     _step = wake_step_text(state, now)
     if _step:
         state.doing = _step
-        try:
-            trace = [x for x in (state.day_trace or []) if isinstance(x, dict)]
-            if not trace or str(trace[-1].get("doing")) != state.doing:
-                trace.append({"at": float(now), "doing": state.doing})
-            state.day_trace = trace[-12:]
-        except Exception:
-            pass
+        _note_trace(state, now, state.doing)
         return True
     _planned = current_plan_item(state, now)
     if _planned:
-        # 日程里有本条 → 以日程为准（她的一天得有形状，不能全靠池子抽）
-        state.doing = _planned
+        # 体力够不够做这件事（T-4）。
+        # 以前 energy 只影响"说多少"（policy 的条数/字数），
+        # 不影响"做什么" —— 累到 6 分她照样去超市。那不是身体，是音量旋钮。
+        _cost = 0
+        _target = None
+        try:
+            for _it in (state.plan or []):
+                if not isinstance(_it, dict) or _it.get("done"):
+                    continue
+                if str(_it.get("what") or "") == _planned:
+                    _target = _it
+                    _cost = int(_it.get("cost") or 0)
+                    break
+        except Exception:
+            _target, _cost = None, 0
+        _energy = float(getattr(state, "energy", 100.0) or 0.0)
+        if _target is not None and _cost and _energy < _cost:
+            # 做不动：今天这件事不会发生。标一次就够（每 5 秒 tick 会重进这里）。
+            _target["skipped_tired"] = True
+            state.doing = _pick_blank(_day, label)
+        else:
+            # 日程里有本条 → 以日程为准（她的一天得有形状，不能全靠池子抽）
+            state.doing = _planned
+            # 标记"这条真的在做过"。结算时靠它区分两件事：
+            #   做过 → 做完了（elapsed）
+            #   没做过 → 没顾上（abandoned）
+            # 以前没有这个标记，区间一过全算"做完了" —— 她的日程永远不会失败，
+            # 也就没有"想做没做"这回事（T-3）。
+            try:
+                for _it in (state.plan or []):
+                    if not isinstance(_it, dict) or _it.get("done"):
+                        continue
+                    if str(_it.get("what") or "") == _planned:
+                        _it["touched"] = True
+                        break
+            except Exception:
+                pass
     else:
         # 身上不舒服的时候更容易什么都不做。
         # 这是身体第一次真的影响她**做什么**，而不只是说话的多少 ——
@@ -1362,13 +1487,7 @@ def refresh_doing(state: LifeState, now: float) -> bool:
             state.doing = _pick_doing(_day, label, items, _used)
     # 记进今天的轨迹：日记要"今天我是怎么过的"，只有一个当前 doing
     # 不够。同一条事不重复记（跨时段可能抽到同一句）。
-    try:
-        trace = [x for x in (state.day_trace or []) if isinstance(x, dict)]
-        if not trace or str(trace[-1].get("doing")) != state.doing:
-            trace.append({"at": float(now), "doing": state.doing})
-        state.day_trace = trace[-12:]
-    except Exception:
-        pass
+    _note_trace(state, now, state.doing)
     return True
 
 

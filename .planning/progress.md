@@ -2731,3 +2731,81 @@ handshake`），直连和代理都失败，而百度正常、代理访问 codelo
 0.11.1 的全部（六条「记着没做」的修复 + 攒批判定 + 跨轮配额 +
 消息链路日志）加上 0.11.2 的七个真机问题（睡醒补回、关系提炼 502、
 醒来时刻、主动消息会话名、话说半句、手头的事重复、情绪维度显示）。
+
+
+## 2026-11-11 23:20–00:10 — v0.13.3：她开始有"以前"
+
+> 0.12.0–0.13.2 的会话记录见 `CHANGELOG.md`。本文件在 0.11.2 之后断档，
+> 属于已知文档债（见 task_plan）。
+
+### 背景
+
+0.13.2 修的是"她出错的时候不出声"。这一版补的是另一个洞：
+
+> 她的时间早就独立于进程（`catch_up`），身体、心情、日程、熟人都有了。
+> 但跨天的经历没有落账 —— 关三天再开，精力对了，可"这三天"不存在。
+
+依据是 `大肥鱼-生命性审计-v0.13.2.md` 的 T-0 ~ T-6。用户决定：
+**除"记忆太准/会误解"外，其余全部修**。
+
+### 做了什么（8 项）
+
+| # | 改动 | 文件 | 测试 |
+|---|---|---|---|
+| T-0a | `_goodnight_busy` 置位后 start 失败要复位 | `world.py` | `selftest_goodnight` 10 |
+| T-0b | 生成队列满不丢（等位 8s → 落盘） | 新增 `concurrency.py`、`desktop.py` | `selftest_concurrency` 16 |
+| T-1a | 年表注入（座位 862「以前」，8 条/250 字） | `soul.py`、`desktop.py` | `selftest_history` 17 |
+| T-1b | 周叙事（7 天 → 五段 → 座位 861） | 新增 `weekly.py`、`life.py` | `selftest_weekly` 37 |
+| T-2 | 约定到期（`due_at` + 主动第 10 源） | `bond.py`、新增 `future.py`、`narrative.py`、`proactive.py` | `selftest_future` 36 |
+| T-3 | "没做成"（touched → abandoned → own_loop） | `life.py`、`proactive.py` | `selftest_own_loop` 19 |
+| T-4 | 体力代价（cost 8–35，累就不做） | `plan.py`、`life.py` | 并入 life 129 |
+| T-5 | 旧账跨天（unresolved，7 天过期） | `bond.py`、`desktop.py`、`proactive.py` | `selftest_unresolved` 15 |
+| T-6 | 决策快照（候选/hit/骰子落盘） | `prompt_trace.py`、`world.py` | 并入 trace 23 |
+
+### 验证
+
+- 50 个 `selftest_*.py`：**0 失败**
+- `tools/check.py`：语法 / 未定义名 0 / 版本 0.13.3
+- `test_persona_parity.py`：18/18（年表不进人格，Node 侧不受影响）
+- 真实数据只读验证：`soul.json` 渲染出 1 条年表；`life.json` 新字段兜底；
+  `memory.sqlite3` 副本上 `ALTER` 成功、3 条事件保留
+- 打包版自检：20 通过 / 1 失败 / 1 跳过（失败项是"灵魂：数据目录不可写"，
+  非管理员跑 exe 的已知现象）
+
+### 静态检验（查出 1 个真 bug）
+
+`future.parse_due` 用 `\b(\d{1,2})-(\d{1,2})\b` 匹配短横线日期。
+中文和数字之间没有词边界，所以：
+
+```
+"12-03号"    → 0（解析失败）
+"约在11-20"  → 0（解析失败）
+```
+
+原有测试只写了 `2026-12-01` 和 `11月20日`，恰好都能过。
+改成 `(?<!\d)…(?!\d)` 并补 3 条真实写法用例。
+
+另外两处：`future.py` 未使用的 `Tuple` 导入、`World._weekly_busy`
+未在 `__init__` 初始化 —— 均已修。
+
+### 动态检查（新增第 50 个 selftest）
+
+`tools/selftest_dynamic.py`：沙盒数据根里跑真实模块，7 组路径 / 35 项：
+
+```
+轨迹累积 → 周叙事全链路 → 日程结算 → 约定到期
+→ 主动候选（due/own_loop 都进 collect）→ 决策快照落盘 → 旧账 → 体力 cost
+```
+
+检查中发现脚本自己用错接口：`load_soul()` 的参数是**数据根**不是文件路径
+（`load_soul(root)` / `soul_file_path(root)` / `resolve_data_root()` 都是"根"，
+只有 `read_soul_file(path)` 吃文件路径）。已记在这里，免得下次再踩。
+
+### 遗留
+
+| 项 | 状态 |
+|---|---|
+| 记忆"太准/会误解" | 用户明确不认可，不做 |
+| 落盘消息自动重放 | 先保证"不丢"，重放留后续 |
+| `architecture.md` 的 0.11–0.13.2 增量 | 文档债，本次只补了 0.13.3 一节 |
+| 被迫的事 / 有以后 / 完全没用的事 | 与 D-36 冲突，需先改规则（待用户拍板） |
