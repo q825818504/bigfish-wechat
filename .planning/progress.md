@@ -2831,3 +2831,37 @@ handshake`），直连和代理都失败，而百度正常、代理访问 codelo
 **注意**：0.13.3 只有源码与便携包，**没有重新生成安装包**
 （`dist/BigFish-0.13.3-installer/` 未构建）。需要安装器时跑
 `python tools/build_installer.py`（或按 README 的方式 A）。
+
+---
+
+## 2026-11-12 00:23–00:40 — v0.13.4：首页"没有日记"的 bug
+
+### 用户报告
+
+首页「她留下的日记」显示"还没有日记"，点「打开 journal」toast
+`路径不存在：D:\大肥鱼\journal\unknown.md`。但日记文件明明存在。
+
+### 根因（两处叠加）
+
+1. `journal.list_days()` 把目录里所有 `.md` 都当日记，
+   包括 `WRITING.md`（写作指南）。
+2. 字符串倒序：`'WRITING' > '2026-11-11'`（'W'=87 / '2'=50），
+   所以 `days[0] = 'WRITING'`。
+3. `path_for('WRITING')` 把非数字清空 → `'unknown'` → `unknown.md`。
+4. `read('WRITING')` 读到空 → 首页"还没有日记"；`path` 指向不存在的文件。
+
+### 修法
+
+`list_days()` 只认 `^\d{4}-\d{2}-\d{2}$`。`path_for()` 的兜底保留（防御）。
+新增 `tools/selftest_journal.py` 14 条（含"目录里只有 WRITING.md"的用例）。
+
+### 顺带补的日记
+
+11-10 的日记原来是 `_drafts/2026-11-10.md`（710 B 草稿，21:24 写的），
+没转正。已按正式格式写入 `journal/2026-11-10.md`（251 字，正文未改）。
+
+11-11 的日记**本来就有**（00:11 写的，421 字），不需要补。
+
+### 验证
+
+51 个 `selftest_*.py` 全绿；`check.py` 版本 0.13.4；打包版自检 20/1/1。

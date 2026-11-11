@@ -166,14 +166,28 @@ def path_for(day: str, root: Optional[str] = None) -> str:
     return os.path.join(dir_path(root), f"{safe}.md")
 
 
+#: 合法日记文件名。**必须**只认这个形状 —— 目录里还有 `WRITING.md`
+#: （写作指南）。以前 `list_days` 把所有 `.md` 都当日记，于是
+#: `WRITING` 按字符串倒序排在 `2026-11-11` 前面（'W' > '2'），
+#: `days[0] = "WRITING"` → `path_for()` 把非数字清空成 `unknown`
+#: → 首页显示"还没有日记"，点「打开 journal」提示
+#: `路径不存在：...\journal\unknown.md`。
+_DAY_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def list_days(root: Optional[str] = None, limit: int = 60) -> List[str]:
-    """已有日记的日期，新的在前。"""
+    """已有日记的日期，新的在前。**
+
+    只认 `YYYY-MM-DD.md`：目录里还有 `WRITING.md`（写作指南），
+    把它当日记会让首页永远显示"还没有日记"（见 `_DAY_NAME` 的注释）。
+    """
     d = dir_path(root)
     try:
         names = [n for n in os.listdir(d) if n.endswith(".md")]
     except Exception:
         return []
-    days = sorted((n[:-3] for n in names), reverse=True)
+    days = [n[:-3] for n in names if _DAY_NAME.match(n[:-3])]
+    days.sort(reverse=True)
     return days[:limit]
 
 
