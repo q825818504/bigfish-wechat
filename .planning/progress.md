@@ -2809,3 +2809,25 @@ handshake`），直连和代理都失败，而百度正常、代理访问 codelo
 | 落盘消息自动重放 | 先保证"不丢"，重放留后续 |
 | `architecture.md` 的 0.11–0.13.2 增量 | 文档债，本次只补了 0.13.3 一节 |
 | 被迫的事 / 有以后 / 完全没用的事 | 与 D-36 冲突，需先改规则（待用户拍板） |
+
+### 发布（2026-11-12 00:15）
+
+| 项 | 值 |
+|---|---|
+| Release | https://github.com/q825818504/bigfish-wechat/releases/tag/v0.13.3 |
+| Release ID | `441917579`（draft=false / prerelease=false） |
+| 提交 | `46632bd` v0.13.3：她开始有"以前" |
+| 便携包 | `BigFish-0.13.3-portable.zip` — 210,340,327 B（200.6 MB），341 文件 |
+| SHA-256 | `4f279c596fd0291b949f5e284bc7d923abb9620e41264e11d1bc1ee92a1976a3` |
+| 清单 | `BigFish-0.13.3-manifest.json` — 643 B，SHA-256 `bc8edf042c75e3d7a5ee0ba82901d5c3804fd81c4be606a8870ff58717e93138` |
+
+**发布后核验**（脚本 `.tmp/verify_release.py`）：
+
+- tag `v0.13.3` 指向 `46632bd`（= 本地 HEAD）
+- Release 状态 `draft=False` / `prerelease=False`
+- 两个附件大小与本地逐字节一致
+- raw 回读 `bigfish/__init__.py` = `0.13.3`
+
+**注意**：0.13.3 只有源码与便携包，**没有重新生成安装包**
+（`dist/BigFish-0.13.3-installer/` 未构建）。需要安装器时跑
+`python tools/build_installer.py`（或按 README 的方式 A）。
