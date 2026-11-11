@@ -29,7 +29,6 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -126,6 +125,130 @@ def main() -> int:
     check("凌晨 2 点 → 条数压到 1", night.max_parts == 1, str(night))
     check("凌晨 2 点 → 不接许可更高", night.silence_bias > bright.silence_bias,
           str(night))
+
+    # ════════════════════════════════════════════════════════════
+    section("[注意力] 允许没听清（走神许可）")
+    # ════════════════════════════════════════════════════════════
+    #
+    # 她一直「永远切题、永远完整」—— 那是整套系统里最像 AI 的地方。
+    # 这一节守的是：累、深夜、连着回了好几轮时，可以只接半句；
+    # 状态好的时候，不给这个许可（一个天天走神的人是傻子）。
+
+    check("状态好时不许走神", bright.attention_line == "", bright.attention_line)
+    check("精力 20 → 给了走神许可", bool(tired.attention_line),
+          tired.attention_line)
+    check("凌晨 2 点 → 给了走神许可", bool(night.attention_line),
+          night.attention_line)
+
+    groggy = P.response_policy(mood=90, dims={"happy": 8}, energy=80,
+                               now=at(15), recent_replies=5)
+    check("连着回 5 轮 → 强许可",
+          "可以不回答那个问题" in groggy.attention_line, groggy.attention_line)
+    check("许可里不写情绪词（她会演）",
+          "难过" not in groggy.attention_line
+          and "累" not in groggy.attention_line.split("——")[0],
+          groggy.attention_line)
+    check("走神许可和语气描述是两件事",
+          groggy.attention_line != groggy.tone_line, "")
+
+    # ════════════════════════════════════════════════════════════
+    section("[注意力] 被打断：话说到一半会停")
+    # ════════════════════════════════════════════════════════════
+    #
+    # 以前她分条连发时，对方插一句，她照样把第 3、4 条发完 ——
+    # 那不是"把话说完整"，那是没在听。
+
+    from bigfish import say as SAY
+
+    own_only = [{"local_id": 10, "is_self": True},
+                {"local_id": 11, "is_self": True}]
+    with_peer = own_only + [{"local_id": 12, "is_self": False}]
+
+    def _recent(rows):
+        return lambda chat, n: rows
+
+    check("只有自己的消息 → 不算被打断",
+          SAY._peer_spoke("c", _recent(own_only), 10) is False)
+    check("对方插了一句 → 算被打断",
+          SAY._peer_spoke("c", _recent(with_peer), 10) is True)
+    check("插话在基线之前 → 不算",
+          SAY._peer_spoke("c", _recent(with_peer), 12) is False)
+    check("没有基线时不判（第一条必须发出去）",
+          SAY._peer_spoke("c", _recent(with_peer), 0) is False)
+
+    def _boom(chat, n):
+        raise RuntimeError("读不出来")
+
+    check("读不出来时不误判（宁可继续发）",
+          SAY._peer_spoke("c", _boom, 10) is False)
+
+    # ════════════════════════════════════════════════════════════
+    section("[收尾] 说了「我先去忙了」就真的停")
+    # ════════════════════════════════════════════════════════════
+    #
+    # `-`（这一轮不接）只表示"这句不回"，下一轮对方再来她照样说话。
+    # 而"我先去忙了"是**结束这段对话** —— 说完了还主动找他，就是打自己的脸。
+
+    check("「我先去忙了」算收尾", P.is_farewell("我先去忙了") is True)
+    check("「那我去睡了」算收尾", P.is_farewell("那我去睡了") is True)
+    check("「明天见」算收尾", P.is_farewell("明天见") is True)
+    check("问句不算（「你睡了？」是关心）",
+          P.is_farewell("你睡了？") is False)
+    check("普通回复不算", P.is_farewell("好") is False)
+    check("空的不算", P.is_farewell("") is False)
+
+    # ════════════════════════════════════════════════════════════
+    section("[心情] 底子：睡差了底子就低")
+    # ════════════════════════════════════════════════════════════
+    #
+    # 以前心情永远往 70 衰减，所以"实时心情"在多数时候显示的是衰减后的
+    # 余数 —— 睡差了、身上难受、连着阴三天，底子都是 70。
+    # 底子低的时候一件小事就够烦，底子高的时候同样的事笑笑就过了。
+
+    from bigfish import mood_judge as MJ
+
+    _good = MJ.baseline_of(sleep_debt=0, energy=88,
+                           discomfort="", weather="18°C，晴")
+    _bad = MJ.baseline_of(sleep_debt=240, energy=20,
+                          discomfort="头有点沉", weather="5°C，雨")
+    check("状态好 → 底子高", _good > 72, f"{_good:.1f}")
+    check("状态差 → 底子低", _bad < 50, f"{_bad:.1f}")
+    check("底子有下界（再差也不演）", _bad >= 25, f"{_bad:.1f}")
+    check("底子有上界（留余地给事件）", _good <= 92, f"{_good:.1f}")
+    check("欠觉越多底子越低",
+          MJ.baseline_of(sleep_debt=240) < MJ.baseline_of(sleep_debt=0),
+          f"{MJ.baseline_of(sleep_debt=240):.1f} vs {MJ.baseline_of(sleep_debt=0):.1f}")
+    check("身上难受压底子",
+          MJ.baseline_of(discomfort="眼睛有点干") < MJ.baseline_of(discomfort=""),
+          "")
+    check("阴雨天比晴天低",
+          MJ.baseline_of(weather="12°C，雨") < MJ.baseline_of(weather="18°C，晴"),
+          "")
+    check("取不到值时退回中性", 55 <= MJ.baseline_of(energy=None) <= 80,
+          f"{MJ.baseline_of(energy=None):.1f}")
+
+    # ════════════════════════════════════════════════════════════
+    section("[口头禅] 她的用词会漂")
+    # ════════════════════════════════════════════════════════════
+    #
+    # 她的用词以前是固定的（soul 只读渲染，不学习），八个月后说话和今天
+    # 一模一样。这一节守的是：某个词连着几条消息都在，才算"老爱说"。
+
+    _rows = [("我", "确实有点累"), ("他", "嗯"), ("我", "确实不想动"),
+             ("他", "哦"), ("我", "确实今天不想说话")]
+    _tics = SAY.recent_tics(_rows, min_msgs=3)
+    check("三条消息都有「确实」→ 认出来了",
+          _tics and _tics[0][0] == "确实", str(_tics))
+    check("只统计她自己说的",
+          SAY.recent_tics([("他", "确实确实确实"), ("他", "确实"),
+                           ("他", "确实")], min_msgs=3) == [],
+          "")
+    check("一条消息里重复十遍不算老爱说",
+          SAY.recent_tics([("我", "确实" * 10)], min_msgs=3) == [], "")
+    check("凑不够就不硬凑", SAY.recent_tics([], min_msgs=3) == [], "")
+    check("停用词不进口头禅",
+          SAY.recent_tics([("我", "这个东西就是这样")] * 3, min_msgs=3) == [],
+          str(SAY.recent_tics([("我", "这个东西就是这样")] * 3, min_msgs=3)))
 
     # ════════════════════════════════════════════════════════════
     section("[预算] 跨轮配额：刚说过话就少说（0.11.1）")

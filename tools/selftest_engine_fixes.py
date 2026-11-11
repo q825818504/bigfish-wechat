@@ -243,7 +243,11 @@ def test_mood_write(tmp: str) -> None:
     # 70 + round(6/3) = 72
     check("步长除以 3（6 → +2）", st["mood"] == 72, str(st["mood"]))
     check("reason 已记", st["lastReason"] == "他说今天早点回家", st["lastReason"])
-    check("dims 有增量", st["dims"]["happy"] == 4, str(st["dims"]))
+    # 判定给的是"强度"4，但落到维度上要乘 DIM_GAIN（标定值，见 mood_judge
+    # 的注释：不乘的话一天下来七根维度长期停在 0~10，界面看起来"没有情绪"）。
+    # 这里跟着常量走，改标定值时这条不会假红。
+    check("dims 有增量",
+          st["dims"]["happy"] == round(4 * MJ.DIM_GAIN), str(st["dims"]))
     check("timeline 有一条", len(st["timeline"]) == 1, str(len(st["timeline"])))
     check("timeline 带 dimsDelta",
           st["timeline"][0].get("dimsDelta", {}).get("happy") == 4)

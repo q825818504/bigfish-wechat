@@ -124,7 +124,7 @@ def try_paste(s, gui, edit, box, path: str, tag: str) -> dict:
     print(f"{'─' * 70}")
 
     if not os.path.isfile(path):
-        print(f"     ✗ 文件不存在")
+        print("     ✗ 文件不存在")
         return {"tag": tag, "ok": False, "why": "文件不存在"}
 
     try:

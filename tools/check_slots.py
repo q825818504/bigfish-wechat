@@ -140,7 +140,7 @@ def check_file(path: str) -> int:
                           f"{cls.name}.{fn.name}")
                     print(f"      @Slot 声明了 {n_inputs} 个输入参数，"
                           f"但方法接受 {n_min}~{n_max} 个")
-                    print(f"      → JS 调用会静默失败，表现成「按钮点了没反应」")
+                    print("      → JS 调用会静默失败，表现成「按钮点了没反应」")
                     problems += 1
 
                 # result= 但方法没有返回值注解：可疑，但不一定错

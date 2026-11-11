@@ -228,10 +228,19 @@ def test_debt() -> None:
     L.tick(normal, normal.wake_at + 60)
     normal_energy = normal.energy
 
+    # 熬夜的唯一真实机制：入睡点前后还在聊 → 每 8~12 分钟续一次，一晚封顶 96 分钟。
+    # 旧版这里直接 tick 到凌晨 3 点，靠"进程没 tick"制造出"硬撑到 3 点"——
+    # 那不是她的选择，是进程不在。catch_up 之后她到点就睡，所以要真的去延长。
     late, _ = fresh(2026, 11, 7, 10)
-    L.tick(late, at(2026, 11, 8, 3, 0))       # 硬撑到凌晨 3 点
+    _t = late.bedtime - L.EXTEND_WINDOW_MINUTES * 60 + 60
+    for _ in range(8):
+        L.try_extend(late, _t)
+        _t += 9 * 60
+    L.tick(late, late.bedtime + late.extended_minutes * 60 + 60)
     check("熬夜最终会睡（不会永远醒着）", late.asleep,
           f"asleep={late.asleep} energy={late.energy:.0f}")
+    check("陪聊确实延长了入睡点", late.extended_minutes > 0,
+          f"extended={late.extended_minutes:.0f}")
     check("熬夜记了睡眠债", late.sleep_debt > 0, f"debt={late.sleep_debt:.0f}")
     check("撑到 3 点精力明显下降", late.energy < 55, f"{late.energy:.0f}")
 
@@ -241,6 +250,37 @@ def test_debt() -> None:
     check("第二天起床精力更低", late.energy < normal_energy,
           f"正常 {normal_energy:.0f} / 熬夜 {late.energy:.0f}")
     check("债衰减但没清零", 0 < late.sleep_debt < 240, f"{late.sleep_debt:.0f}")
+
+    # ── 没人看着，她也按自己的钟睡 ──────────────────────────────────
+    # 这是 catch_up 的全部意义。2026-11-10 用户实测：21:00 关软件、
+    # 次日 19:32 才打开，她"今天晚上才醒"，一整天从晚上七点半开始。
+    # 病根是入睡和醒来被实现成 tick 的副作用，而不是时间的函数。
+    alone, _ = fresh(2026, 11, 7, 10)
+    alone.last_tick = at(2026, 11, 7, 22, 0)
+    L.tick(alone, at(2026, 11, 8, 3, 0))
+    check("没人看着也到点就睡（不会被冻到凌晨）",
+          alone.asleep and alone.asleep_since <= alone.bedtime + 60,
+          f"asleep={alone.asleep} 入睡={hhmm(alone.asleep_since)} 计划={hhmm(alone.bedtime)}")
+
+    # 隔夜打开：一天必须从早上开始，不能从打开那一刻开始
+    over, _ = fresh(2026, 11, 7, 10)
+    over.last_tick = at(2026, 11, 7, 22, 0)
+    L.tick(over, at(2026, 11, 8, 11, 0))
+    check("隔夜打开后，醒来时刻落在早上而不是打开的时刻",
+          5 <= datetime.fromtimestamp(over.just_woke_at).hour <= 12,
+          f"醒来={hhmm(over.just_woke_at)}")
+    check("隔夜打开后，她的一天推进到今天", over.day == "2026-11-08",
+          f"day={over.day}")
+
+    # 关软件的时刻刚好落在入睡点之后（23:50 关、次日 6:00 开）：
+    # 那一觉不能丢 —— 丢了就是"早上才睡、晚上才醒"。
+    edge, _ = fresh(2026, 11, 7, 10)
+    edge.last_tick = edge.bedtime + 5 * 60      # 入睡点之后 5 分钟关掉
+    edge.asleep = False                          # 引擎还没 tick 到"睡下"
+    L.tick(edge, at(2026, 11, 8, 6, 0))
+    check("关在入睡点之后，那一觉也补在正确的位置",
+          edge.asleep and abs(edge.asleep_since - edge.bedtime) < 600,
+          f"asleep={edge.asleep} 入睡={hhmm(edge.asleep_since)} 计划={hhmm(edge.bedtime)}")
 
 
 def test_extend() -> None:
@@ -297,12 +337,15 @@ def test_energy() -> None:
     L.tick(c, c.wake_at + 60)
     check("睡一觉之后精力回升", c.energy > before + 10, f"{before:.0f} → {c.energy:.0f}")
 
+    # 超时消耗（熬夜额外掉精力）现在端到端测不到了：catch_up 会让
+    # 她在入睡点那一刻就睡下，不存在"该睡却还醒着"的区间 —— 这是对的。
+    # 所以这里直接测公式本身，守住"超时的那一段扣得更快"这个不变式。
     d, now3 = fresh(2026, 11, 7, 22, 0)
-    d.bedtime = now3 + 70 * 60          # 70 分钟后该睡
+    d.bedtime = now3 - 30 * 60          # 已经超时 30 分钟
     before_overtime = d.energy
-    L.tick(d, now3 + 100 * 60)          # 已经超时 30 分钟
+    L._advance_flat(d, now3, now3 + 3600)   # 一小时纯公式，不经过任何边界
     over = before_overtime - d.energy
-    plain = L.ENERGY_AWAKE_DRAIN * (100 / 60)
+    plain = L.ENERGY_AWAKE_DRAIN * 1.0
     check("超时之后掉得更快", over > plain + 0.5,
           f"超时 {over:.1f} / 纯基础 {plain:.1f}")
     check("精力不会掉到下限以下", d.energy >= L.ENERGY_FLOOR - 0.01, f"{d.energy}")
@@ -511,6 +554,159 @@ def test_pending() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 身体
+# ══════════════════════════════════════════════════════════════════════
+
+def test_body() -> None:
+    print("\n[身体] 她身上有点什么（必须有成因，不能抽卡）")
+
+    def roll(day: int, trace: list, debt: float = 0.0) -> str:
+        ts = (datetime(2026, 1, 1) + timedelta(days=day)).replace(
+            hour=8).timestamp()
+        st = L.LifeState()
+        st.day_trace = [{"at": 0, "doing": d} for d in trace]
+        st.sleep_debt = debt
+        return L.roll_body(st, ts)
+
+    # 三成日子什么都没感觉 —— 天天难受是病，不是生活
+    blanks = sum(1 for d in range(120) if not roll(d, ["在看剧"]))
+    check("有三成左右的日子身上没什么感觉", 20 <= blanks <= 52,
+          f"{blanks}/120")
+
+    # 成因：欠了债就别指望头不沉
+    feels = [roll(d, ["在收拾屋子"], debt=180) for d in range(120)]
+    check("欠了两小时债之后，出现的是这几样里的",
+          all(f in ("", "头有点沉，像没睡透", "腰有点酸", "手一直是凉的")
+              for f in feels),
+          str(sorted(set(feels))))
+
+    # 成因：昨天看了一天屏幕，眼睛就该干
+    screen = [roll(d, ["在看剧", "在翻几页小说"]) for d in range(120)]
+    check("昨天一直在看屏幕 → 会出现眼睛干", "眼睛有点干" in screen,
+          str(sorted(set(screen))))
+
+    # 过期自己好
+    st = L.LifeState()
+    st.body = "眼睛有点干"
+    st.body_since = 1000.0
+    st.body_until = 5000.0
+    check("还没到点 → 还有这个感觉", L.body_now(st, 3000.0) == "眼睛有点干")
+    check("过了点 → 自己就好了", L.body_now(st, 6000.0) == "")
+    check("没感觉时 → 空串", L.body_now(L.LifeState(), 3000.0) == "")
+
+    # 进提示词
+    st2 = L.LifeState()
+    st2.day = "2026-11-11"
+    st2.energy = 80
+    st2.just_woke_at = datetime(2026, 11, 11, 7, 50).timestamp()
+    st2.body = "眼睛有点干"
+    st2.body_since = datetime(2026, 11, 11, 9, 0).timestamp()
+    text = L.render(st2, now=datetime(2026, 11, 11, 12, 30).timestamp())
+    check("身体感觉进了提示词", "眼睛有点干" in text, text[:120])
+    check("带上持续了多久", "个小时" in text, text[:120])
+
+    # ── 梦：醒来只记得一点，过了就想不起来 ──
+    _dreams = []
+    for _d in range(60):
+        _st = L.LifeState()
+        _st.day_trace = [{"at": 0, "doing": "去趟超市"}]
+        _ts = (datetime(2026, 1, 1) + timedelta(days=_d)).replace(hour=8).timestamp()
+        _dreams.append(L.roll_dream(_st, _ts))
+    _had = [x for x in _dreams if x]
+    check("三成多的日子记得梦", 10 <= len(_had) <= 36, f"{len(_had)}/60")
+    check("梦的内容不是同一句", len(set(_had)) > 1, str(set(_had)))
+
+    _ds = L.LifeState()
+    _ds.day = "2026-11-11"
+    _ds.energy = 80
+    _ds.just_woke_at = datetime(2026, 11, 11, 8, 0).timestamp()
+    _ds.dream = "在菜市场，怎么走都走不到头"
+    _ds.dream_until = datetime(2026, 11, 11, 10, 0).timestamp()
+    _t1 = L.render(_ds, now=datetime(2026, 11, 11, 8, 30).timestamp())
+    check("刚醒时还记着梦", "梦见了" in _t1, _t1[:120])
+    check("说梦时留了「记不太清」", "记不太清" in _t1, _t1[:120])
+    _t2 = L.render(_ds, now=datetime(2026, 11, 11, 11, 0).timestamp())
+    check("两小时后就说不出来了", "梦见了" not in _t2, _t2[:120])
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 日程守卫
+# ══════════════════════════════════════════════════════════════════════
+
+def test_plan_guard() -> None:
+    print("\n[日程] 守卫：陈旧 plan 与已完成的事")
+
+    def at_hm(h: int, m: int) -> float:
+        return datetime(2026, 11, 11, h, m).timestamp()
+
+    # ① 昨天的 plan 不能当"今天打算做的"渲染，也不能被结算
+    st = L.LifeState()
+    st.day = "2026-11-11"
+    st.energy = 60
+    st.plan = [{"at": "09:00", "end": "10:00", "dur": 60,
+                "what": "去趟超市", "done": False, "from": "fact"}]
+    st.plan_day = "2026-11-10"
+    check("陈旧 plan 不渲染成今天的安排",
+          L.plan_for_prompt(st, now=at_hm(9, 30)) == "", "")
+    check("陈旧 plan 不被结算成「过去了」",
+          L.expire_plan(st, at_hm(23, 30)) == 0, "")
+
+    # ② 已做完的事不再算"正在做"
+    st2 = L.LifeState()
+    st2.day = "2026-11-11"
+    st2.energy = 60
+    st2.plan = [{"at": "09:00", "end": "10:00", "dur": 60,
+                 "what": "去趟超市", "done": True, "from": "fact"}]
+    st2.plan_day = "2026-11-11"
+    check("做完的事不会又变成手头在做",
+          L.current_plan_item(st2, at_hm(9, 30)) == "",
+          L.current_plan_item(st2, at_hm(9, 30)))
+
+    # ③ dur 是垃圾字符串不能抛（一抛就是整天日程全丢）
+    st3 = L.LifeState()
+    try:
+        L.set_plan(st3, [{"at": "09:00", "what": "x", "dur": "45分钟"}],
+                   day="2026-11-11")
+        check("dur 是字符串时不抛", True, str(st3.plan[0]["dur"]))
+    except Exception as exc:                      # noqa: BLE001
+        check("dur 是字符串时不抛", False, str(exc))
+
+    # ④ 超出范围的时刻是僵尸：永不命中、永不 elapsed，只能丢
+    st4 = L.LifeState()
+    L.set_plan(st4, [{"at": "99:99", "what": "僵尸"},
+                     {"at": "10:00", "what": "正常"}], day="2026-11-11")
+    check("超出范围的时刻被丢掉",
+          len(st4.plan) == 1 and st4.plan[0]["what"] == "正常",
+          str([x["what"] for x in st4.plan]))
+
+    # ⑤ 区间命中与"提前 30 分钟"互不打架
+    st5 = L.LifeState()
+    st5.day = "2026-11-11"
+    st5.energy = 60
+    st5.plan = [{"at": "21:00", "end": "21:30", "dur": 30,
+                 "what": "看书", "done": False, "from": "self"}]
+    st5.plan_day = "2026-11-11"
+    check("区间外不命中", L.current_plan_item(st5, at_hm(20, 20)) == "", "")
+    check("区间内命中", L.current_plan_item(st5, at_hm(21, 10)) == "看书", "")
+    check("过点后不再命中", L.current_plan_item(st5, at_hm(21, 40)) == "", "")
+
+    # ⑥ 醒来后的流程是**有顺序的三步**，不是"一段被占掉的时间"
+    _st6 = L.LifeState()
+    _st6.just_woke_at = datetime(2026, 11, 11, 7, 50).timestamp()
+
+    def _step(m: int) -> str:
+        return L.wake_step_text(_st6, _st6.just_woke_at + m * 60)
+
+    check("刚醒在洗漱", _step(5) == "刚起来，还在洗漱", _step(5))
+    check("过一会儿在弄吃的", _step(20) == "在弄点吃的", _step(20))
+    check("再往后在收拾出门", _step(45) == "收拾一下，准备出门", _step(45))
+    check("过了流程就交回日程", _step(70) == "", _step(70))
+    check("还没醒时不算流程",
+          L.wake_step_text(_st6, _st6.just_woke_at - 600) == "", "")
+
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 渲染
 # ══════════════════════════════════════════════════════════════════════
 
@@ -688,6 +884,8 @@ def main() -> int:
     test_nap()
     test_nap_is_not_a_new_day()
     test_pending()
+    test_body()
+    test_plan_guard()
     test_render()
     test_condition()
     test_roundtrip()

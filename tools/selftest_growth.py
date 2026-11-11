@@ -161,16 +161,22 @@ def main() -> int:
     section("[日程] 落进 life 状态")
     # ════════════════════════════════════════════════════════════
 
+    # ⚠ day 必须和 at() 是同一天： 现在按**日历日**
+    #   判断"这条是不是今天的"（凌晨没醒时 state.day 还停在前一天，
+    #   用它当判据会让昨天的安排冒充今天）。写死一个 2026-11-08 再配
+    #   "今天的 now"，就等于在测一个永远不会发生的组合。
+    _day = L.day_key(at(9, 30))
     st = L.LifeState()
     L.set_plan(st, [
-        {"at": "14:00", "what": "把书看完", "from": "yesterday"},
-        {"at": "09:30", "what": "去趟超市", "from": "fact"},
+        {"at": "14:00", "end": "15:30", "dur": 90, "what": "把书看完", "from": "yesterday"},
+        {"at": "09:30", "end": "10:30", "dur": 60, "what": "去趟超市", "from": "fact"},
         {"at": "bad", "what": "坏时间"},
         {"at": "18:00", "what": ""},
-    ], day="2026-11-08")
+    ], day=_day)
     check("坏数据被丢掉", len(st.plan) == 2, str(st.plan))
     check("按时间排好", st.plan[0]["at"] == "09:30", str(st.plan))
-    check("记下是哪天的", st.plan_day == "2026-11-08", st.plan_day)
+    check("区间被保住", st.plan[0].get("end") == "10:30", str(st.plan[0]))
+    check("记下是哪天的", st.plan_day == _day, st.plan_day)
 
     check("上午在做第一条",
           L.current_plan_item(st, at(10)) == "去趟超市",
@@ -198,6 +204,143 @@ def main() -> int:
 
     empty = L.LifeState()
     check("没日程时不注入", L.plan_for_prompt(empty, now=at(10)) == "")
+
+    # ════════════════════════════════════════════════════════════
+    section("[日程] 骨架与区间：时间必须自洽")
+    # ════════════════════════════════════════════════════════════
+    # 这一段守的是"她不可能同时出现在两个地方"：
+    #   区间不重叠、避开饭点、从醒来算起、两条之间留走动时间。
+
+    wake = at(7, 53)
+    bed = at(23, 20)
+    laid = PLAN.layout([
+        {"when": "上午", "what": "去趟超市"},
+        {"when": "中午", "what": "把汤热一热"},
+        {"when": "下午", "what": "翻几页小说"},
+        {"when": "傍晚", "what": "做顿饭"},
+    ], wake_at=wake, bedtime=bed)
+    check("四条都排进去了", len(laid) == 4, str([x["what"] for x in laid]))
+    check("每条都有起止", all(x.get("start") and x.get("end") for x in laid),
+          str([(x.get("start"), x.get("end")) for x in laid]))
+
+    ordered = sorted(laid, key=lambda x: x["start"])
+    overlap = [i for i in range(1, len(ordered))
+               if ordered[i]["start"] < ordered[i - 1]["end"]]
+    check("区间不重叠", not overlap, str([(x["start"], x["end"]) for x in ordered]))
+    check("第一条不早于她醒来的时间", ordered[0]["start"] >= "08:30",
+          ordered[0]["start"])
+
+    # 11:40~12:30 是午饭，谁都不许排进去
+    lunch_hit = [x for x in laid if x["start"] < "12:30" and x["end"] > "11:40"]
+    check("没有事排进午饭时间", not lunch_hit,
+          str([(x["start"], x["end"], x["what"]) for x in lunch_hit]))
+
+    # 因果：要做饭就得先有菜
+    with_pre = PLAN.with_prerequisites([
+        {"when": "晚上", "what": "做顿饭"},
+        {"when": "下午", "what": "翻几页小说"},
+    ])
+    check("排了做饭会自动补一条买菜",
+          any(PLAN.SHOP_FILLER == str(x.get("what")) for x in with_pre),
+          str([x["what"] for x in with_pre]))
+    no_need = PLAN.with_prerequisites([
+        {"when": "上午", "what": "去趟超市"},
+        {"when": "晚上", "what": "做顿饭"},
+    ])
+    check("已经有买菜就不重复补",
+          sum(1 for x in no_need if PLAN.SHOP_FILLER == str(x.get("what"))) == 0,
+          str([x["what"] for x in no_need]))
+
+    # 醒得晚：不许出现"09:00 去超市"而她 11:00 才醒
+    late = PLAN.layout([{"when": "早上", "what": "去趟超市"}],
+                       wake_at=at(11, 0), bedtime=bed)
+    check("醒得晚就不会排到醒之前",
+          not late or late[0]["start"] >= "11:00",
+          str([(x["start"], x["what"]) for x in late]))
+
+    # ── 只跟她自己有关的动机 ──
+    # 素材全部来自她的处境（身上、碰见的人、天气、一直在做的事），
+    # 不来自对话 —— 否则她做的每件事最终都能追溯到你。
+    _sm = PLAN.self_material(body="眼睛有点干", met=["卖鱼的：摊子空着"],
+                             weather="12°C，阴", trace=["在收拾屋子"] * 2)
+    check("自己的素材里有身上", any("眼睛" in x for x in _sm), str(_sm))
+    check("碰见的人进了素材", any("卖鱼的" in x for x in _sm), str(_sm))
+    check("反复在做的事被认出来", any("收拾屋子" in x for x in _sm), str(_sm))
+    check("没有素材时为空", PLAN.self_material() == [], str(PLAN.self_material()))
+    check("空素材时提示词里不出现这一段",
+          "## 你自己会想到的" not in PLAN.build_request(
+              day="d", weekday="w", yesterday=[], facts=[], recent=[])[1], "")
+    check("有素材时提示词里有这一段",
+          "## 你自己会想到的" in PLAN.build_request(
+              day="d", weekday="w", yesterday=[], facts=[], recent=[],
+              self_lines=_sm)[1], "")
+
+    # ════════════════════════════════════════════════════════════
+    section("[别人] 她生活里的熟人")
+    # ════════════════════════════════════════════════════════════
+    # 这一段守的是"她的世界里有别人，但别人不是道具"：
+    #   只能是固定那几个人、状态会变、遭遇没有剧情。
+
+    import tempfile as _tf
+
+    from bigfish import neighbors as NB
+
+    _root = _tf.mkdtemp()
+    shop = [{"when": "上午", "what": "去趟超市"}]
+    got = NB.attach(shop, day="2026-11-11", root=_root)
+    # 概率是 0.5，所以这里只断言"要么没有、要么是表里的人"
+    met = [x for x in got if isinstance(x.get("meet"), dict)]
+    check("碰见的人只能来自固定的那张表",
+          all(m["meet"]["who"] in [c["name"] for c in NB.CAST] for m in met),
+          str([m["meet"]["who"] for m in met]))
+
+    # 同一天同一个配角，状态必须一样 —— 否则她一天里会碰到两个"卖鱼的"
+    same_day = [NB.attach(shop, day="2026-11-13", root=_root) for _ in range(3)]
+    states = {str((x[0].get("meet") or {}).get("text") or "") for x in same_day}
+    # 没命中的那几次是空串（50% 概率），不算"说法不同"
+    states.discard("")
+    check("同一天碰见同一个人，说法一致", len(states) <= 1, str(states))
+
+    # 不同天，状态会变（十天里至少出现两种不同的说法）
+    seen_states = set()
+    for _d in range(11, 25):
+        for _x in NB.attach(shop, day=f"2026-11-{_d:02d}", root=_root):
+            if isinstance(_x.get("meet"), dict):
+                seen_states.add(str(_x["meet"].get("text") or ""))
+    check("不同天他的样子会变", len(seen_states) >= 2, str(seen_states))
+
+    # 不涉及那些地点的事，不会碰见谁
+    quiet = NB.attach([{"when": "下午", "what": "翻几页小说"}],
+                      day="2026-11-11", root=_root)
+    check("在家看书不会碰见谁",
+          not any(isinstance(x.get("meet"), dict) for x in quiet),
+          str(quiet))
+
+    # 落盘往返
+    st_nb = NB.load(_root)
+    check("见过的人记下来了", bool(st_nb.get("seen")), str(list(st_nb.get("seen") or {})))
+    check("一天最多碰见两次",
+          len([x for x in NB.attach(
+              [{"when": "上午", "what": "去趟超市"},
+               {"when": "下午", "what": "下楼走一圈"},
+               {"when": "傍晚", "what": "取快递"}],
+              day="2026-11-09", root=_root) if isinstance(x.get("meet"), dict)]) <= 2,
+          "")
+
+    # ── 关系会消失 ──
+    # 只涨不跌的不是关系，是账本。一个永远在场的邻居不是人，是背景板。
+    _gone_seen = {"fish": {"count": 8,
+                           "last": _dt.datetime(2026, 11, 1, 9).timestamp()}}
+    _gone_now = _dt.datetime(2026, 11, 20, 9).timestamp()
+    _gone_states = {NB._state_for(NB.CAST[0], "2026-11-%02d" % _d,
+                                  _gone_seen, _gone_now) for _d in range(1, 6)}
+    check("十几天没见过的人，说法变成「不在了」",
+          bool(_gone_states & set(NB.GONE_STATES)), str(_gone_states))
+    _near_seen = {"fish": {"count": 8,
+                           "last": _dt.datetime(2026, 11, 19, 9).timestamp()}}
+    _near = {NB._state_for(NB.CAST[0], "2026-11-%02d" % _d, _near_seen, _gone_now)
+             for _d in range(1, 6)}
+    check("昨天刚见过的还是原样", not (_near & set(NB.GONE_STATES)), str(_near))
     L.refresh_doing(empty, at(15))
     check("没日程时退回静态池", bool(empty.doing), empty.doing)
 
@@ -283,7 +426,6 @@ def main() -> int:
           any(h.get("kind") == "evolved" for h in (soul.get("history") or [])),
           str(soul.get("history"))[:120])
 
-    before = len(notes)
     ok2, n2, _ = V.evolve_soul(changed, "又一天")
     check("同一个看法不重复记", (not ok2) or n2 == 0, f"{ok2} {n2}")
 
@@ -499,13 +641,73 @@ def main() -> int:
     check("提示词不许总结", "不要总结" in _sys, "")
     check("提示词要求第一人称", "第一人称" in _sys, "")
     check("提示词允许空白", "允许空白" in _sys, _sys[:80])
-    check("提示词禁止编对话", "不许编对话" in _sys, "")
+    check("提示词禁止编对话", "不许编「对方」" in _sys, "")
+    # 「别人」解禁之后的新边界：可以写碰到的人，但不替他们编话。
+    check("提示词允许写碰见的人", "碰见的人" in _sys, "")
+    check("碰见的人不许替他们编话", "不替他们编对话" in _sys, "")
 
     _sys2, user2 = J.build_request(day="2026-11-09",
                                    materials={"talk": [], "plan": []})
     check("空白要明说没人说话", "没有人跟你说话" in user2, user2[:100])
     check("空日程要明说", "没有安排" in user2, user2[:140])
     check("空白不编对话的指令进请求", "没有发生过" in user2, user2[:160])
+
+    # ════════════════════════════════════════════════════════════
+    section("[日志] 写完的日记要回一次记忆")
+    # ════════════════════════════════════════════════════════════
+    #
+    # 在此之前，日记只躺在磁盘上给人看（journal 明写"不进提示词"），
+    # 记忆库里只有"他说过什么"，没有"她自己过成了什么样"。
+    # 回流之后，"翻旧日记"变成"检索到自己的一句话"。
+
+    import os as _os2
+    import tempfile as _tf2
+
+    from bigfish import memory as M2
+    from bigfish import world as W2
+
+    _root2 = _tf2.mkdtemp()
+    _db2 = _os2.path.join(_root2, "m.sqlite3")
+    M2.ensure_schema(_db2)
+
+    class _FakeWorld:
+        def _log(self, *a, **k):
+            pass
+
+    _diary = """# 2026-11-09
+
+    今天把昨天取的快递拆了，一件件归置好。下午又把厚衣服翻出来整理。
+
+    <!-- chars=60 -->"""
+    W2.World._remember_diary(_FakeWorld(), "2026-11-09", _diary,
+                             db=_db2, owner="private:wechat:x")
+    _rows = (M2.list_facts(_db2, "dafeiyu", status="active", limit=5,
+                           owner="private:wechat:x",
+                           tier=M2.TIER_OWNER) or {}).get("items") or []
+    check("日记摘了一句进记忆", len(_rows) == 1, str(_rows))
+    check("摘的是正文第一句，不是标题",
+          bool(_rows) and _rows[0]["object"].startswith("今天把"),
+          _rows[0]["object"] if _rows else "")
+    check("来源标成日记（可追溯）",
+          bool(_rows) and "journal:2026-11-09" in (_rows[0].get("evidence") or ""),
+          _rows[0].get("evidence") if _rows else "")
+
+    # 同一天重写日记 → 加固同一条，不新增
+    W2.World._remember_diary(_FakeWorld(), "2026-11-09", _diary,
+                             db=_db2, owner="private:wechat:x")
+    _rows2 = (M2.list_facts(_db2, "dafeiyu", status="active", limit=5,
+                            owner="private:wechat:x",
+                            tier=M2.TIER_OWNER) or {}).get("items") or []
+    check("同一天重写不新增一条", len(_rows2) == 1, str(len(_rows2)))
+
+    # 摘不出内容就不写
+    W2.World._remember_diary(_FakeWorld(), "2026-11-10", "# 2026-11-10\n\n<!-- c -->",
+                             db=_db2, owner="private:wechat:x")
+    check("空日记不写进记忆",
+          len((M2.list_facts(_db2, "dafeiyu", status="active", limit=9,
+                             owner="private:wechat:x",
+                             tier=M2.TIER_OWNER) or {}).get("items") or []) == 1,
+          "")
 
     # ── 出口 ──
     print()

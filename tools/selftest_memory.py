@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -210,9 +211,16 @@ def t_facts(tmp: str) -> None:
     check("旧指针指向新", by_id[fid]["supersededBy"] == fid3, str(by_id[fid]["supersededBy"]))
     check("新的是 active", by_id[fid3]["status"] == "active")
     check("active 只留一条", len(M.list_facts(db, "dafeiyu", status="active")["items"]) == 1)
-    check("提示词只用 active",
-          "无糖豆浆" in M.facts_for_prompt(db, "dafeiyu", owner=OWNER, tier=M.TIER_OWNER)
-          and "不喝咖啡" not in M.facts_for_prompt(db, "dafeiyu", owner=OWNER, tier=M.TIER_OWNER))
+    # ⚠ 语义更新（2026-11-10）：旧说法现在**允许**以"以前：…"的形式出现 ——
+    #   那是时间线，不是事实。她要能说"你以前不喝咖啡，后来改无糖了"，
+    #   但不能把"不喝咖啡"当成现在的事实。所以这里判的是**位置**：
+    #   出现就必须在"以前：…"的括号里。
+    _prompt = M.facts_for_prompt(db, "dafeiyu", owner=OWNER,
+                                 tier=M.TIER_OWNER)
+    _old_ok = ("不喝咖啡" not in _prompt
+               or re.search(r"以前：[^）]*不喝咖啡", _prompt) is not None)
+    check("提示词只用 active：旧说法只能出现在「以前」里",
+          "无糖豆浆" in _prompt and _old_ok, _prompt[:200])
 
     ok, err = M.forget_fact(db, "dafeiyu", fid3, "用户要求")
     check("遗忘成功", ok, err)
@@ -573,7 +581,6 @@ def t_isolation(tmp: str) -> None:
     check("shared + 黑名单话题（身体）→ 仍不外传", "手术" not in after, after)
 
     # 换成白名单话题「食物」，同一 visibility 下就外传了
-    fid3 = [f["id"] for f in M.list_facts(db, "dafeiyu", query="爱吃辣")["items"]][0]
     after2 = M.facts_for_prompt(db, "dafeiyu", owner=other, tier=M.TIER_GUEST)
     check("shared + 白名单话题（食物）→ 陌生人可见", "爱吃辣" in after2, after2)
     ev = [e["kind"] for e in M.fact_events(db, "dafeiyu")]
@@ -665,7 +672,6 @@ def t_habits(tmp: str) -> None:
 
     # 衰减：放很久以后，评分应下降
     before = M.refresh_habits(db, "dafeiyu", me, now=day1 + 3 * 86_400_000)
-    score_now = [r for r in [before]]
     check("重组成功", before.get("ok"), str(before))
     later = M.refresh_habits(db, "dafeiyu", me,
                              now=day1 + 3 * 86_400_000 + 300 * 86_400_000)
@@ -1016,9 +1022,37 @@ def t_retrieval_strategy(tmp: str) -> None:
     c.close()
 
     # ① 带了相关问题：旧事该被相关性顶上来，即使它更老
+    #
+    # ⚠ 以前这里用 "我最近牙疼" 当 query，能过 —— 但那是**碰巧**：
+    #   `_relevance` 只做词面交集，"牙疼"和"智齿"切不出共同词，
+    #   实际是走了"分数平局"，靠旧的"从没用过 = 全新鲜"让它排前面。
+    #   改成按创建时间折旧之后，这个巧合失效了。
+    #   现在用词面真能对上的 query 测**相关性能压过新鲜度**这件事本身；
+    #   "牙疼↔智齿"那种同义/上下位要另外做词表，属于已知限制（未做）。
     got = M.facts_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER,
-                             limit=1, pinned_limit=0, question="我最近牙疼")
-    check("问牙疼 → 捞到三年前拔智齿", "智齿" in got, got)
+                             limit=1, pinned_limit=0, question="还记得我智齿那事吗")
+    check("问智齿 → 捞到三年前那条（相关性压过新鲜度）", "智齿" in got, got)
+
+    # ② 时间线：同一个人、同一个谓词改过几次，注入时要带上"以前"
+    #
+    # supersede 链本身就是时间线。渲染出来她才第一次有「变化」而不只是
+    # 「状态」—— 才可能在很久以后说一句"你以前不是这样的"。
+    _ids = []
+    for _obj in ("天天生气", "提了离职", "在交接"):
+        _ok, _fid, _why = M.remember(db, "dafeiyu", M.Fact(
+            predicate="上班", object=_obj, owner=me, confidence=0.8),
+            verify_sources=False)
+        if _fid:
+            _ids.append(_fid)
+    check("三次改写都落库了", len(_ids) == 3, str(_ids))
+    _chain = M.lineage(db, "dafeiyu", _ids[-1])
+    check("lineage 能往回走", _chain and _chain[0] == "天天生气", str(_chain))
+    _out = M.facts_for_prompt(db, "dafeiyu", owner=me, tier=M.TIER_OWNER,
+                              limit=6, pinned_limit=0)
+    check("注入时带上「以前」", "以前：" in _out, _out[:200])
+    check("时间线是旧 → 新", "天天生气 → 提了离职" in _out, _out[:240])
+    check("没有历史的事不多一个括号",
+          _out.count("以前：") <= 2, str(_out.count("以前：")))
     check("问牙疼 → 不塞无关的加班", "加班" not in got, got)
 
     # ② 不带问题：按取用分数排，不按 id
@@ -1042,10 +1076,20 @@ def t_retrieval_strategy(tmp: str) -> None:
     check("久没用过也不会归零", M._fact_score(old, now) > 0,
           str(M._fact_score(old, now)))
 
-    # ⑤ 从没用过的按"全新鲜"算，不会一起沉底
-    fresh = dict(row, lastUsedAt=0, useCount=0, confidence=0.9)
-    check("从没用过 = 不折旧", abs(M._fact_score(fresh, now) - 0.9) < 1e-6,
-          str(M._fact_score(fresh, now)))
+    # ⑤ 没有使用记录的，按**创建时间**折旧。
+    #
+    # 以前这里是"从没用过 = 全新鲜（1.0）"，理由是怕老库升级当天全体沉底。
+    # 代价是：三年前那句"你拔过智齿"和昨天刚聊的一样新 ——
+    # 而"很久没想起过的一件事"恰恰是最该沉的，人就是这样忘东西的。
+    born = dict(row, lastUsedAt=0, createdAt=now - 3 * 365 * DAY,
+                useCount=0, confidence=0.9)
+    check("从没用过、但三年没碰 → 会折旧",
+          M._fact_score(born, now) < 0.9 * 0.5,
+          str(M._fact_score(born, now)))
+    orphan = dict(row, lastUsedAt=0, createdAt=0, useCount=0, confidence=0.9)
+    check("连创建时间都没有（老库）→ 仍按全新鲜算，不一起沉底",
+          abs(M._fact_score(orphan, now) - 0.9) < 1e-6,
+          str(M._fact_score(orphan, now)))
 
     # ⑥ 相关性用同一套分词
     #

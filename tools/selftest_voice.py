@@ -17,7 +17,6 @@ from __future__ import annotations
 import array
 import json
 import math
-import os
 import sys
 import tempfile
 import threading
@@ -30,7 +29,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from bigfish import voice as V          # noqa: E402
-from bigfish import voice_audio as A    # noqa: E402
 from bigfish import voice_director as D  # noqa: E402
 from bigfish import voice_text as T     # noqa: E402
 
@@ -115,6 +113,33 @@ def main() -> int:
     cleaned = T.clean_for_tts("还不睡吗？[呼气]我这边灯已经关了。")
     check("[呼气]" in cleaned, "清洗 · 保护音频标签", cleaned)
     check("@" not in T.clean_for_tts("@老爸 好呀"), "清洗 · 去掉 @")
+
+
+    # 1.5) 长话拆段：语音要能承载长对话，且**不许丢内容**
+    #
+    # 以前整轮超 50 秒就改发文字，一段两三百字的心里话永远听不见。
+    # 现在按句切、每段 ≤200 字、最多 3 段，剩下的并入最后一段。
+    from bigfish.voice_split import split_for_voice
+
+    _short = "大肥鱼，蓝鲸一条，住在电脑里。"
+    check("拆段 · 短句不拆", split_for_voice(_short) == [_short],
+          str(split_for_voice(_short)))
+
+    _long = "。".join(["这是一句用来测试切分的话"] * 30) + "。"
+    _parts = split_for_voice(_long)
+    check("拆段 · 长话被拆开", 1 < len(_parts) <= 3, f"{len(_parts)} 段")
+    check("拆段 · 每段不超预算", all(len(p) <= 200 for p in _parts[:-1]),
+          str([len(p) for p in _parts]))
+    # 最重要的一条：一个字都不许丢
+    check("拆段 · 不丢内容", "".join(_parts) == _long, "拼接后应与原文一致")
+    # 每一段都得是完整句子（以句末标点结尾），不能从词中间断
+    check("拆段 · 不切半个词",
+          all(p.endswith(("。", "！", "？", "…")) for p in _parts[:-1]),
+          str([p[-3:] for p in _parts[:-1]]))
+
+    _no_punct = "啊" * 500
+    check("拆段 · 没标点也不丢",
+          "".join(split_for_voice(_no_punct)) == _no_punct, "")
 
     # 2) 导演：场景 + speed 固定 1.00
     late = D.from_state(text="还不睡吗？我这边灯已经关了。", mood=77,

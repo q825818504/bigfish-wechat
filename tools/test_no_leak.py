@@ -16,7 +16,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 
@@ -54,22 +53,6 @@ def section(t: str) -> None:
 def read(rel: str) -> str:
     with open(os.path.join(_ROOT, rel), "r", encoding="utf-8") as f:
         return f.read()
-
-
-def _code_only(src: str) -> str:
-    """剥掉 Python 源码里的注释和字符串，只留真正会执行的部分。"""
-    import io
-    import tokenize
-
-    out = []
-    try:
-        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
-            if tok.type in (tokenize.COMMENT, tokenize.STRING):
-                continue
-            out.append(tok.string)
-    except Exception:
-        return src
-    return " ".join(out)
 
 
 def _strip_py(src: str) -> str:

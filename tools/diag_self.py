@@ -35,7 +35,6 @@ def main() -> int:
 
     running = [a for a in accs if a.get("running")] or accs
 
-    picked = None
     hits = []
     for a in running:
         acc = a.get("account") or ""
@@ -79,7 +78,7 @@ def main() -> int:
             print(f"  {int(m.get('local_id') or 0):>6} {str(sid):>6} "
                   f"{str(sender)[:22]:<22} {str(is_self):>5}  {txt}")
 
-        print(f"\n  -- 各分片 Name2Id 里本机账号 rowid --")
+        print("\n  -- 各分片 Name2Id 里本机账号 rowid --")
         try:
             for rel in db._message_dbs():
                 conn = db._open(rel)

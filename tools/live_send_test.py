@@ -98,7 +98,7 @@ def main() -> int:
     section("4. 发送测试消息")
     stamp = time.strftime("%H:%M:%S")
     text = f"[自检 {stamp}] 这条是大肥鱼发的，收到说明收发都通。"
-    say(f"  目标: 文件传输助手")
+    say("  目标: 文件传输助手")
     say(f"  内容: {text}")
 
     t = time.time()

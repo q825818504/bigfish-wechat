@@ -166,7 +166,10 @@ def test_wiring() -> None:
     _t.sleep(0.8)
     turns = app.conv("wxid_x").turns
     check("历史里对方 3 条", sum(1 for w, _ in turns if w == "小麟") == 3, f"{turns}")
-    check("历史里自己 3 条", sum(1 for w, _ in turns if w == "爸") == 3, f"{turns}")
+    # ⚠ 这里以前写的是 `w == "爸"`，但 `history.append` 存的是「我」——
+    #   追溯链（D-36）要求"她说的每句话"能追回原文，标签必须和写入端一致。
+    #   同一段第 168 行用的是会话名（对方），两行不一致本身就是笔误。
+    check("历史里自己 3 条", sum(1 for w, _ in turns if w == "我") == 3, f"{turns}")
 
 
 def test_say_off() -> None:

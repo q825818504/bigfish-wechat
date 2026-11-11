@@ -99,7 +99,10 @@ def test_config() -> None:
         "cap": 3.5, "total_cap": 12.0, "quote_protect": True,
         "async_confirm": True, "strict_confirm": False,
     }
-    check("默认值齐全", cfg == expect, f"{cfg}")
+    # 只断言**这里列出的**键，不用整表相等：`say` 后来加了 6 个批处理配置
+    # （batch_*），整表断言会让每次加配置都红一次，而那不是回归。
+    missing = {k: (cfg.get(k), v) for k, v in expect.items() if cfg.get(k) != v}
+    check("默认值齐全", not missing, f"不对的项: {missing}")
 
     root = tempfile.mkdtemp()
     try:

@@ -394,7 +394,6 @@ def test_list_models_offline() -> None:
     check("没地址 → 拒绝且说清", (not ok) and "地址" in msg, msg)
 
     # 免 key 也要让请求发出去（OpenRouter 的 /models 是公开的）
-    c2 = cfg_with(channel="openrouter", api_key="")
     check("没 key 不在本地就拦住",
           "先填 API Key" not in R.list_models.__doc__)
     import inspect

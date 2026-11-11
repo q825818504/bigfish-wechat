@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -22,7 +21,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from PySide6.QtCore import QTimer, QUrl  # noqa: E402
+from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import bigfish.desktop as D  # noqa: E402

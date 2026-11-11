@@ -45,7 +45,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from bigfish.ledger import Handle, Ledger, close_enough, normalize  # noqa: E402
+from bigfish.ledger import Ledger, close_enough, normalize  # noqa: E402
 
 PASS = 0
 FAIL = 0

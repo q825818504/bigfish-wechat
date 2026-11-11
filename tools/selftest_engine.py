@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -47,6 +46,11 @@ class Flow:
     def s1(self):
         print("\n1. 未选会话时启动")
         self.b.watching = []
+        # ⚠ 必须连**配置兜底**一起断掉。`start_engine` 里有一段
+        #   "配置里明明有，就别让用户去取消再勾一次"的自动恢复 ——
+        #   只清 self.watching 的话，它会把会话从配置里捡回来，于是
+        #   "没选会话"这一条永远测不到（测试里跑着跑着就 dry 启动了）。
+        self.b._watching_from_config = lambda: []
         r = json.loads(self.b.start_engine())
         ok("返回明确错误", r.get("ok") is not True and "error" in r, f"-> {r}")
         st = json.loads(self.b.get_status())

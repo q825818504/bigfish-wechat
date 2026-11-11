@@ -73,7 +73,6 @@ def main() -> int:
     try:
         from bigfish import desktop as D
         from bigfish import world as W
-        from bigfish.watcher import Incoming  # noqa: F401
     except Exception as exc:          # noqa: BLE001
         skip("补回队列", f"{exc}")
         skip("会话名解析", f"{exc}")

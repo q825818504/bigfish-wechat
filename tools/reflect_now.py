@@ -50,7 +50,6 @@ def _gather(now: float, *, chat: str = "", owner: str = "") -> dict:
     from bigfish import life as L
     from bigfish import memory as M
     from bigfish import mood_judge
-    from bigfish import plan as PLAN
     from bigfish import proactive as P
     from bigfish import vault as V
 

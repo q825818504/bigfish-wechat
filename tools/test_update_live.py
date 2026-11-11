@@ -16,7 +16,6 @@ import hashlib
 import json
 import os
 import sys
-import tempfile
 import time
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")

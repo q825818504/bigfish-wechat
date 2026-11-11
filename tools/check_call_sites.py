@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import ast
 import os
-import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)

@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import os
-import random
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))

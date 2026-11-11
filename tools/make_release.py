@@ -209,7 +209,7 @@ def main() -> int:
     print(f"    标题: {rel['name']}")
     print(f"    标签: {rel['tag_name']}")
     print(f"    地址: {rel['html_url']}")
-    print(f"    附件:")
+    print("    附件:")
     for a in rel.get("assets", []):
         print(f"      {a['name']:34s} {a['size']/1024/1024:7.1f} MB")
 

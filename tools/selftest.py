@@ -271,7 +271,6 @@ def t_group_gate():
     r = db_holder.get("r")
     assert r, "数据库未就绪"
     from bigfish.group_gate import GroupGate
-    from bigfish.wechat import WeChatReader as WR  # noqa
 
     gate = GroupGate(r._db, r._db.wxid, enable=True)
     names = gate.my_names
