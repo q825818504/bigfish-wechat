@@ -7,19 +7,30 @@
 
 ## 推送代码（先看这条）
 
-**这个仓库的 git 凭证已经配好了，`git push` / 建 Release 不会弹窗。**
-
-如果你接手时它又弹窗了（命令卡住、几十秒后超时），跑一次：
+**用这个，别用 `git push`：**
 
 ```bash
-python tools/setup-git-token.py
+python tools/push.py                # 推到当前分支
+python tools/push.py --dry-run      # 只看要推什么
 ```
 
-令牌在 **`D:\大脑\github.txt`**（不在仓库里，也不会进仓库）。
+它把令牌直接放进 `http.extraHeader`，**不碰 credential.helper、不碰 GCM**。
 
-⚠ **不要用 `git credential fill` 去取令牌** —— 它在非交互环境里会挂住等
-交互。需要 token 调 GitHub API 时，直接读那个文件的第一行。
-细节和排错步骤见 `.planning/git-push.md`。
+### 为什么不能直接 `git push`
+
+2026-11-11 实测：`git push origin HEAD` 走了系统凭证管理器，它没交出令牌、
+一直重试到 21 秒超时，报出来是「Failed to connect to github.com:443」——
+**看起来像网络断了，实际是凭证流程卡住**。同一次里把令牌塞进请求头，
+一次就通。这种误判会让人花半小时去查网络。
+
+令牌在 **`D:\大脑\github.txt`** 的第一行（仓库外，不进版本库），
+也可以走环境变量 `BIGFISH_GITHUB_TOKEN`。
+
+⚠ **不要用 `git credential fill` 去取令牌** —— 它在非交互环境里会挂住等交互。
+需要 token 调 GitHub API 时，直接读那个文件的第一行。
+
+旧路径 `python tools/setup-git-token.py` 仍然可用（它配 credential helper），
+但既然出现过上面那次误判，**优先用 `tools/push.py`**。
 
 ---
 

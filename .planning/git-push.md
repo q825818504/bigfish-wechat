@@ -1,6 +1,45 @@
 # 推送代码：为什么不弹窗了
 
 > 2026-11-08 配好。换机器或新 clone 之后要重做一次，见最后一节。
+>
+> **2026-11-11 更新：现在优先用 `python tools/push.py`，不再依赖凭证管理器。**
+
+## 一个更省事的路径（2026-11-11 之后）
+
+```bash
+python tools/push.py            # 推到当前分支
+python tools/push.py --dry-run  # 只看要推什么
+```
+
+它把令牌直接写进 `http.extraHeader Authorization: Basic <base64>`，
+**完全不碰 credential.helper**。
+
+### 为什么加了这条路
+
+2026-11-11 推 0.13.0 时踩了一次：
+
+```
+$ git push origin HEAD
+fatal: unable to access '...': Failed to connect to github.com:443
+       after 21103 ms: Could not connect to server
+```
+
+看起来是网络断了。于是去查：`api.github.com` 200、`baidu.com` 200、
+`ssh git@github.com` 能握手（`Permission denied (publickey)`）——
+全都不像断网。
+
+**真相是凭证管理器没把令牌交出去**，git 一直重试到超时，
+把"认证卡住"报成了"连不上"。同一次里改用：
+
+```bash
+git -c http.extraHeader="Authorization: Basic $(echo -n 'x-access-token:<token>' | base64 -w0)" \
+    push https://github.com/... HEAD:main
+```
+
+一次就通。
+
+**教训**：`Failed to connect ... 443` 这个错误在 Windows + GCM 环境下
+**不能直接当成网络问题**。先试 `tools/push.py`，通了就是凭证的事。
 
 ## 原来的问题
 
