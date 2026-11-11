@@ -369,7 +369,7 @@ class MessageBatcher:
         return None
 
     # ------------------------------------------------------------------
-    def _thaw(self, bucket: _Bucket, now: float) -> None:
+    def _thaw(self, bucket: _Bucket, now: float) -> Optional[str]:
         """判定线程回不来时强制解冻。**必须在 tick/due 的开头调。**
 
         2026-11-11 线上的冻结：21:52:13 判定回来时结论已经作废（对方在判定期间
@@ -379,24 +379,34 @@ class MessageBatcher:
         消息攒着，日志一个字不打，直到 2 分半后用户又发一句才解开。
 
         这是最坏的一类 bug：**没有异常、没有日志、没有超时，只有"她不理我了"**。
-        现在按 `judge_timeout + 2` 兜底：超时就当"判定说完了"，照常封批。
+        现在按 `judge_timeout + 3` 兜底：超时就当"判定说完了"，照常封批。
         卡住的那个线程是 daemon，socket 超时后自己会死，不用管。
+
+        ⚠ 两个数必须错开：
+          · `desktop._judge_one` 用 `join(judge_timeout + 2)` 掐表 = 8 秒；
+          · 这里用 `+ 3` = 9 秒。
+          以前两边都是 8 秒，临界时 `_thaw` 会**抢在判定返回之前**把桶清掉，
+          于是判定白跑一次（`verdict` 找不到桶，`return None`）。消息不丢，
+          但白花一次模型调用，而且日志会显示"没回音"—— 其实是回了。
+          错开 1 秒，让判定永远先有机会。
+
+        返回值：需要打的日志（**不在这里调 `_on_log`**）。本函数在
+        `with self._lock` 内被调，而日志回调是外部代码 —— 它要是慢一点，
+        整把锁就被它攥着。所以让调用方在锁外打。
         """
         if not bucket.awaiting or not bucket.awaiting_at:
-            return
-        grace = max(1.0, float(self.policy.judge_timeout)) + 2.0
+            return None
+        grace = max(1.0, float(self.policy.judge_timeout)) + 3.0
         waited = now - bucket.awaiting_at
         if waited < grace:
-            return
+            return None
         bucket.awaiting = False
         bucket.awaiting_at = 0.0
         # 直接把判定额度用光：这一轮判定已经证明不可靠了，再提交一次只是
         # 再等 8 秒撞同一个墙。让 tick() 下一步就封批。
         bucket.judged = max(bucket.judged + 1,
                             int(self.policy.judge_max_rounds))
-        if self._on_log:
-            self._on_log(
-                f"[倾听] 判定 {waited:.0f} 秒没回音，按说完了处理"
+        return (f"[倾听] 判定 {waited:.0f} 秒没回音，按说完了处理"
                 f"（这条出现就是判定线程卡住了，不该有）")
 
     # ------------------------------------------------------------------
@@ -421,13 +431,16 @@ class MessageBatcher:
         """取所有到期的批次。调用方应每 100~200ms 调一次。"""
         now = self._clock() if now is None else now
         out: List[Batch] = []
+        notes: List[str] = []
         with self._lock:
             for chat_id in list(self._buckets):
                 bucket = self._buckets[chat_id]
                 if not bucket.messages:
                     self._buckets.pop(chat_id, None)
                     continue
-                self._thaw(bucket, now)
+                note = self._thaw(bucket, now)
+                if note:
+                    notes.append(note)
                 if now >= bucket.deadline:
                     # 正在等判定 / 还该问一次模型：别抢封，交给 due() + verdict()
                     if bucket.awaiting or self._should_judge(bucket, now):
@@ -436,6 +449,10 @@ class MessageBatcher:
                     if now - bucket.first_at >= self.policy.max_wait - 1e-6:
                         reason = "max_wait"
                     out.append(self._seal_locked(chat_id, bucket, reason, now))
+        # 日志在锁外打：回调是外部代码，慢一点就会把整把锁攥住。
+        for note in notes:
+            if self._on_log:
+                self._on_log(note)
         return out
 
     # ------------------------------------------------------------------
@@ -448,11 +465,14 @@ class MessageBatcher:
         """
         now = self._clock() if now is None else now
         out: List[Tuple[str, List[BatchMessage]]] = []
+        notes: List[str] = []
         with self._lock:
             for chat_id, bucket in list(self._buckets.items()):
                 if not bucket.messages:
                     continue
-                self._thaw(bucket, now)
+                note = self._thaw(bucket, now)
+                if note:
+                    notes.append(note)
                 if bucket.awaiting:
                     continue
                 if now < bucket.deadline:
@@ -462,6 +482,9 @@ class MessageBatcher:
                 bucket.awaiting = True
                 bucket.awaiting_at = now
                 out.append((chat_id, list(bucket.messages)))
+        for note in notes:
+            if self._on_log:
+                self._on_log(note)
         return out
 
     def verdict(self, chat_id: str, more: bool,

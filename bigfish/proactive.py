@@ -478,7 +478,7 @@ def gate_block_reason(st: ProactiveState, *, now: float, per_day: int,
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 候选：六个源
+# 候选：九个源
 # ══════════════════════════════════════════════════════════════════════
 
 def _recent_lines(chat_id: str, limit: int = 12) -> List[Tuple[str, str]]:
@@ -1032,7 +1032,12 @@ def note_hit(st: ProactiveState) -> None:
     st.miss_streak = 0
 
 def roll_due(st: ProactiveState, now: float) -> bool:
-    """现在该不该掷骰子。40 分钟内掷过就不再掷 —— 中没中都算。"""
+    """现在该不该掷骰子。ROLL_INTERVAL_MINUTES（120 分钟）内掷过就不再掷
+    —— 中没中都算。
+
+    别把它读成 40 分钟：那是 MIN_GAP（两条**发出去**之间至少隔多久），
+    两件事。这里管的是"多久给一次机会"。
+    """
     last = float(getattr(st, "last_roll_at", 0.0) or 0.0)
     if last <= 0:
         return True

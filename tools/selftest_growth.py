@@ -118,7 +118,11 @@ def main() -> int:
     short = '{"plan":[{"at":"9:5","what":"洗衣服","from":"self"}]}'
     items4, err4 = PLAN.parse_plan(short)
     check("个位数时间能补", items4 and items4[0]["at"] == "09:05", str(items4))
-    check("少于两条算不合格", bool(err4) and "至少" in err4, err4)
+    # 注意断言的**语义**，不是文案：少于 PLAN_MIN 只是"偏少"，
+    # 要给出提示，但这一条照样保留（`ensure_yesterday` 还能往上补）。
+    # 以前这里断言 err 里含「至少」，改一次文案就红一次。
+    check("少于两条：有提示但不丢弃",
+          bool(err4) and bool(items4), err4)
 
     bad = ('{"plan":[{"at":"25:00","what":"x"},{"at":"10:00","what":""},'
            '{"at":"11:00","what":"做饭"}]}')

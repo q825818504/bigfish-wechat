@@ -514,12 +514,14 @@ def test_batch_judge() -> None:
     due = b.due()
     check("提交了判定", len(due) == 1, f"{due}")
     check("卡住前 tick 不封批", b.tick() == [], "sealed while awaiting")
-    # judge_timeout + 2 = 8 秒之内还算正常，过了就必须解冻
+    # 解冻阈值 = judge_timeout + 3（比 desktop 那边 join 的 +2 晚一秒，
+    # 让判定永远先有机会返回；两边都写 8 秒时 _thaw 会抢在判定返回前
+    # 把桶清掉，白跑一次模型调用）。
     clock.now = 17.0
-    check("8 秒内不解冻", b.tick() == [], "thawed too early")
-    clock.now = 18.5
+    check("解冻阈值内不解冻（7s < 9s）", b.tick() == [], "thawed too early")
+    clock.now = 19.5
     out = b.tick()
-    check("判定卡死 8 秒后强制封批", len(out) == 1, f"{out}")
+    check("判定卡死后强制封批（9.5s ≥ 9s）", len(out) == 1, f"{out}")
     check("解冻封批一条不丢", out and len(out[0].messages) == 3,
           f"{out and len(out[0].messages)}")
     check("解冻打了一行日志",

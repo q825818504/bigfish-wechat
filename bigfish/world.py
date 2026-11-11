@@ -1301,7 +1301,8 @@ class World:
         if not chat_id:
             return
 
-        # 40 分钟内掷过就不再掷 —— 中没中都算。
+        # ROLL_INTERVAL_MINUTES（120 分钟）内掷过就不再掷 —— 中没中都算。
+        # 别和 MIN_GAP（45 分钟，两条发出去之间）弄混。
         # 放在 collect **之前**：collect 要查一次记忆库（recall），
         # 每分钟白查一次很浪费，而且查完才发现不该掷。
         if not P.roll_due(pro, now):

@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date as _date, timedelta as _timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: 一天排几件事。三条足够看出"有安排"，又不至于像待办清单。
@@ -211,10 +212,15 @@ def build_request(*, day: str, weekday: str, yesterday: List[str],
         parts.append(f"天气：{_clip(weather, 120)}")
 
     y = [x for x in (yesterday or []) if str(x).strip()]
+    # 「昨天」必须写明是哪一天。素材来自生活状态，它可能是空的
+    # （`yesterday_lines` 会挡掉"不是昨天"的那份），而写死「昨天」两个字时，
+    # 模型会把任何素材都当成昨天 —— 包括其实是三天前的那份。
+    y_label = _prev_day(day) or "昨天"
     if y:
-        parts.append("## 昨天\n" + "\n".join(f"- {_clip(x, 80)}" for x in y[:6]))
+        parts.append(f"## 昨天（{y_label}）\n"
+                     + "\n".join(f"- {_clip(x, 80)}" for x in y[:6]))
     else:
-        parts.append("## 昨天\n（没有记录）")
+        parts.append(f"## 昨天（{y_label}）\n（没有记录）")
 
     r = [x for x in (recent or []) if str(x).strip()]
     if r:
@@ -375,7 +381,12 @@ def parse_plan(raw: str) -> Tuple[List[Dict[str, Any]], str]:
     out.sort(key=lambda x: WHEN_ORDER.get(x.get("when") or "", 9))
 
     if len(out) < PLAN_MIN:
-        return out, f"只排了 {len(out)} 条（至少要 {PLAN_MIN}）"
+        # ⚠ 这只是**偏少**，不是失败。返回的 err 给日志看，调用方
+        #   （`world._maybe_plan`）只判 `if not items` —— 以前文案写
+        #   「至少要 2 条」，读代码的人会以为少于 2 条会被丢掉，实际不会。
+        #   宁可 1 条也不要这天没安排：1 条还能被 `ensure_yesterday` 补，
+        #   空列表连补的锚都没有。
+        return out, f"只排了 {len(out)} 条（期望 {PLAN_MIN}，照样用）"
     return out, ""
 
 
@@ -618,6 +629,15 @@ def summarize(items: List[Dict[str, Any]]) -> str:
         f"{x.get('at')} {x.get('what')}" for x in items if isinstance(x, dict))
 
 
+def _prev_day(day: str) -> str:
+    """`2026-11-11` → `2026-11-10`。算不出来返回空串。"""
+    try:
+        return (_date.fromisoformat(str(day or "").strip())
+                - _timedelta(days=1)).isoformat()
+    except Exception:
+        return ""
+
+
 def yesterday_lines(state: Any, *, now: float) -> List[str]:
     """从 life 状态里取"昨天留下的东西"。
 
@@ -628,6 +648,18 @@ def yesterday_lines(state: Any, *, now: float) -> List[str]:
     只取 plan，不取聊天记录。聊天由调用方另外从 history 里取，
     因为 history 是"对话"，plan 是"生活"，混在一起会让她把
     "他说要体检"当成"我昨天去体检"。
+
+    ⚠ **只认真的昨天**：`plan_day` 必须正好是 `day` 的前一天。
+
+      关三天再打开时，`catch_up` 会把 `day` 推进三次，而 `plan` 还是
+      三天前那份（`plan_day` 停在三天前）。以前这里完全不看 `plan_day`，
+      于是"接昨天"接的是三天前的安排；而且那些条目早就被 `expire_plan`
+      标成"（过去了）"，`ensure_yesterday` 一个 seed 都取不到，
+      静默 `return items` —— 「至少一条 from=yesterday」这条规则整条失效，
+      只剩模型自觉。
+
+      这条错得不像 bug，像她"记性不好"：日程看着正常，只是一直不接昨天。
+      而它是 D-36（事实必须有真来源）在生活层唯一的破口。
     """
     out: List[str] = []
     try:
@@ -635,6 +667,11 @@ def yesterday_lines(state: Any, *, now: float) -> List[str]:
                    if isinstance(x, dict)]
     except Exception:
         return out
+    plan_day = str(getattr(state, "plan_day", "") or "")
+    today = str(getattr(state, "day", "") or "")
+    # 两者都非空才校验；老数据缺 plan_day 时保持旧行为（下一次 set_plan 就有）。
+    if plan_day and today and plan_day != _prev_day(today):
+        return []
     for item in entries:
         what = str(item.get("what") or "").strip()
         if not what:

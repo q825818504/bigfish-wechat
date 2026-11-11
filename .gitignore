@@ -105,3 +105,12 @@ data-backup/
 
 # VB-CABLE 解压后的目录进仓库；下载缓存不进
 vendor/vb-cable-pack45.zip
+
+# ── 2026-11-11 补：这些是工具产物，绝不能进版本库 ──
+# `dist_build/` 是 tools/deploy.py 的 PyInstaller 中间目录（几百 MB）。
+# 它以前没被 ignore，一次 `git add -A` 就会把它整个提交上去。
+dist_build/
+# 设计/评估工具的工作目录（截图、mocks、报告），不参与程序运行。
+.impeccable/
+.taste-skill/
+design/*/.review/

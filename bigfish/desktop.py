@@ -883,6 +883,10 @@ class EngineWorker(QThread):
         #: 声音：每个会话的冷却/每日/连续计数
         self._voice_stats: dict = {}
         self._voice_lock = threading.Lock()
+        #: 流水是否已从磁盘载入（懒加载：语音关着的人不该多一次 IO）
+        self._voice_loaded: bool = False
+        #: 最近一次"没出声"的原因，跟着流水一起落盘，用来回答"语音怎么没声"
+        self._voice_skip: dict = {}
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
@@ -1737,32 +1741,105 @@ class EngineWorker(QThread):
 
         return VoiceSettings.from_config(path=CONFIG_PATH)
 
+    def _voice_stats_load(self) -> dict:
+        """从数据根读语音流水（冷却 / 日上限 / 上次为什么没出声）。
+
+        ⚠ **必须落盘。** 以前 `self._voice_stats` 只在内存里，重启就把
+          600 秒冷却和「每天 12 条」一起清零。
+
+          这一条单独看很小，但和语音的失败模式叠起来就变成陷阱：
+          语音有七八个 `return {}` 出口（没声卡 / 切分后为空 / 合成失败 /
+          单段太长 / 气泡太短 / 异常），全部表现为"这一轮改发文字"。
+          于是用户的处置永远是"重启试试"——而重启恰好让上限看起来又好了，
+          把一个稳定复现的问题伪装成偶发。
+        """
+        if getattr(self, "_voice_loaded", False):
+            return self._voice_stats
+        self._voice_loaded = True
+        try:
+            import bigfish.vault as _V
+
+            p = os.path.join(_V.resolve_data_root(), "voice-usage.json")
+            with open(p, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                self._voice_skip = raw.pop("_last_skip", {}) or {}
+                self._voice_stats = {k: v for k, v in raw.items()
+                                     if isinstance(v, dict)}
+        except Exception:
+            # 读不出来等于"今天还没发过语音" —— 比不给发好。
+            pass
+        return self._voice_stats
+
+    def _voice_stats_save(self) -> None:
+        """落盘。调用方一般已持 `_voice_lock`。
+
+        失败只影响"下次重启忘掉配额"，绝不该挡住聊天 —— 所以整段吞掉。
+        """
+        try:
+            import bigfish.vault as _V
+
+            data = dict(self._voice_stats)
+            skip = getattr(self, "_voice_skip", None)
+            if isinstance(skip, dict) and skip:
+                data["_last_skip"] = skip
+            _V._atomic_write_json(
+                os.path.join(_V.resolve_data_root(), "voice-usage.json"), data)
+        except Exception:
+            pass
+
     def _voice_state(self, chat_id: str) -> dict:
         today = time.strftime("%Y-%m-%d")
         with self._voice_lock:
-            st = self._voice_stats.setdefault(chat_id, {
+            stats = self._voice_stats_load()
+            st = stats.setdefault(chat_id, {
                 "day": today, "count": 0, "last": 0.0, "consecutive": 0})
             if st.get("day") != today:
+                # 跨天重置也要落盘，否则第二天一重启又回到昨天的计数。
                 st.update(day=today, count=0, consecutive=0)
+                self._voice_stats_save()
             return dict(st)
 
     def _note_voice_sent(self, chat_id: str) -> None:
         today = time.strftime("%Y-%m-%d")
         with self._voice_lock:
-            st = self._voice_stats.setdefault(chat_id, {
+            stats = self._voice_stats_load()
+            st = stats.setdefault(chat_id, {
                 "day": today, "count": 0, "last": 0.0, "consecutive": 0})
             if st.get("day") != today:
                 st.update(day=today, count=0, consecutive=0)
             st["count"] = int(st.get("count") or 0) + 1
             st["consecutive"] = int(st.get("consecutive") or 0) + 1
             st["last"] = time.time()
+            self._voice_stats_save()
 
     def _note_text_sent(self, chat_id: str) -> None:
         with self._voice_lock:
-            st = self._voice_stats.setdefault(chat_id, {
+            stats = self._voice_stats_load()
+            st = stats.setdefault(chat_id, {
                 "day": time.strftime("%Y-%m-%d"), "count": 0,
                 "last": 0.0, "consecutive": 0})
             st["consecutive"] = 0
+            self._voice_stats_save()
+
+    def _voice_skip(self, reason: str) -> dict:
+        """这一轮不出声（失败或政策）。记下原因，返回空 dict。
+
+        返回值仍然是 `{}`，调用方行为一个字都不变 —— 加这一层只是为了
+        让「为什么没出声」有一个**能查到的状态**，而不是只活在日志里。
+        用户报「语音坏了」时，先看 `<数据根>/voice-usage.json` 的
+        `_last_skip`，再看日志。
+        """
+        try:
+            with self._voice_lock:
+                self._voice_skip = {"at": int(time.time()),
+                                    "reason": str(reason)[:40],
+                                    "chat": str(getattr(self, "_voice_chat", ""))}
+                self._voice_stats_load()
+                self._voice_stats_save()
+        except Exception:
+            pass
+        return {}
 
     def _plan_voice(self, msg, body: str, reply: str, parts: list,
                     *, is_group: bool, is_owner: bool) -> dict:
@@ -1770,6 +1847,8 @@ class EngineWorker(QThread):
 
         返回 {} 表示只发文字。合成失败也返回 {}，文字照发。
         """
+        # 只给 _voice_skip 用：让"上次为什么没出声"能记下是哪个会话。
+        self._voice_chat = getattr(msg, "chat_name", "")
         try:
             from bigfish import afterglow as _AG
             from bigfish import plugins as _P
@@ -1831,7 +1910,7 @@ class EngineWorker(QThread):
             if decision.send_as == "bubble" and not settings.device:
                 self._log("[声] 气泡模式还没选虚拟声卡播放端；这一轮改发文字",
                           "err")
-                return {}
+                return self._voice_skip("没选虚拟声卡")
             from bigfish.voice import VoiceEngine
 
             # 每轮按当前 config 新建：用户在声音页改了 Key/模型，
@@ -1850,7 +1929,7 @@ class EngineWorker(QThread):
             pieces = split_for_voice(decision.text)
             if not pieces:
                 self._log("[声] 切分后没有可念的文本，改发文字", "err")
-                return {}
+                return self._voice_skip("切分后为空")
             results = []
             for idx, piece in enumerate(pieces):
                 r = engine.synthesize_turn(
@@ -1862,16 +1941,16 @@ class EngineWorker(QThread):
                 if not r.ok:
                     self._log(f"[声] 第 {idx + 1}/{len(pieces)} 段合成失败，"
                               f"改发文字：{r.error}", "err")
-                    return {}
+                    return self._voice_skip(f"合成失败:{str(r.error)[:20]}")
                 # 语音上限 60 秒，留 10 秒容错：超过 50 秒一律改文字。
                 if r.duration > 50.0:
                     self._log(f"[声] 第 {idx + 1} 段太长（{r.duration:.1f}s），"
                               "超过 50 秒；这一轮改发文字", "err")
-                    return {}
+                    return self._voice_skip(f"单段{r.duration:.0f}s>50")
                 if decision.send_as == "bubble" and r.duration < 1.0:
                     self._log("[声] 气泡太短，微信可能不认；这一轮改发文字",
                               "err")
-                    return {}
+                    return self._voice_skip("气泡太短")
                 results.append(r)
             res = results[0]
             total = sum(r.duration for r in results)
@@ -1893,7 +1972,7 @@ class EngineWorker(QThread):
             }
         except Exception as exc:  # noqa: BLE001 —— 声音坏了不能影响文字
             self._log(f"[声] 判定/合成异常，改发文字：{exc}", "err")
-            return {}
+            return self._voice_skip(f"异常:{str(exc)[:20]}")
 
     def _send_voice_file(self, msg, path: str) -> bool:
         """音频文件发送。气泡失败时也走这里，避免同一份音频白合成。"""
