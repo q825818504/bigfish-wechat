@@ -1523,8 +1523,11 @@ class EngineWorker(QThread):
                 "- 不要复述对方说过的话，直接回应\n"
                 "- **不要解释自己**：不说「我往上翻了翻」「我记忆没乱」「我以为是」"
                   "这类话，也不要提「记忆」「上下文」「我的回复」「我的逻辑」\n"
-                "- 对方说「你怎么没回我」时，一句就够：「啊？我没看到」或「回错人了」，"
-                  "不要展开解释\n"
+                "- 对方催你回话（「怎么不说话了」「在吗」「你怎么没回我」）时："
+                  "一句带过就行（「刚在想事」「啊我没看到」，别的不许展开），"
+                  "**但紧接着必须接上他前面那半截话** —— 他问「你觉得最自由的是什么」，"
+                  "就答那个。撂一句「在想怎么回你」然后停住，在微信上等于把人晾在那儿，"
+                  "比不回还冷\n"
                 "- 需要更多信息就一句话追问"
                 "\n- **大多数时候正常回**。只有当对方这句实在没什么可接的时候"
                 "（比如只回了个「嗯」「哦」），才只输出一个 `-`，表示这一轮不接"
@@ -3636,7 +3639,7 @@ class EngineWorker(QThread):
             except Exception:
                 pass
             try:
-                batcher.feed(L.BatchMessage(
+                _sealed = batcher.feed(L.BatchMessage(
                     chat_id=msg.chat_id,
                     author=(msg.sender_name or msg.chat_name),
                     text=(msg.text or ""),
@@ -3652,6 +3655,14 @@ class EngineWorker(QThread):
                 ), replied_at=_reply_mono.get(msg.chat_id))
             except Exception as exc:
                 self._log(f"[倾听] 入批失败：{exc}", "err")
+                return
+            # ⚠ feed() 有返回值：一批攒满 max_batch 时会**就地封批**并返回。
+            #   以前这里把返回值丢了 —— 那一批既不在桶里（_seal_locked 已经
+            #   pop 掉），也没交给 handle_batch，于是消息**凭空消失，
+            #   而且一行日志都不打**。攒批器只负责"什么时候封"，
+            #   "封了之后谁来处理"是调用方的事，不能只指望 tick()。
+            if _sealed is not None:
+                handle_batch(_sealed)
 
         def handle_batch(batch) -> None:
             """一批消息 → 合成一条 → 交给原来的 handle。
@@ -3725,25 +3736,60 @@ class EngineWorker(QThread):
         _judge_pool = ThreadPoolExecutor(max_workers=2,
                                          thread_name_prefix="bigfish-judge")
 
+        #: 墙钟兜底多给几秒，让正常超时自己先报（那条日志更有信息量）
+        _JUDGE_WALL_GRACE = 2.0
+
         def _judge_one(chat_id: str, msgs: list) -> None:
-            """问模型「他还有下一句吗」，然后把结论交回攒批器。"""
+            """问模型「他还有下一句吗」，然后把结论交回攒批器。
+
+            ⚠ 必须自己掐表，不能只信 `urlopen(timeout=...)`。
+              那是 socket 级超时，只在每次 recv 时生效：服务端把连接挂着、
+              一直不吐数据时它不一定响。2026-11-11 21:52:16 那次就是
+              这样卡住没回来，`awaiting` 一直 True，这个会话的攒批
+              彻底停摆两分半 —— 用户看到的是「她突然不理我了」，
+              日志里一行解释都没有。
+
+              MessageBatcher._thaw 是第二道兜底（防的是连这里的线程都
+              没起来/被池子排队）。这里是第一道：能把「请求还卡着」
+              和「结论已经丢了」分开，日志也说得清。
+            """
             more, why = False, ""
             try:
                 from bigfish import listen_judge as _LJ
 
                 last = msgs[-1] if msgs else None
-                more, why = _LJ.judge_more(
-                    [{"text": m.text} for m in msgs],
-                    peer=((getattr(last, "author", "") or
-                           getattr(last, "chat_name", "") or "对方")
-                          if last else "对方"),
-                    self_name=getattr(self.soul, "name", "") or "",
-                    timeout=float(batcher.policy.judge_timeout),
-                )
-                if why:
-                    self._log("[倾听] 判定："
-                              + ("他还有下一句" if more else "说完了")
-                              + f"（{why}）", "think")
+                _peer = ((getattr(last, "author", "") or
+                          getattr(last, "chat_name", "") or "对方")
+                         if last else "对方")
+                _box: dict = {}
+
+                def _run() -> None:
+                    try:
+                        _box["r"] = _LJ.judge_more(
+                            [{"text": m.text} for m in msgs],
+                            peer=_peer,
+                            self_name=getattr(self.soul, "name", "") or "",
+                            timeout=float(batcher.policy.judge_timeout),
+                        )
+                    except BaseException as exc:      # noqa: BLE001
+                        _box["e"] = exc
+
+                _th = threading.Thread(target=_run, daemon=True,
+                                       name="bigfish-judge-http")
+                _th.start()
+                _limit = float(batcher.policy.judge_timeout) + _JUDGE_WALL_GRACE
+                _th.join(_limit)
+                if _th.is_alive():
+                    self._log(f"[倾听] 判定请求 {_limit:.0f} 秒没回来，"
+                              f"不再等 —— 按说完了处理", "err")
+                elif "e" in _box:
+                    raise _box["e"]
+                else:
+                    more, why = _box.get("r", (False, ""))
+                    if why:
+                        self._log("[倾听] 判定："
+                                  + ("他还有下一句" if more else "说完了")
+                                  + f"（{why}）", "think")
             except Exception as exc:          # noqa: BLE001
                 # 判定失败一律按"说完了"走：宁可早回一句，也不让人干等
                 self._log(f"[倾听] 判定失败（按说完了处理）：{exc}", "err")

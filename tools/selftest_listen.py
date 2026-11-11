@@ -445,7 +445,11 @@ def test_batch_judge() -> None:
                          judge_max_rounds=9, max_wait=30.0)
     b = L.MessageBatcher(pol, clock=clock, judge=True)
     b.feed(msg("c1", "小明", "在吗", at=0.0))
-    for _t in (6.0, 14.0, 22.0):
+    # 每一轮都等满 judge_extra 再判：deadline = 上次判定时刻 + 8
+    # （14.0 那次其实没到 deadline，due() 不报 —— 结果就是一个假的
+    #  "verdict 但根本没判定在跑"，会把这一批提前封掉。用 14.5 / 23.0 才是
+    #  真的"一直说还有"。）
+    for _t in (6.0, 14.5, 23.0):
         clock.now = _t
         b.due()
         clock.now = _t + 0.5
@@ -458,7 +462,14 @@ def test_batch_judge() -> None:
     check("封批理由 max_wait",
           out and out[0].reason == "max_wait", f"{out and out[0].reason}")
 
-    # 5) 判定期间对方又说话 → 旧结论作废，重新计时
+    # 5) 判定期间对方又说话 → 旧结论作废，但**这一批不能悬着**
+    #
+    #    ⚠ 2026-11-11 改：以前这里断言「旧判定回来被忽略」，也就是
+    #      verdict() 返回 None、桶继续等下一轮。线上那次就是在这条路上静默了
+    #      两分半 —— 每次判定都会在"提交完立刻被新消息作废"的窗口里打转，
+    #      对方连发了四五句，这边一次都没回，日志还显示"判定 说完了"。
+    #      现在：结论过时就直接按"说完了"封批（reason=judged_stale），
+    #      话一句都不丢，只是这一轮不再重新问。
     clock = Clock()
     b = L.MessageBatcher(L.ListenPolicy(batch_min_wait=6.0), clock=clock,
                          judge=True)
@@ -467,10 +478,53 @@ def test_batch_judge() -> None:
     b.due()
     clock.now = 6.2
     b.feed(msg("c1", "小明", "问你个事", at=6.2))
-    check("旧判定回来被忽略", b.verdict("c1", False) is None, "stale verdict accepted")
-    check("两条都还在批里", b.pending().get("c1") == 2, f"{b.pending()}")
-    clock.now = 12.1
-    check("按新消息重新计时", b.tick() == [], "sealed on old deadline")
+    stale = b.verdict("c1", False)
+    check("旧判定回来立刻封批（不丢话）",
+          stale is not None and len(stale.messages) == 2, f"{stale}")
+    check("封批理由 judged_stale",
+          stale is not None and stale.reason == "judged_stale",
+          f"{stale and stale.reason}")
+    check("两条都在这一批里",
+          stale is not None and [m.text for m in stale.messages] == ["在吗", "问你个事"],
+          f"{stale and [m.text for m in stale.messages]}")
+    check("桶已清空", b.pending() == {}, f"{b.pending()}")
+
+    # 6) 从没提交过判定就调 verdict → 安静忽略（调用方的错，不该封别人的批）
+    clock = Clock()
+    b = L.MessageBatcher(L.ListenPolicy(batch_min_wait=6.0), clock=clock,
+                         judge=True)
+    b.feed(msg("c1", "小明", "在吗", at=0.0))
+    clock.now = 10.0
+    check("没判定在跑时 verdict 被忽略", b.verdict("c1", False) is None,
+          "phantom verdict sealed the batch")
+    check("那一批还在", b.pending().get("c1") == 1, f"{b.pending()}")
+
+    # 7) 判定线程卡死（请求发出去了，结论永远不回来）→ 必须自己解冻
+    #
+    #    2026-11-11 线上就是这个：21:52:16 提交的判定卡在本地模型服务上，
+    #    `awaiting` 一直 True，tick() 和 due() 全都绕开这个会话，
+    #    她整整两分半没理人，日志一个字都没打。这条测试守的就是它。
+    logs: list[str] = []
+    clock = Clock()
+    pol = L.ListenPolicy(batch_min_wait=6.0, judge_timeout=6.0)
+    b = L.MessageBatcher(pol, clock=clock, judge=True, on_log=logs.append)
+    for i, t in enumerate((0.0, 1.0, 2.0)):
+        b.feed(msg("c1", "小明", f"第{i}句", at=t, local_id=i + 1))
+    clock.now = 10.0
+    due = b.due()
+    check("提交了判定", len(due) == 1, f"{due}")
+    check("卡住前 tick 不封批", b.tick() == [], "sealed while awaiting")
+    # judge_timeout + 2 = 8 秒之内还算正常，过了就必须解冻
+    clock.now = 17.0
+    check("8 秒内不解冻", b.tick() == [], "thawed too early")
+    clock.now = 18.5
+    out = b.tick()
+    check("判定卡死 8 秒后强制封批", len(out) == 1, f"{out}")
+    check("解冻封批一条不丢", out and len(out[0].messages) == 3,
+          f"{out and len(out[0].messages)}")
+    check("解冻打了一行日志",
+          any("没回音" in s for s in logs), f"{logs}")
+    check("解冻后桶已清空", b.pending() == {}, f"{b.pending()}")
 
     # 6) 最短等待对长消息也生效（用户要的是「底线 6 秒」）
     pol = L.ListenPolicy(batch_min_wait=6.0)

@@ -229,6 +229,14 @@ class _Bucket:
     judged: int = 0
     #: 正在等判定结果（后台线程在跑）。期间 tick 不许抢封。
     awaiting: bool = False
+    #: `awaiting` 是什么时候设上的。**没有它，判定线程回不来就等于永久冻结。**
+    #:
+    #: 2026-11-11 线上：21:52:13 判定返回后这一轮结论作废，21:52:16 又提交了
+    #: 一次判定，然后那个线程卡在本地模型服务的 HTTP 上没回来 ——
+    #: tick() 和 due() 都因为 `bucket.awaiting` 一直跳过这个会话，
+    #: 消息攒在里面，日志一个字都不打。用户看到的是「她突然不理我了」，
+    #: 一直到他 2 分半后再发一句才恢复。现在靠这个时间戳做超时解冻。
+    awaiting_at: float = 0.0
 
 
 class MessageBatcher:
@@ -349,12 +357,47 @@ class MessageBatcher:
             bucket.reason = "mention" if msg.at_bot else ("media" if msg.is_bare_media else "quiet")
             # 对方又说话了：上一轮判定的结论作废，重新计次。
             # 不重置的话，"他说完了" 的旧结论会按住后面新来的消息。
+            #
+            # ⚠ `awaiting_at` **故意不清**：它要留作"刚才真的有判定在跑"的
+            #   证据。verdict() 靠 `awaiting_at > 0` 区分两种 awaiting=False ——
+            #   一种是"结论被新消息作废了，该封批",一种是"调用方乱调，没判定在跑"。
             bucket.awaiting = False
             bucket.judged = 0
 
             if len(bucket.messages) >= self.policy.max_batch:
                 return self._seal_locked(msg.chat_id, bucket, "batch_full", now)
         return None
+
+    # ------------------------------------------------------------------
+    def _thaw(self, bucket: _Bucket, now: float) -> None:
+        """判定线程回不来时强制解冻。**必须在 tick/due 的开头调。**
+
+        2026-11-11 线上的冻结：21:52:13 判定回来时结论已经作废（对方在判定期间
+        又说话了），21:52:16 顺手又提交了一次判定，那次请求卡在本地模型服务上
+        没返回。`awaiting` 一直是 True —— tick() 因为它是 True 而 `continue`，
+        due() 因为它也是 True 而 skip，于是**这个会话彻底静默**：
+        消息攒着，日志一个字不打，直到 2 分半后用户又发一句才解开。
+
+        这是最坏的一类 bug：**没有异常、没有日志、没有超时，只有"她不理我了"**。
+        现在按 `judge_timeout + 2` 兜底：超时就当"判定说完了"，照常封批。
+        卡住的那个线程是 daemon，socket 超时后自己会死，不用管。
+        """
+        if not bucket.awaiting or not bucket.awaiting_at:
+            return
+        grace = max(1.0, float(self.policy.judge_timeout)) + 2.0
+        waited = now - bucket.awaiting_at
+        if waited < grace:
+            return
+        bucket.awaiting = False
+        bucket.awaiting_at = 0.0
+        # 直接把判定额度用光：这一轮判定已经证明不可靠了，再提交一次只是
+        # 再等 8 秒撞同一个墙。让 tick() 下一步就封批。
+        bucket.judged = max(bucket.judged + 1,
+                            int(self.policy.judge_max_rounds))
+        if self._on_log:
+            self._on_log(
+                f"[倾听] 判定 {waited:.0f} 秒没回音，按说完了处理"
+                f"（这条出现就是判定线程卡住了，不该有）")
 
     # ------------------------------------------------------------------
     def _should_judge(self, bucket: _Bucket, now: float) -> bool:
@@ -384,6 +427,7 @@ class MessageBatcher:
                 if not bucket.messages:
                     self._buckets.pop(chat_id, None)
                     continue
+                self._thaw(bucket, now)
                 if now >= bucket.deadline:
                     # 正在等判定 / 还该问一次模型：别抢封，交给 due() + verdict()
                     if bucket.awaiting or self._should_judge(bucket, now):
@@ -406,13 +450,17 @@ class MessageBatcher:
         out: List[Tuple[str, List[BatchMessage]]] = []
         with self._lock:
             for chat_id, bucket in list(self._buckets.items()):
-                if not bucket.messages or bucket.awaiting:
+                if not bucket.messages:
+                    continue
+                self._thaw(bucket, now)
+                if bucket.awaiting:
                     continue
                 if now < bucket.deadline:
                     continue
                 if not self._should_judge(bucket, now):
                     continue
                 bucket.awaiting = True
+                bucket.awaiting_at = now
                 out.append((chat_id, list(bucket.messages)))
         return out
 
@@ -425,10 +473,31 @@ class MessageBatcher:
         now = self._clock() if now is None else now
         with self._lock:
             bucket = self._buckets.get(chat_id)
-            if bucket is None or not bucket.awaiting:
-                # 判定期间对方又说话了（feed 已把 awaiting 清掉）：旧结论作废
+            if bucket is None:
+                return None
+            if not bucket.awaiting:
+                # 判定期间对方又说话了（feed 把 awaiting 清掉）：这一轮的结论
+                # 说的是旧内容，确实不能直接用。
+                #
+                # 以前这里直接 `return None`，什么都没做 —— 于是判定白跑一次，
+                # 桶继续占着，due() 下一轮又提交一次判定。对方连发几句时，
+                # 每一次判定都会在"提交后立刻被新消息作废"的窗口里打转：
+                # 从外面看就是"一直在判定、永远没人回"。2026-11-11 21:52
+                # 那次就是这么静默了 2 分半。
+                #
+                # 现在：既然新消息也已经过了最短等待，就按"说完了"直接封。
+                # 宁可早回一句，也不让这一批悬着。
+                #
+                # `awaiting_at > 0` 是"刚才真有判定在跑"的凭证。为 0 说明
+                # 从来没人提交过判定，这时候调 verdict 是调用方的错，
+                # 安静忽略（自检里有一条专门测这个）。
+                if (bucket.awaiting_at and bucket.messages
+                        and now >= bucket.first_at
+                        + float(self.policy.batch_min_wait)):
+                    return self._seal_locked(chat_id, bucket, "judged_stale", now)
                 return None
             bucket.awaiting = False
+            bucket.awaiting_at = 0.0
             if not more:
                 return self._seal_locked(chat_id, bucket, "judged", now)
 
@@ -465,6 +534,7 @@ class MessageBatcher:
         bucket.reason = "quiet"
         bucket.judged = 0
         bucket.awaiting = False
+        bucket.awaiting_at = 0.0
         self._buckets.pop(chat_id, None)
         return batch
 
