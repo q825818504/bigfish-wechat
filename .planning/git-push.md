@@ -159,3 +159,34 @@ python tools/setup-git-token.py
 
 **教训**：在有窗口的凭证管理器面前，任何"读一次存起来"的思路都不可靠，
 因为第二次调用时它可能改成要交互。要么一开始就走文件，要么别碰。
+
+---
+
+## 2026-11-11 补：两种失败要分清楚
+
+同一天里连着撞了两种，症状都是"推不上去"，处置完全不同：
+
+| 报错 | 真因 | 处置 |
+|---|---|---|
+| `![remote rejected] ... refusing to allow a Personal Access Token to create or update workflow .github/workflows/... without workflow scope` | 令牌有 `repo` 没有 `workflow`。GitHub 不允许这类 token 动 `.github/workflows/` 下的文件 | 去 github.com/settings/tokens 给令牌勾 `workflow`，更新 `D:\大脑\github.txt`。**这一条和网络无关**，别去查代理 |
+| `fatal: unable to access ...: Failed to connect to github.com:443 after 21078 ms` | **真的连不上**。实测 `api.github.com:443` 通（0.1s）而 `github.com:443` 超时（8s）—— 典型域名阻断，不是网络全断 | 走系统代理。本机 `127.0.0.1:7899`（注册表 `ProxyServer` 里那个），`HTTPS_PROXY=http://127.0.0.1:7899 python tools/push.py` |
+
+**怎么快速分辨**：先跑一个 `api.github.com` 的请求。
+
+- 通了 + push 报 workflow → **权限问题**，查令牌 scope；
+- 通了 + push 报 connect → **域名阻断**，挂代理；
+- 都不通 → 网络真断了。
+
+`tools/push.py` 自己会分开报这两种（"连不上 GitHub" vs 打印 remote rejected），
+所以**先看它的诊断，再动手**，不要一上来就怀疑凭证 —— 那是 11-11 早些时候
+踩过的坑（凭证问题也会报成 connect error，但那次是凭证管理器卡住，而这次
+把令牌放进请求头之后仍然 connect failed，才是真的网络）。
+
+### 现状备忘
+
+2026-11-11 22:59 推 `72d7bf8` 到 `origin/main` 成功，走的是
+`HTTPS_PROXY=http://127.0.0.1:7899`。
+
+`.github/workflows/ci.yml` **还在工作区、没进仓库** —— 等令牌补上
+`workflow` 权限后再单独提交这一个文件。`tools/check.py` 已经进了仓库，
+手动跑完全可用。
