@@ -47,7 +47,6 @@ import os
 import queue
 import random
 import threading
-from datetime import datetime
 from typing import Any, Dict, Optional
 
 from bigfish import proactive as P
@@ -74,6 +73,68 @@ GOODNIGHT_QUIET = 40 * 60
 JOURNAL_BEFORE = 20 * 60
 #: 日记：睡后多久还允许补写（秒）。她可能提前困倒，也可能那时程序没开。
 JOURNAL_GRACE = 2 * 3600
+
+
+def _fact_items(result: Any) -> list:
+    """把 list_facts 的返回统一成 list[dict]。
+
+    ⚠ 它返回的是 **`{"items": [...], "total": n}`**，不是 list。
+      以前复盘和日记那里直接 `for row in rows` —— 遍历到的是字典的键
+      （"items"、"total" 两个字符串），`isinstance(row, dict)` 永远 False。
+      于是「## 今天说到的事」这一段**从上线起就一直是空的**：模型只看得到
+      对话和心情，看不到她记得的事实，`changed_view` 自然写不出来。
+      实测（2026-11-10）soul.selfNotes 至今 0 条自动条目、history 为空。
+    """
+    if isinstance(result, dict):
+        items = result.get("items")
+        return [x for x in items if isinstance(x, dict)] if isinstance(items, list) else []
+    if isinstance(result, list):
+        return [x for x in result if isinstance(x, dict)]
+    return []
+
+
+def _fact_line(row: Dict[str, Any]) -> str:
+    """一条事实写成一行人话。
+
+    ⚠ 字段是 `predicate` / `object`，不是 `text` / `statement`
+      （那是更早的叫法，`_row_to_item` 早就不产出它们了）。
+    """
+    pred = str(row.get("predicate") or "").strip()
+    obj = str(row.get("object") or "").strip()
+    if not obj:
+        return ""
+    return f"{pred}：{obj}" if pred else obj
+
+
+def re_first(body: str) -> str:
+    """取正文第一句（到句号/问号/叹号为止）。
+
+    单独一个函数：以前内联成 `[^。！？]{6,}`，那个 {6,} 要求太严 ——
+    首句只有五个字（"睡到十一点。"）时会匹配失败，退化成"取前 40 字"，
+    把后面几句拼进来。
+    """
+    import re as _re
+
+    text = str(body or "").strip()
+    if not text:
+        return ""
+    first_line = text.splitlines()[0] if text.splitlines() else ""
+    m = _re.match("[^\u3002\uff01\uff1f]{1,}", first_line)
+    return (m.group(0) if m else first_line).strip()
+
+
+def _meet_suffix(item: Any) -> str:
+    """日程条目上的「碰见谁」，写成一句括号。"""
+    if not isinstance(item, dict):
+        return ""
+    meet = item.get("meet")
+    if not isinstance(meet, dict):
+        return ""
+    who = str(meet.get("who") or "").strip()
+    if not who:
+        return ""
+    text = str(meet.get("text") or "").strip()
+    return f"（碰见{who}{'，' + text if text else ''}）"
 
 
 class World:
@@ -162,9 +223,52 @@ class World:
             try:
                 from bigfish import mood_judge
 
-                mood_judge.decay_only()
+                mood_judge.decay_only(baseline=self._mood_baseline())
             except Exception:
                 pass
+
+    def _mood_baseline(self) -> Optional[float]:
+        """今天的情绪底子：睡眠债 + 精力 + 身体 + 天气。
+
+        以前心情永远往 70 衰减，所以"实时心情"在多数时候显示的是余数。
+        底子低的时候一件小事就够烦，底子高的时候同样的事笑笑就过了 ——
+        事件仍然由 judge 加在上面，这里只决定地基。
+
+        任何一块取不到都给中性值：底子算错比没有底子更糟。
+        """
+        try:
+            from bigfish import mood_judge
+
+            life = self._life()
+            if life is None:
+                return None
+            body = ""
+            try:
+                import time as _t
+
+                from bigfish import life as _L
+
+                body = _L.body_now(life, _t.time())
+            except Exception:
+                body = ""
+            weather = ""
+            try:
+                from bigfish import senses
+
+                # ⚠ 这里以前写的是 `time.time()`，而 world 只 `import queue/random/
+                #   threading`，没有 `import time` —— NameError 被下面的 except
+                #   吞成"没有天气"，底子少算一档，而且永远不会报错。
+                #   用函数内已经拿到的 `_t`（import time as _t）。
+                weather = senses.cached_weather(float(_t.time())) or ""
+            except Exception:
+                weather = ""
+            return mood_judge.baseline_of(
+                sleep_debt=getattr(life, "sleep_debt", 0.0),
+                energy=getattr(life, "energy", 70.0),
+                discomfort=body,
+                weather=weather)
+        except Exception:
+            return None
 
     def _refresh_senses(self) -> None:
         """后台刷天气缓存（p1-7）。失败只记一行，不重试。"""
@@ -257,11 +361,26 @@ class World:
         materials["day"] = day
 
         materials["plan"] = [
-            f"{x.get('at')} {x.get('what')}"
+            f"{x.get('at')} {x.get('what')}{_meet_suffix(x)}"
             + ("（过去了）" if x.get("done_by") == "elapsed"
                else "（做完了）" if x.get("done") else "")
             for x in (getattr(self._life(), "plan", None) or [])
             if isinstance(x, dict)]
+
+        # 今天碰见的人。她生活里的那几个熟人 —— 没有这一项，
+        # 复盘就只能写"我和他"，她的世界永远只有一个人。
+        materials["met"] = []
+        try:
+            from bigfish import neighbors as NB
+
+            materials["met"] = NB.meet_lines(
+                getattr(self._life(), "plan", None) or [])
+            # 她生活里那几个**固定**的人是谁 —— 只在日记/复盘素材里给，
+            # 不进每轮提示词（那会挤掉记忆和对话）。有这一段，她写
+            # "碰见卖鱼的"时才知道那是个什么人，而不是一个空名字。
+            materials["cast"] = NB.cast_block()
+        except Exception:
+            pass
 
         # 她手头在做什么 + 今天做过的事。日记里写到"我当时在……"时有据可依 ——
         # 不注入的话，模型会自己补一个场景（实测补过"坐在沙发上"、"煮了面"），
@@ -303,12 +422,33 @@ class World:
         if db:
             try:
                 bank = M._default_bank(db) or "dafeiyu"
-                rows = M.list_facts(db, bank, status="active", limit=8)
-                for row in rows or []:
-                    if isinstance(row, dict):
-                        text = row.get("text") or row.get("statement") or ""
-                        if str(text).strip():
-                            facts.append(str(text).strip())
+                # ⚠ 两层都要做，只传 owner 是**不够的**。
+                #
+                #   第一层：传 owner + tier（memory 的规矩）。
+                #   第二层：自己再收一刀 —— `scope_filter` 在 strict_owner=False
+                #   时产出 `(owner=A OR visibility IN (...))`，而
+                #   `visible_visibilities(TIER_OWNER)` 是**全部三种**，
+                #   于是 OR 那一半恒真，等于全库。实测：用 A 的身份查，
+                #   B 的私密照样返回。
+                #   `facts_for_prompt` 早就补了这一刀，这里以前没有。
+                _own = str(owner or "")
+                if _own:
+                    _mine = {_own}
+                    try:
+                        _mine |= set(M.owner_persons(db, _own))
+                    except Exception:
+                        pass
+                    rows = M.list_facts(
+                        db, bank, status="active", limit=24,
+                        owner=_own, tier=M.TIER_OWNER)
+                    for row in _fact_items(rows):
+                        if str(row.get("owner") or "") not in _mine:
+                            continue
+                        text = _fact_line(row)
+                        if text:
+                            facts.append(text)
+                        if len(facts) >= 8:
+                            break
             except Exception:
                 facts = []
         materials["facts"] = facts
@@ -460,6 +600,17 @@ class World:
                     return
                 finish()
                 self._log(f"[日志] {chars} 字 → {os.path.basename(path)}", "in")
+                # 日记写完之后回一次记忆：她那天的日记摘一句进 facts。
+                #
+                # 这一步是「记忆和生活咬合」的关键。在此之前，日记只躺在
+                # 磁盘上给人看（journal.py 明写「不进提示词」），
+                # 记忆库里只有"他说过什么"，没有"她自己过成了什么样"。
+                # 回流之后，"翻旧日记"变成"检索到自己的一句话" ——
+                # 她这才有可能**误解过去的自己**。
+                try:
+                    self._remember_diary(day, text, db=db, owner=owner)
+                except Exception as exc:
+                    self._log(f"[日志] 回记忆失败（不影响日记）：{exc}", "")
             except Exception as exc:
                 self._log(f"[日志] 失败（今天不写）：{exc}", "")
                 finish()
@@ -681,6 +832,66 @@ class World:
         threading.Thread(target=work, daemon=True,
                          name="bf-goodnight").start()
 
+    def _remember_diary(self, day: str, text: str, *, db: str,
+                        owner: str) -> None:
+        """把当天日记的一句话摘进记忆库。
+
+        为什么只摘一句、不是全文：
+          日记是给人和界面看的（`journal.py` 明写不进提示词），
+          全文进库会挤掉对话素材。而一句话摘要刚好够她在很久以后
+          被问到那天时想起"我那天是这么过的"。
+          作者自己在 `journal.py:52-53` 留的就是这个方向。
+
+        为什么 `verify_sources=False`：
+          这条事实的来源是**磁盘上那篇日记**，不是某条对话片段 ——
+          `_verify_sources` 只认 chunks 表，认不了日记文件。
+          D-36 要防的是"凭空编一条事实"，而这里是从已落盘的原文里
+          摘第一句；摘不出来就一个字都不写。
+        """
+        import re as _re
+
+        from bigfish import memory as M
+
+        if not db:
+            return
+        body = str(text or "").strip()
+        if not body:
+            return
+        body = _re.sub(r"\A#.*\n", "", body)          # 去掉 `# 2026-11-09`
+        body = _re.sub(r"<!--.*?-->", "", body, flags=_re.S).strip()
+        if not body:
+            return
+        # 第一句。⚠ 以前是 `{6,}` + `[:40]` 硬切，两个毛病：
+        #   · 首句不足 6 字（"睡到十一点。"）会退化成"前 40 字"，把后面
+        #     好几句话拼在一起，已经不是"那一天"了
+        #   · 首句超过 40 字会切在词中间，而且没有省略号，读着像被截断的日志
+        _first = (re_first(body) or "").strip()
+        if not _first:
+            return
+        brief = _first if len(_first) <= 40 else _first[:38] + "…"
+        if len(brief) < 4:
+            return
+            return
+        # ⚠ anchor 必须是**这一天**。以前 anchor 留空 + predicate 固定，
+        #   `_find_same` 按 (owner, anchor, predicate) 判定"同一件事"，
+        #   于是第二天的日记会把第一天的当成"纠正"给 supersede 掉 ——
+        #   实测写两天只剩一条 active。用日期当 anchor，一天一条。
+        ok, _fid, why = M.remember(
+            db, M._default_bank(db) or "dafeiyu",
+            M.Fact(predicate="那天", object=brief, owner=owner or "",
+                   # ⚠ 必须是**完整日期**。用 MM-DD 的话 2026-11-09 和
+                   #   2027-11-09 会被 `_find_same` 当成同一条，今年的日记
+                   #   就把去年那篇 supersede 掉；而 superseded 的行既不进
+                   #   注入也查不到 lineage，去年那篇会静默消失。
+                   anchor=str(day or "")[:10],
+                   confidence=0.7,                   # 她自己写的，不是猜的
+                   evidence=f"journal:{day}"[:200]),
+            verify_sources=False)
+        if not ok:
+            self._log(f"[日志] 摘要没进记忆（{why}）", "")
+        elif _fid:
+            self._log(f"[日志] 摘要进了记忆：{brief[:20]}…", "in")
+
     def _maybe_plan(self, now: float) -> None:
         """醒来后给今天排两三件事（p1-4）。
 
@@ -733,13 +944,26 @@ class World:
                         from bigfish import memory as M
 
                         bank = M._default_bank(db) or "dafeiyu"
-                        rows = M.list_facts(db, bank, status="active", limit=8)
-                        for row in rows or []:
-                            if isinstance(row, dict):
-                                text = (row.get("text")
-                                        or row.get("statement") or "")
-                                if str(text).strip():
-                                    facts.append(str(text).strip())
+                        # 同 _gather_day_materials：owner 过滤要再收一刀，
+                        # 否则 tier=owner 的 visibility 分支让 owner 条件恒真。
+                        _own = str(getattr(self.e, "owner_id", "") or "")
+                        if _own:
+                            _mine = {_own}
+                            try:
+                                _mine |= set(M.owner_persons(db, _own))
+                            except Exception:
+                                pass
+                            rows = M.list_facts(
+                                db, bank, status="active", limit=24,
+                                owner=_own, tier=M.TIER_OWNER)
+                            for row in _fact_items(rows):
+                                if str(row.get("owner") or "") not in _mine:
+                                    continue
+                                text = _fact_line(row)
+                                if text:
+                                    facts.append(text)
+                                if len(facts) >= 8:
+                                    break
                     except Exception:
                         facts = []
 
@@ -753,12 +977,28 @@ class World:
 
                 import datetime as _dt
 
+                # 她自己会想到的：身上、昨天碰见的人、天气、一直在做的事。
+                # 这一天的底色是她的处境，不只是他昨天说了什么。
+                self_lines = []
+                try:
+                    from bigfish import neighbors as NB
+
+                    self_lines = PLAN.self_material(
+                        body=L.body_now(life, now),
+                        met=NB.meet_lines(getattr(life, "plan", None) or []),
+                        weather=weather,
+                        trace=[str(x.get("doing") or "")
+                               for x in (getattr(life, "day_trace", None) or [])
+                               if isinstance(x, dict)])
+                except Exception:
+                    self_lines = []
+
                 when = _dt.datetime.fromtimestamp(now)
                 weekday = "周" + "一二三四五六日"[when.weekday()]
                 _sys, user = PLAN.build_request(
                     day=when.strftime("%Y-%m-%d"), weekday=weekday,
                     yesterday=yesterday, facts=facts, recent=recent,
-                    weather=weather)
+                    weather=weather, self_lines=self_lines)
                 raw = call_model(mcfg, _sys, user)
                 items, err = PLAN.parse_plan(raw)
                 if not items:
@@ -766,6 +1006,24 @@ class World:
                               "think")
                     return
                 items = PLAN.ensure_yesterday(items, yesterday)
+                # 模型只给"时段 + 做什么"，落点由代码算：
+                # 先补因果（要做饭就得先有菜），再排进今天的空档
+                # （避开饭点、洗漱、起床段，两条之间留走动时间）。
+                items = PLAN.with_prerequisites(items)
+                wake = float(getattr(life, "just_woke_at", 0) or 0)
+                items = PLAN.layout(items, wake_at=wake,
+                                    bedtime=float(getattr(life, "bedtime", 0) or 0))
+                if not items:
+                    self._log("[日程] 今天排不进任何空档，用旧的", "think")
+                    return
+                # 给日程挂「碰见谁」—— 她的一天里得有不认识她的人。
+                # 挂了才有"卖鱼的今天不在"这种没有信息量、但真实的东西。
+                try:
+                    from bigfish import neighbors as NB
+
+                    items = NB.attach(items, day=day)
+                except Exception as exc:
+                    self._log(f"[日程] 碰见谁没挂上（无妨）：{exc}", "")
                 L.set_plan(life, items, day=day)
                 L.save(life, force=True)
                 self._log(f"[日程] 今天：{PLAN.summarize(items)}", "in")
@@ -799,14 +1057,50 @@ class World:
                     self._react_neglect(pro, now)
             except Exception as exc:
                 self._log(f"[主动] 结算未回失败：{exc}", "")
-            try:
-                self._maybe_proactive(now)
-            except Exception as exc:
-                self._log(f"[主动] 判定异常：{exc}", "err")
+            # 她刚说了"我先去忙了" → 这一段就别再主动开口了。
+            # 说完了还主动找他，就是在打自己的脸。
+            if not self._stopped_by_farewell(now):
+                try:
+                    self._maybe_proactive(now)
+                except Exception as exc:
+                    self._log(f"[主动] 判定异常：{exc}", "err")
             try:
                 self._maybe_followup(now)
             except Exception as exc:
                 self._log(f"[主动] 追问判定异常：{exc}", "err")
+
+    def _stopped_by_farewell(self, now: float) -> bool:
+        """她最后一句是不是收尾语（而且对方没再接话）。
+
+        为什么要单独认这一类：`-`（这一轮不接）只表示"这句不回"，
+        下一轮对方再来她照样说话。而"我先去忙了"是**结束这段对话** ——
+        说完了再主动找他，就是在打自己的脸。
+
+        为什么用"谁最后说话"而不是时间窗口：
+          `history` 里没有时间戳，硬记一个窗口就要多一处状态、多一处会漂。
+          而"她说了去忙、之后没人再说"这件事本身已经表达了状态 ——
+          对方一开口，条件自动不成立。
+        """
+        # 太久没互动的话，昨天那句收尾不算数
+        if self.last_peer_at and now - self.last_peer_at > 6 * 3600:
+            return False
+        try:
+            chat_id, _name = self.owner_chat()
+        except Exception:
+            return False
+        if not chat_id:
+            return False
+        try:
+            from bigfish import history
+            from bigfish import policy
+
+            rows = history.load(chat_id, limit=6) or []
+            if not rows:
+                return False
+            who, text = rows[-1][0], rows[-1][1]
+        except Exception:
+            return False
+        return str(who) == "我" and policy.is_farewell(text)
 
     def _react_neglect(self, pro, now: float) -> int:
         """把"发了没人回"变成一次真实的情绪波动（p0-1）。

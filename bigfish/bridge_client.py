@@ -16,9 +16,9 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from bigfish.paths import app_root, res_root  # noqa: E402
+from bigfish.paths import res_root  # noqa: E402
 
 _HERE = os.path.join(res_root(), "bigfish")
 _ROOT = res_root()
@@ -298,15 +298,6 @@ def _default_data_root() -> str:
     from bigfish.vault import resolve_data_root
 
     return resolve_data_root()
-
-
-def _scope_dir_of(root: str, scope: str = "") -> Optional[str]:
-    """当前范围的目录。优先按 scope.json 推，推不出再扫。"""
-    _ = scope      # 老参数，新布局没有范围概念
-    from bigfish.vault import legacy_layout
-
-    lg = legacy_layout(root)
-    return (lg or {}).get("dir") or None
 
 
 def _pick_scope_dir(root: str) -> Optional[str]:

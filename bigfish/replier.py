@@ -45,9 +45,7 @@ import urllib.request
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Tuple
 
-from bigfish.bridge_client import Context, load_context
 from bigfish import providers
-from bigfish.soul import Soul
 
 # 老的默认值。只在没有任何配置时兜底 —— 现在默认走 deepseek 预设，
 # 因为「本机 Magpie 网关」这个默认值对别人等于不可用。

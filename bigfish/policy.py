@@ -79,6 +79,11 @@ class ResponsePolicy:
     must_reply_after: int
     #: 进 system 的一句倾向描述。空串 = 不加这一段。
     tone_line: str = ""
+    #: 「这一轮可以没听清」的许可。空串 = 这一轮她得好好听。
+    #:
+    #: 单独一个字段、不混进 tone_line：tone_line 说的是"怎么说"，
+    #: 这一条说的是"可以不回答哪个问题"—— 两件事，混在一起她会当成语气修饰。
+    attention_line: str = ""
     #: 日志/快照用的一句话，说清为什么是这个预算。
     reason: str = ""
 
@@ -126,7 +131,8 @@ def _hour(now: Optional[float]) -> int:
         return -1
 
 
-def tone_of(mood: float, dims: Optional[Dict[str, Any]]) -> str:
+def tone_of(mood: float, dims: Optional[Dict[str, Any]],
+            energy: Any = None) -> str:
     """一句定性的表达倾向。
 
     刻意**不写情绪词**（"难过""开心"），只写怎么说。
@@ -143,6 +149,20 @@ def tone_of(mood: float, dims: Optional[Dict[str, Any]]) -> str:
     sweet = _dim(dims, "sweet")
     happy = _dim(dims, "happy")
     heartache = _dim(dims, "heartache")
+
+    # ── 精力先于心情 ──────────────────────────────────────────
+    #
+    # 心情再好，累到 20 分也说不了多少。以前这个函数**根本不收 energy**，
+    # 于是"累"只有数字（条数、字数），没有一句定性的话 ——
+    # 她永远看起来精神正常，只是话少。这是"身体只影响音量旋钮"最明显的一处。
+    try:
+        _e = float(energy) if energy is not None else NEUTRAL_ENERGY
+    except (TypeError, ValueError):
+        _e = NEUTRAL_ENERGY
+    if _e < 20:
+        return "你现在是真的乏了。能一句说完就别分两条，也不用把话说圆。"
+    if _e < 35:
+        return "有点乏。句子短一点，不用每句都接满。"
 
     if mood < 35:
         # 只写"能说多少"，"可以不接"交给 silence_hint ——
@@ -248,9 +268,86 @@ def response_policy(
         max_chars=chars,
         silence_bias=round(bias, 3),
         must_reply_after=after,
-        tone_line=tone_of(m, dims),
+        tone_line=tone_of(m, dims, energy=e),
+        attention_line=attention_hint(energy=e, hour=hour, recent_replies=_rr),
         reason=why,
     )
+
+
+#: 收尾语。她说了这些，这段对话就该停下来。
+#:
+#: 为什么要单独认这一类：`SILENT_MARKS` 只表示"这一轮不接"，
+#: 下一轮对方再来她照样回。而"我先去忙了"是**结束这段对话** ——
+#: 说完了还主动找他，就是在打自己的脸。
+#:
+#: 判据故意宽：宁可少主动一次，也不要她刚说完"去忙"又来找你。
+FAREWELL_MARKS = (
+    "我先去忙", "去忙了", "先这样", "不聊了", "先去睡", "先睡了",
+    "去睡了", "我去睡", "睡了睡了", "明天说", "明天见", "改天聊",
+    "我去洗澡", "先去洗", "回头说", "先撤了", "先不聊", "我去干活",
+    "先忙去了", "晚安",
+)
+
+
+def is_farewell(text: Any) -> bool:
+    """这句是不是收尾（"我先去忙了"）。
+
+    问句不算 —— "你睡了？"是关心，不是告别。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return False
+    if s.endswith(("？", "?")):
+        return False
+    return any(m in s for m in FAREWELL_MARKS)
+
+
+def attention_hint(*, energy: float, hour: int, recent_replies: int) -> str:
+    """这一轮她「可以没听清」的许可。空串 = 这一轮得好好听。
+
+    为什么需要这一条：
+
+        `listen_judge.py` 的整个系统提示只问一件事 —— 「对方这串消息
+        **说完了没有**」，从来不问"说的是什么"。而 `plugins/say.py` 又写死
+        「每句话都要说完整。不要停在『还得对着那领导』这种半句上」。
+        两条合起来就是：她**永远切题、永远完整**。这是整套系统里最像 AI
+        的地方 —— 不是语气，不是人设，是她从不失手。
+
+    为什么写成「许可」而不是「状态」：
+
+        如果告诉她"你现在很累所以容易听错"，她会把累演给你看
+        （`tone_of` 的注释里已经踩过这个坑：写"你有点难过"她就演难过）。
+        写成"可以不回答那个问题"只是放开了动作，没有加戏。
+
+    什么时候给（都是"本来就不该指望她状态好"的时候）：
+
+        energy < 20 或 1~5 点   → 强许可：干脆别答那个问题
+        energy < 30 或 0~6 点   → 弱许可：答你确定的那半句
+        recent_replies >= 4     → 强许可：连着回了好几轮，会接串
+        recent_replies >= 2     → 弱许可
+
+    一个从不走神的人假，一个天天走神的人是傻子 —— 所以只放开，
+    不给"我记错了"之类的负面情绪。
+    """
+    try:
+        e = float(energy)
+    except (TypeError, ValueError):
+        e = NEUTRAL_ENERGY
+    try:
+        rr = max(0, int(recent_replies or 0))
+    except (TypeError, ValueError):
+        rr = 0
+    try:
+        h = int(hour)
+    except (TypeError, ValueError):
+        h = 12
+
+    if e < 20 or 1 <= h < 5 or rr >= 4:
+        return ("这一轮你可能没太看清他上一条到底问了什么。可以不回答那个问题，"
+                "只接你看到的那半句 —— 说半句比硬凑一个完整回答更像真的。")
+    if e < 30 or 0 <= h < 6 or rr >= 2:
+        return "他上一条你要是不太确定，就接你确定的那半句，别为了答全硬凑。"
+    return ""
 
 
 def silence_hint(bias: float) -> str:

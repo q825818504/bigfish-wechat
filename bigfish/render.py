@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 # 微信 4.x 的 local_type 复合码：高 32 位是子类型，低 32 位是主类型。
 # 这里只用到基础表；复合码由调用方先拆过再传进来。

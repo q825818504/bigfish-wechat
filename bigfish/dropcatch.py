@@ -47,7 +47,6 @@ from __future__ import annotations
 import ctypes
 import json
 import os
-import sys
 import time
 from ctypes import wintypes
 

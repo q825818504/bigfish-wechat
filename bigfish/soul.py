@@ -22,13 +22,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from bigfish.vault import (
-    DEFAULT_ADDRESS,
     TRAIT_DOC,
     default_soul,
     existing_path,
-    legacy_layout,
-    normalize_soul,
-    read_soul_file,
     resolve_data_root,
     soul_path,
     trait_sentence,

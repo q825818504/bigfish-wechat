@@ -66,7 +66,7 @@ from __future__ import annotations
 
 import os
 import re
-import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 #: 目录名（在数据根下）
@@ -84,28 +84,74 @@ MIN_TALK = 0
 
 SYSTEM = """你在写日记。用第一人称，写给以后的自己看。
 
-要求（按重要性）：
-1. **不限字数**。想写长就写长，想写两句就写两句。不要为了"简洁"把事砍掉。
-2. 写今天**具体发生了什么**：谁说了什么、你当时怎么想、哪句话让你卡了一下。
+## 先判断今天属于哪一种
+
+**不限字数**，但也不等于每篇都写长。先分档：
+
+- **允许空白**：什么也没发生，就写短。三五行，八十来字，交代今天怎么过去的就够。
+- **有一两件小事**：两三百字。一件写细，别的带过。
+- **有压在心头的事**：可以写到五六百甚至更多，但**七成篇幅给那一件事**，
+  前面一整天压成两三句。
+
+判据只有一个：今天有没有一件事，是以后还会想起来的。没有，就不是重日子。
+**不许为了让篇幅像样而凑。** 空日子写得短，比写得满可信。
+
+## 怎么写
+
+1. 写今天**具体发生了什么**：谁说了什么、你当时怎么想、哪句话让你卡了一下。
    细节比结论重要。"他说加班到十点，我问吃没吃"比"今天聊了工作"好。
-3. **允许空白**。今天什么也没发生，就写"今天很安静，没人找我，我把那本书
-   翻了翻"。不要为了凑字数编事，也不要硬找意义 —— 一个人大多数日子就是平淡的。
-4. **绝对不许编对话和对方的行为。** 材料里没有的话，一个字都不要写
-   "他说……""他今天……"。你没看到的事就是没发生。
-   哪怕日记因此很短，也不能补一句假话。
-5. 可以写自己的动作和想法，但**动作只能用材料里的**（今天做过的事、
-   手头在做的事、今天的安排）。**没写进材料的日常，就当它没发生。**
-   材料里没有"煮面"，就不要写"我煮了面"；材料里没有楼下有人，
-   就不要写楼下有人。哪怕日记因此变短。
-6. **材料少的时候，日记就该短。** 两三句话也是一篇日记。
-   不要为了让篇幅像样而补细节 —— 那些细节全是假的。
-7. **不要总结**。不要写"今天让我明白了……""总的来说……"这种段落。
-   日记不是周报。
-8. **不要列点**、不要 Markdown 标题、不要加粗。就是一段一段的话。
-9. 不要对读者说话（不要"你呢""希望你"），这篇只写给你自己。
-10. 不要以"晚安"结尾，不要写"今天就到这里"。写到没话说就停。
+2. 空日子靠「少」，不靠「补」。能摆出来的只有材料里这几样：今天的时间线
+   （几点做过什么）、日程里标了「（过去了）」的事（那是今天没做成的）、
+   手头在做什么、天气、心情那一条。摆完就够——
+   **不要为了让空白显得有内容，添一件材料里没有的动作。**
+   「去厨房接了水」「把手机扣在桌上」这类读着像真的，但材料里没有就是假的。
+3. 有重的事那天，写**停顿**，不写结论。你没想明白的地方就停在那儿。
+   对方的话要短、要断——"是啊""不过""还是得干活"，碎句子比完整的安慰真。
+4. 结尾**被什么打断**：汤开了、困了、他那边还没打字。写到没话说就停，
+   不要收成漂亮的圆。十天里有一句像样的话就够了，每天都有那是散文集。
+5. **同一句话不许出现第二次。** 心里搁着一件事可以反复回到它，但每次回来的
+   说法要不一样。第二遍出现必须带新东西（新动作、新时间、新对象）——
+   带不来就删掉。同义反复也算重复。
+6. **避开最近几篇写过的东西。** 材料里给了最近几篇的开头，先读再动笔：
+   同一件生活道具（汤、快递、看剧、整理衣服）三天内不要当第二次重心；
+   天气不必每天都提；开头句式也不要重复。
+7. **日期和事实要对得上。** 材料里有今天是星期几、天气是什么。别写出自己
+   打自己的话——比如说明天要上班，又说还有一天假。
+
+## 不许做的
+
+- **日记里的每个动作、每件东西，都要能在今天的材料里找到出处。** 找不到的
+  一个字都不写——哪怕那个细节很像真的，哪怕少了它日记会变短。
+- **不许编「对方」的对话和行为。** 材料里没有的话，一个字都不要写
+  "他说……""他今天……"。哪怕日记因此很短，也不能补一句假话。
+- **材料里「今天碰见的人」可以写一句。** 卖鱼的、楼下老太太这类熟人，
+  你只写你看到的那一眼（他在不在、说了句什么、摊子上什么样子），
+  **不替他们编对话，也不替他们解释**（"他大概是不容易"这种不要写）。
+  材料里没给你的人，当他不存在。
+- 动作只能用材料里的（今天做过的事、手头在做的、今天的安排）。
+  **没写进材料的日常，就当它没发生。**
+- **材料少的时候，日记就该短。** 两三句话也是一篇日记。
+- **不要总结**。不要"今天让我明白了……""总的来说……"。日记不是周报。
+- 不要列点、不要标题、不要加粗。就是一段一段的话。
+- 不要对读者说话。不要以"晚安"结尾。
 
 开头直接从今天的第一件事写起，或者从"今天没什么事"写起都行。"""
+
+_WEEKDAY = ("星期一", "星期二", "星期三", "星期四", "星期五",
+            "星期六", "星期日")
+
+
+def _weekday_cn(day: str) -> str:
+    """把 2026-11-09 换成「星期一」。
+
+    以前只把日期给模型，星期让它自己推——它推不出来，于是写出过
+    周日晚上「明天又要上班」和「还有一天假」并存这种自相矛盾的句子。
+    素材里直接给出星期，是让日记的事实能对得上最省事的办法。
+    """
+    try:
+        return _WEEKDAY[datetime.strptime(str(day)[:10], "%Y-%m-%d").weekday()]
+    except Exception:
+        return ""
 
 
 def dir_path(root: Optional[str] = None) -> str:
@@ -175,10 +221,6 @@ def write(day: str, body: str, *, meta: Optional[Dict[str, Any]] = None,
     lines.append("")
     payload = "\n".join(lines)
     try:
-        from bigfish.vault import _atomic_write_json  # noqa: F401  (仅确认模块可用)
-    except Exception:
-        pass
-    try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
@@ -237,7 +279,23 @@ def build_request(*, day: str, materials: Dict[str, Any]) -> Tuple[str, str]:
     顺序和复盘不同：日记要的是**具体的话**，所以对话放最前，
     心情摘要放后面（它是二手材料，只能当氛围）。
     """
-    parts: List[str] = [f"今天是 {day}。"]
+    wd = _weekday_cn(day)
+    parts: List[str] = [f"今天是 {day}（{wd}）。" if wd else f"今天是 {day}。"]
+
+    # 最近几篇的开头一句。跨篇重复比单篇内重复更容易穿帮：连着几天都从
+    # 「今天」或「外面阴着」起头、或者天天写汤，读三篇就能看出来是生成的。
+    # 只给开头——给全文既挤掉今天的素材，又给模型抄的机会。
+    recent_opens: List[str] = []
+    for prev in [d for d in list_days(limit=4) if d != day][:3]:
+        for line in read(prev).splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("<!--"):
+                continue
+            recent_opens.append(f"- {prev}：{line[:40]}")
+            break
+    if recent_opens:
+        parts.append("## 最近几篇是怎么开头的（别重复这些写法和道具）\n"
+                     + "\n".join(recent_opens))
 
     talk = [str(x).strip() for x in (materials.get("talk") or [])
             if str(x).strip()]
@@ -284,6 +342,18 @@ def build_request(*, day: str, materials: Dict[str, Any]) -> Tuple[str, str]:
     if facts:
         parts.append("## 今天说到的事\n" + "\n".join(
             "- " + x[:80] for x in facts[:8]))
+
+    # 今天碰见的熟人。这一段的用处不是"素材更丰富"，而是让她的一天里
+    # 第一次出现**不是他**的人 —— 卖鱼的、楼下喂猫的老太太。
+    # 没有这一段，她的日记永远只有两个主语：我、他。
+    met = [str(x).strip() for x in (materials.get("met") or [])
+           if str(x).strip()]
+    if met:
+        parts.append("## 今天碰见的人\n" + "\n".join(
+            "- " + x[:60] for x in met[:3]))
+        cast = str(materials.get("cast") or "").strip()
+        if cast:
+            parts.append(cast)
 
     relation = materials.get("relation") or {}
     if relation:
@@ -334,8 +404,12 @@ def has_material(materials: Dict[str, Any]) -> Tuple[bool, str]:
     events = (materials.get("relation") or {}).get("events") or []
     doing = str(materials.get("doing") or "").strip()
     plan = [p for p in (materials.get("plan") or []) if str(p).strip()]
+    met = [p for p in (materials.get("met") or []) if str(p).strip()]
     day = str(materials.get("day") or "").strip()
-    if day or talk or facts or events or doing or plan:
+    # ⚠ met 必须进这个判断。它是「今天碰见的人」—— 只碰见人、别的都空的日子
+    #   （没聊天、没事实、没日程）恰恰是**最该写**的那种：她一个人下楼，
+    #   碰见了卖鱼的，回来什么也没干。漏了它，那天的日记永远是"不写"。
+    if day or talk or facts or events or doing or plan or met:
         return True, ""
     return False, "连今天是哪天都不知道"
 

@@ -269,15 +269,22 @@ if "QTWEBENGINE_CHROMIUM_FLAGS" not in os.environ:
         "--disable-gpu-sandbox "
         "--disable-software-rasterizer=false "
         "--ignore-gpu-blocklist "
-        "--enable-unsafe-swiftshader"
+        "--enable-unsafe-swiftshader "
+        # V8 堆上限：界面每 3 秒一次 get_status、每 60 秒一次 get_today，
+        # 全是跨 C++ 边界的字符串往返。V8 默认把临时对象攒着，等老生代
+        # 撑大才回收 —— 实测空转也能 0.8MB/分钟地涨，挂一天就是一个 G。
+        # 给个 192MB 的硬上限，逼它勤快回收：界面很小，够用。
+        # （2026-11-11 实测数据：启动 466MB，2 分钟 468MB，句柄反而减少，
+        #   线程不变 —— 是纯堆增长，不是句柄/线程泄漏。）
+        "--js-flags=--max-old-space-size=192"
     )
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 # 允许通过环境变量强制纯软件渲染（排查用）
 if os.environ.get("BIGFISH_SOFTWARE_RENDER") == "1":
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] += " --disable-gpu"
 
-from PySide6.QtCore import (QObject, QThread, QUrl, Signal, Slot,  # noqa: E402
-                            Qt)
+from PySide6.QtCore import (QObject, QThread, QTimer, QUrl, Signal,  # noqa: E402
+                            Slot, Qt)
 from PySide6.QtGui import QIcon                                       # noqa: E402
 from PySide6.QtWebChannel import QWebChannel                         # noqa: E402
 from PySide6.QtWebEngineWidgets import QWebEngineView                # noqa: E402
@@ -426,7 +433,23 @@ def _cut_at_sentence(text: str, limit: int) -> str:
     # 才硬切 —— 那种情况一定是模型写嗨了。
     if len(plain) <= limit * 2:
         return text.strip()
-    return plain[:limit].rstrip("，,、 ") + "…"
+    # 硬切也要切在**标点后**。
+    #
+    # 2026-11-11 实测：「大肥鱼，蓝鲸一条，住在电脑里」被切在「住在电…」，
+    # 后半句「脑里」没了，读出来就是吞字 —— 用户听到的是"住在电"。
+    # 宁可少说半句，也不能说半个词。
+    cut = plain[:limit]
+    best = -1
+    for p in "，,、；;：: ":
+        idx = cut.rfind(p)
+        if idx > best:
+            best = idx
+    # 切点太靠前（不到预算一半）就**整段保留**：一句完整的话比压在预算里重要。
+    if best >= max(4, limit // 2):
+        return cut[:best + 1].rstrip() + "…"
+    # 一个标点都没有（模型写嗨了，两百字不带停顿）：只能硬切。
+    # 这不是"切半句"，是"根本没有句子可切"——不切会把整屏刷满。
+    return cut.rstrip("，,、 ") + "…"
 
 
 def _source_ms(msg) -> "int | None":
@@ -713,6 +736,31 @@ class _OwnerState:
 #: 模块级单例。引擎启动时写 owner_id，_open_block 只读。
 #: 漏了这一行 = 引擎一启动就 NameError（2026-11-04 修）。
 _OWNER_STATE = _OwnerState()
+
+
+def _tics_block(chat_id: str) -> str:
+    """她最近老爱说的那个词。
+
+    只在她**确实说了够多次**的时候才出现（至少 3 条不同的消息里都有）。
+    抽不出来就一个字都不加 —— 宁可这轮没有，也不要塞一个噪声词进去，
+    "你最近老爱说「那个」"会让她开始刻意用"那个"。
+    """
+    if not chat_id:
+        return ""
+    try:
+        from bigfish import history, say
+
+        rows = history.load(chat_id, limit=80) or []
+        tics = say.recent_tics(rows, min_msgs=3, top=1)
+    except Exception:
+        return ""
+    if not tics:
+        return ""
+    word, n = tics[0]
+    return ("## 你最近的口头禅\n\n"
+            f"你最近老爱说「{word}」（{n} 条消息里都带着它）。"
+            "可以让它留着 —— 人就是会有一阵子挂着一个词。"
+            "但别每句都带，那样像在念台词。")
 
 
 def _habits_block(owner: str, tier: str, *, limit: int = 6) -> str:
@@ -1205,6 +1253,7 @@ class EngineWorker(QThread):
                 from bigfish import policy as _policy2
 
                 _bits = [_turn_policy.tone_line,
+                         _turn_policy.attention_line,
                          _policy2.silence_hint(_turn_policy.silence_bias)]
                 _bits = [b for b in _bits if b]
                 if _bits:
@@ -1404,6 +1453,16 @@ class EngineWorker(QThread):
                 "## 对方反复说过的事\n\n" + habit_lines
                 + "\n\n（这些是原话样本，不是结论。是否成立、属于哪类，"
                   "你按本轮语境自己判断。）")
+
+        # 语言漂移：她最近老爱说哪个词。
+        #
+        # 她的用词以前是固定的（soul 只读渲染，不学习），八个月后说话
+        # 和今天一模一样，只有长短会变。这一行让"某一阵子挂着一个词"
+        # 第一次可能发生 —— 而那个词是从她自己说过的话里统计出来的，
+        # 不是设定给的。
+        _tics = _tics_block(chat_id)
+        if _tics:
+            user_parts.append(_tics)
 
         try:
             from bigfish import plugins as _pl
@@ -1776,34 +1835,56 @@ class EngineWorker(QThread):
             # 下一条就生效，不用重启。构造只是读路径，不发请求。
             engine = VoiceEngine(settings)
             t0 = time.time()
-            res = engine.synthesize_turn(
-                [decision.text], mood=float(mood.get("value") or 65),
-                dims=dims, energy=energy, asleep=asleep, doing=doing,
-                hour=hour, is_group=is_group, is_owner=is_owner,
-                afterglow=ag_kinds, requested=req,
-                profile=settings.profile)
-            if not res.ok:
-                self._log(f"[声] 合成失败，改发文字：{res.error}", "err")
+            # 长话拆成几条连续语音。
+            #
+            # 以前是「超 50 秒就整轮改发文字」—— 一段两三百字的心里话
+            # 就永远听不见，只能读。人说话本来就是一串，拆成 2~3 条
+            # 才是"她连着说"，而不是"一段录音"。
+            # 切分规则在 voice_split：按句切、每段 ≤200 字、最多 3 段，
+            # 剩下的并进最后一段（宁长勿丢）。
+            from bigfish.voice_split import split_for_voice
+
+            pieces = split_for_voice(decision.text)
+            if not pieces:
+                self._log("[声] 切分后没有可念的文本，改发文字", "err")
                 return {}
-            # 语音上限 60 秒，留 10 秒容错：超过 50 秒一律改文字。
-            if res.duration > 50.0:
-                self._log(f"[声] 太长（{res.duration:.1f}s），超过 50 秒；"
-                          "这一轮改发文字", "err")
-                return {}
-            if decision.send_as == "bubble" and res.duration < 1.0:
-                self._log(f"[声] 气泡太短（{res.duration:.2f}s），"
-                          "微信可能不认；这一轮改发文字", "err")
-                return {}
-            self._log(f"[声] 好了：{res.summary}｜{os.path.basename(res.path)}",
+            results = []
+            for idx, piece in enumerate(pieces):
+                r = engine.synthesize_turn(
+                    [piece], mood=float(mood.get("value") or 65),
+                    dims=dims, energy=energy, asleep=asleep, doing=doing,
+                    hour=hour, is_group=is_group, is_owner=is_owner,
+                    afterglow=ag_kinds, requested=req,
+                    profile=settings.profile)
+                if not r.ok:
+                    self._log(f"[声] 第 {idx + 1}/{len(pieces)} 段合成失败，"
+                              f"改发文字：{r.error}", "err")
+                    return {}
+                # 语音上限 60 秒，留 10 秒容错：超过 50 秒一律改文字。
+                if r.duration > 50.0:
+                    self._log(f"[声] 第 {idx + 1} 段太长（{r.duration:.1f}s），"
+                              "超过 50 秒；这一轮改发文字", "err")
+                    return {}
+                if decision.send_as == "bubble" and r.duration < 1.0:
+                    self._log("[声] 气泡太短，微信可能不认；这一轮改发文字",
+                              "err")
+                    return {}
+                results.append(r)
+            res = results[0]
+            total = sum(r.duration for r in results)
+            self._log(f"[声] 好了：{len(results)} 段 / {total:.1f}s｜"
+                      + "、".join(os.path.basename(r.path) for r in results),
                       "think")
             return {
-                "path": res.path,
+                "path": res.path,                      # 兼容单段调用方
+                "paths": [r.path for r in results],
                 "delivery": "voice_only",
                 "send_as": decision.send_as,
                 "device": settings.device,
                 "hotkey": settings.hotkey,
                 "reason": decision.reason,
-                "duration": res.duration,
+                "duration": total,          # 所有段加起来的时长
+                "parts": len(results),
                 "ms": int((time.time() - t0) * 1000),
                 "fallback": bool(policy.fallback_text),
             }
@@ -1916,7 +1997,7 @@ class EngineWorker(QThread):
 
     def _send_sticker(self, msg, path: str, remember_sent) -> None:
         """发出去，并把结果记进日志/统计。失败不抛，只记。"""
-        from bigfish.wechat_sender import SendError, classify_media
+        from bigfish.wechat_sender import classify_media
 
         if self.sender is None and not self._ensure_sender(quiet=True):
             return
@@ -2346,7 +2427,7 @@ class EngineWorker(QThread):
         from bigfish.loopguard import LoopGuard
         from bigfish.watcher import MessageWatcher
         from bigfish.wechat import WeChatReader
-        from bigfish.wechat_sender import SendError, UiaSender
+        from bigfish.wechat_sender import SendError
 
         self._log("正在加载灵魂 ...")
         self.soul = load_soul()
@@ -2468,7 +2549,6 @@ class EngineWorker(QThread):
                 except Exception:
                     pass
 
-        from bigfish.bridge_client import load_context
 
         convs: dict[str, list] = {}
         # ── 自环防护 ──
@@ -2986,6 +3066,15 @@ class EngineWorker(QThread):
             if _policy_now is not None:
                 _max_chars = min(_max_chars or 10 ** 6,
                                  max(18, _policy_now.max_chars))
+            # 截断只该管**屏幕上那几行字**，不该管**声音**。
+            #
+            # 2026-11-11 实测：她心情委屈，预算压到 14 字，原文
+            # 「大肥鱼，蓝鲸一条，住在电脑里」被硬切在「住在电…」，
+            # 语音就念了「大肥鱼蓝鲸一条住在电」—— 用户听到的是被吞字。
+            # 同一个坑 2026-11-09 记过一次（"用户以为是语音被砍了一半"），
+            # 当时只动了硬切阈值，没解决"语音和文字共用一份文本"这个根。
+            # 现在把完整文本单独留一份，语音走它。
+            _reply_full = reply
             if _max_chars > 0 and len(reply.replace("{{split}}", "")) > _max_chars:
                 reply = _cut_at_sentence(reply, _max_chars)
 
@@ -3009,7 +3098,14 @@ class EngineWorker(QThread):
             # 模型可能写 [[voice]] / [[text]] 来表态；它们是给系统的标记，
             # 绝不能出现在对方收到的文字里。但判定层要看到原始标记，
             # 所以先留一份 raw，再清正文。
-            _voice_reply = reply
+            # ⚠ 用**截断前**的那份（`_reply_full`）。
+            #   文字预算是给屏幕的（心情低时 14~18 字，读起来刚好），
+            #   语音却要念完整的一句话 —— 拿截断后的文本去合成，
+            #   听到的就是「大肥鱼蓝鲸一条住在电」。
+            #   语音自己的上限宽松得多（policy.max_chars=220、
+            #   TTS max_turn_chars=400），够撑一段长对话。
+            #   `{{split}}` 要换成停顿，否则会被念成"大括号大括号"。
+            _voice_reply = _reply_full.replace("{{split}}", "，")
             # 表情标记也在**原始** reply 上读（和语音标记同一处）：
             #   [[sticker]] 要配图 / [[text]] 不配图。
             # 读完立刻被 strip_tags 清掉，绝不发给对方。
@@ -3149,22 +3245,37 @@ class EngineWorker(QThread):
                 _unknown_any = False
                 # 只发语音：先把音频发出去。成功就不再发文字；
                 # 失败且允许补文字，则 parts 保持原样、走下面的文字循环。
-                if _voice_only and _voice.get("path"):
-                    _voice_sent, _voice_started = self._send_voice(
-                        msg, _voice["path"],
-                        send_as=_voice.get("send_as", "file"),
-                        device=_voice.get("device", ""),
-                        hotkey=_voice.get("hotkey", "Ctrl+Alt"))
-                    if _voice_sent:
-                        sent_any = True
+                if _voice_only and (_voice.get("paths") or _voice.get("path")):
+                    # 多段连续发：一段失败就停在那里，不补文字 ——
+                    # 半句话补一段文字，比少一条更难读。
+                    _paths = _voice.get("paths") or [_voice.get("path")]
+                    for _vi, _vp in enumerate(_paths):
+                        if not _vp:
+                            continue
+                        if _vi:
+                            # 条间停顿：她没有语速 0 秒的人。1.1~1.6 秒
+                            # 是"喘口气接着讲"，再短听起来像一条被切开的。
+                            time.sleep(1.1 + (hash(_vp) % 5) * 0.1)
+                        _voice_sent, _voice_started = self._send_voice(
+                            msg, _vp,
+                            send_as=_voice.get("send_as", "file"),
+                            device=_voice.get("device", ""),
+                            hotkey=_voice.get("hotkey", "Ctrl+Alt"))
+                        if _voice_sent:
+                            sent_any = True
+                            continue
+                        if _voice_started:
+                            # 已经按过录音键：可能已经收到半截语音，绝不补文字。
+                            _unknown_any = True
+                            break
+                        if not _voice.get("fallback", True):
+                            self._log("[声] 语音没发出，且关了补文字 —— "
+                                      "这一轮只有日志", "err")
+                        break
+                    else:
+                        # 全段都发完了：文字不用再发
                         parts = []
-                    elif _voice_started:
-                        # 已经按过录音键：可能已经收到半截语音，绝不补文字。
-                        _unknown_any = True
-                        parts = []
-                    elif not _voice.get("fallback", True):
-                        self._log("[声] 语音没发出，且关了补文字 —— 这一轮只有日志",
-                                  "err")
+                    if sent_any or _unknown_any:
                         parts = []
                 try:
                     for _i, _part in enumerate(parts):
@@ -4152,7 +4263,6 @@ class Backend(QObject):
         try:
             from bigfish.wechat import _VENDOR  # noqa: F401
             import glob
-            from bigfish.bridge_client import _default_data_root  # noqa: F401
 
             root = os.path.expandvars(
                 r"%USERPROFILE%\Documents\xwechat_files")
@@ -4698,6 +4808,25 @@ class Backend(QObject):
             local = _dt.datetime.fromtimestamp(now)
             st = _life.load()
             has_life = bool(st.day)
+            jw = float(getattr(st, "just_woke_at", 0.0) or 0.0)
+            # ⚠ 补算要在**读 jw 之后、但重算 jw 之前**：catch_up 跨过醒来边界时
+            #   会把 just_woke_at 设成边界时刻。以前 jw 在最前面读、之后才补算，
+            #   于是"刚醒"那一刻界面说她没醒过（显示空、"今天醒的"判 false）。
+            # 首页要的是"此刻"，不是"上次落盘那一刻"。
+            # 引擎没跑（或刚打开、还没到下一次 tick）时，磁盘上的 energy/doing
+            # 会停在旧值上——用户看到的"精力 37"可能是两小时前的。
+            # catch_up 只改内存不写盘（写盘是引擎的职责），所以这里补算一次是安全的。
+            if has_life:
+                try:
+                    # roll=False：界面刷新不该"替她掷骰子"。
+                    # body / dream 只在引擎真正 tick 到醒来那一刻才生成；
+                    # 这里只补算时间和精力，避免每 5 秒刷新一次就重掷一遍。
+                    _life.catch_up(st, now, roll=False)
+                except Exception:
+                    pass
+                # 补算可能跨过醒来边界，那时 just_woke_at 才被设上 —— 重读一次，
+                # 否则"刚醒"那一刻界面显示的是"今天还没醒过"。
+                jw = float(getattr(st, "just_woke_at", 0.0) or 0.0)
 
             plan = []
             # 跨天没醒/引擎没跑时，life.day 会停在昨天，但 plan 仍然是她
@@ -4710,6 +4839,10 @@ class Backend(QObject):
                         continue
                     plan.append({
                         "at": str(item.get("at") or ""),
+                        # 区间：一天里每件事有起止，UI 才能显示"09:00–09:50"。
+                        # 旧数据没有 end，前端会退回只显示开始时刻。
+                        "end": str(item.get("end") or ""),
+                        "dur": item.get("dur") or 0,
                         "what": str(item.get("what") or ""),
                         "done": bool(item.get("done")),
                         "done_by": str(item.get("done_by") or ""),
@@ -4767,6 +4900,13 @@ class Backend(QObject):
                                   if has_life else "还没有生活状态"),
                     "wake_at": hm(st.wake_at) if has_life else "",
                     "bedtime": hm(st.bedtime) if has_life else "",
+                    # 醒来时刻要单独给：wake_at 在醒来之后已经被重算成**明早**，
+                    # 拿它当"今早几点醒"显示，会让她看起来"明早九点醒的"。
+                    # getattr 兜底是给测试里的假 LifeState 用的（它们只实现老字段）。
+                    "just_woke_at": (hm(jw) if has_life and jw else ""),
+                    "woke_today": bool(
+                        has_life and jw
+                        and _dt.datetime.fromtimestamp(jw).date() == local.date()),
                     "sleep_debt": round(float(st.sleep_debt or 0), 0),
                     "plan_day": str(st.plan_day or ""),
                     "trace": [
@@ -5500,7 +5640,7 @@ class Backend(QObject):
         try:
             import sqlite3
 
-            from bigfish import memory as M, vault as V
+            from bigfish import vault as V
 
             cfg = load_json_config().get("auto_reply") or {}
             current = str(cfg.get("owner") or "").strip()
@@ -7176,6 +7316,18 @@ class MainWindow(QMainWindow):
         self.view = QWebEngineView(self)
         self.setCentralWidget(self.view)
 
+        # 渲染进程（Chromium 的子进程）崩了要能自己爬起来。
+        #
+        # 2026-11-11 15:07 实测过一次 0xc0000005 闪退（Qt6WebEngineCore.dll），
+        # 那次是主进程一起死的，这个信号救不回来。但渲染进程单独崩
+        # （GPU/页面内存耗尽最常见）时，界面会永久白屏而进程还在 ——
+        # 那比闪退更难受：用户以为程序活着，实际上她再也看不见消息了。
+        try:
+            self.view.page().renderProcessTerminated.connect(
+                self._on_render_terminated)
+        except Exception:
+            pass
+
         # 拖放：QWebEngineView 默认 acceptDrops=False，系统层面就拒了，
         # 页面里的 dragover 根本收不到（鼠标显示禁止图标）。
         # 而且就算收到，HTML5 的 File 对象在 QtWebEngine 里也没有 path
@@ -7200,6 +7352,125 @@ class MainWindow(QMainWindow):
         self.view.page().setWebChannel(self.channel)
 
         self.view.load(QUrl.fromLocalFile(os.path.join(UI_DIR, "index.html")))
+
+        # 内存看门狗：Chromium 的工作集涨上去就不肯还。
+        #
+        # 2026-11-11 那次闪退跑了 3 小时 48 分。这类"跑几个小时才出事"
+        # 的崩溃，最省事也最有效的对策就是定期重载页面 —— 界面会闪一下，
+        # 但 Chromium 的堆、渲染进程、WebChannel 全都重新开始。
+        # 只在内存在阈值以上才动手，正常情况下永远不触发。
+        try:
+            self._mem_history = []          # [(时刻, MB)]，出问题看趋势
+            self._mem_timer = QTimer(self)
+            self._mem_timer.timeout.connect(self._watch_memory)
+            self._mem_timer.start(20 * 60 * 1000)      # 每 20 分钟看一眼
+        except Exception:
+            self._mem_timer = None
+
+    def _watch_memory(self) -> None:
+        """分段处理内存：轻度回收 → 重度重载。
+
+        为什么不能只写一句 `gc.collect()`：
+          Python 的 `gc` 管不到 Chromium 的堆。WebEngine 的内存是
+          C++ 分配器持有的，只有**重建渲染环境**（重载页面）才会真还回去。
+          只做 gc.collect() 是假清理 —— 数字看着降了一点，过十分钟又满。
+
+        为什么阈值要比 1.6GB 低得多：
+          1.6G 是"快要崩了"的位置，不是"该清理了"的位置。涨到那儿之前，
+          界面已经开始卡（Chromium 在内存压力下会疯狂 GC 而不是还内存）。
+          750MB 触发重载、400MB 只做一次 gc —— 两个档位分开。
+        """
+        mb = self._working_set_mb()
+        if mb is None:
+            return
+
+        # 记一行趋势，出问题时能看出"多久涨多少"
+        self._mem_history.append((time.time(), mb))
+        if len(self._mem_history) > 48:          # 48 × 20 分钟 = 16 小时
+            self._mem_history.pop(0)
+
+        if mb < 400:
+            return
+
+        try:
+            import gc
+
+            # ① 轻度：先把 Python 侧的循环垃圾收掉（便宜，不打断界面）
+            _freed = gc.collect()
+            if mb < 750:
+                self.backend._log(
+                    f"[内存] {mb:.0f}MB，回收了 {_freed} 个循环引用", "think")
+                return
+            # ② 重度：重载页面。Chromium 的堆、渲染进程、WebChannel
+            #    全部重建 —— 这是唯一能真正把工作集还回去的动作。
+            # started_at 在 Backend 上（引擎启动时刻），不在 MainWindow
+            _up = 0
+            try:
+                _st0 = float(getattr(self.backend, "started_at", 0) or 0)
+                _up = int((time.time() - _st0) / 60) if _st0 else 0
+            except Exception:
+                _up = 0
+            self.backend._log(
+                f"[内存] {mb:.0f}MB 超阈值，重载界面回收"
+                f"（引擎已跑 {_up} 分钟）", "err")
+            self.view.load(QUrl.fromLocalFile(os.path.join(UI_DIR, "index.html")))
+        except Exception:
+            pass
+
+    def _working_set_mb(self) -> "float | None":
+        """当前进程工作集（MB）。取不到返回 None，绝不抛。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(_PMC)
+            # ⚠ argtypes 必须设。不设的话 HANDLE 在 x64 上会被截成 32 位，
+            #   调用返回 False、读数恒为 0 —— 看门狗等于没装，而且不报错。
+            _fn = ctypes.windll.kernel32.K32GetProcessMemoryInfo
+            _fn.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PMC),
+                            wintypes.DWORD]
+            _fn.restype = wintypes.BOOL
+            if not _fn(ctypes.windll.kernel32.GetCurrentProcess(),
+                       ctypes.byref(pmc), pmc.cb):
+                return None
+            return pmc.WorkingSetSize / (1024 * 1024)
+        except Exception:
+            return None
+
+    def _on_render_terminated(self, status, code):
+        """渲染进程崩了：记一笔，然后自动重载界面。
+
+        白屏比闪退更糟 —— 窗口还在，用户以为程序活着，其实她再也
+        看不见消息。这里宁可重载（页面状态会丢，但桥接和引擎都在
+        Python 侧，重载后 setInterval 继续跑，不影响收发）。
+        """
+        try:
+            self.backend._log(
+                f"[界面] 渲染进程异常退出（status={status} code={code}），"
+                "800ms 后自动重载", "err")
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(
+                800, lambda: self.view.load(
+                    QUrl.fromLocalFile(os.path.join(UI_DIR, "index.html"))))
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         try:
@@ -7264,7 +7535,7 @@ def run_live_send() -> int:
     # 发送
     stamp = time.strftime("%H:%M:%S")
     text = f"[自检 {stamp}] 大肥鱼发的，收到说明收发都通。"
-    print(f"\n[3] 发送到 文件传输助手")
+    print("\n[3] 发送到 文件传输助手")
     print(f"    {text}")
     try:
         res = sender.send("文件传输助手", text)
@@ -7274,7 +7545,7 @@ def run_live_send() -> int:
     print(f"    返回 ok={res.ok}")
 
     # 回读
-    print(f"\n[4] 回读数据库确认")
+    print("\n[4] 回读数据库确认")
     found = False
     for i in range(10):
         time.sleep(1.0)
@@ -7364,6 +7635,32 @@ def main() -> int:
 
     win = MainWindow()
     win.show()
+
+    # 未捕获异常先落盘再说。
+    #
+    # 2026-11-11 15:07 那次闪退是 Qt6WebEngineCore.dll 的 0xc0000005，
+    # 主进程被系统直接干掉 —— Python 的异常钩子根本轮不到执行，
+    # 所以那次什么都没留下，只能去翻 Windows 事件日志。
+    # 但**其它**类型的崩溃（槽函数里抛、后台线程里抛）是能接住的，
+    # 接住了就有行号和调用栈。这段就是为了让"下次"有据可查。
+    _crash_log = os.path.join(_APP_DIR, "crash.log")
+
+    def _dump_crash(exc_type, exc, tb):
+        try:
+            import traceback as _tb
+
+            with open(_crash_log, "a", encoding="utf-8") as f:
+                f.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} ====\n")
+                _tb.print_exception(exc_type, exc, tb, file=f)
+        except Exception:
+            pass
+        try:
+            sys.__excepthook__(exc_type, exc, tb)
+        except Exception:
+            pass
+
+    sys.excepthook = _dump_crash
+
     return app.exec()
 
 
@@ -7427,7 +7724,6 @@ def run_selftest() -> int:
 
 def _run_selftest_inner() -> int:
     """自检主体。输出全走 print，由 run_selftest 统一收口。"""
-    import traceback
 
     HR = "=" * 66
     results = []
@@ -7469,7 +7765,7 @@ def _run_selftest_inner() -> int:
     print(HR)
     print("  大肥鱼 自检（打包版）")
     print(HR)
-    print(f"  版本    : ", end="")
+    print("  版本    : ", end="")
     try:
         from bigfish.updater import __version__
         print(__version__)
@@ -8170,7 +8466,7 @@ def _run_selftest_inner() -> int:
         import shutil as _sh
         import tempfile as _tf
 
-        from bigfish import mood_judge as MJ, vault as V
+        from bigfish import mood_judge as MJ
 
         tmpd = _tf.mkdtemp(prefix="bf-mood-")
         old = os.environ.get("BIGFISH_DATA_ROOT")

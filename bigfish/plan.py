@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: 一天排几件事。三条足够看出"有安排"，又不至于像待办清单。
 PLAN_MIN = 2
@@ -71,10 +71,11 @@ SYSTEM = """你在帮一个角色排今天要做的事。
 只输出一个 JSON 对象，不要 Markdown 代码块、不要解释。
 
 格式：
-{"plan":[{"at":"09:30","what":"去趟超市","shareable":true,"from":"yesterday"}]}
+{"plan":[{"when":"上午","what":"去趟超市","shareable":true,"from":"yesterday"}]}
 
 规则（按重要性）：
-1. 排 2~3 条，时间在 08:00 到 22:00 之间，按时间升序。
+1. 排 2~3 条。**when 只能是这六个词之一**：早上、上午、中午、下午、傍晚、晚上。
+   （不要写几点几分 —— 具体时刻由程序按她的作息和空档算，你只管大致时段。）
 2. **至少一条的 from 必须是 "yesterday"**，内容要真的接上昨天：
    昨天没做完的事、昨天提过的事、昨天没回的那句话。
    其余两条 from 用 "fact"（来自给的材料）或 "self"（她自己想做的）。
@@ -84,7 +85,75 @@ SYSTEM = """你在帮一个角色排今天要做的事。
 4. shareable：这件事适不适合主动跟对方提。私人的（洗澡、上厕所）写 false。
 5. 不要编造材料里没有的重要事件（谁生病、谁来找她、去哪座城市）。
    没有材料就排普通日常。
-6. 不要写"等他消息""想他"这类以对方为中心的事 —— 那是心情，不是日程。"""
+6. 不要写"等他消息""想他"这类以对方为中心的事 —— 那是心情，不是日程。
+7. 三条之间要有先后关系，不要排三件互相没关系的事：
+   比如"买菜"和"做饭"可以同一天，"做饭"和"洗衣服"就没关系。
+8. 如果有「## 你自己会想到的」，**可以**排一条接着它的事（from 用 "self"）。
+   它不需要和他有关 —— 身上难受就去买点药，天晴了就想晒被子，
+   昨天碰见的人说的话今天才回过味来。这是这一天里**只属于她**的那部分。"""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 一天的骨架：什么时段一定被占着
+# ══════════════════════════════════════════════════════════════════════
+#
+# 骨架不由模型决定。人不会 14:00 才吃第一口饭，也不会 23:00 才开始洗漱 ——
+# 这些是生理，不是安排。模型只决定"空档里做什么"，空档由这里算出来。
+
+#: 醒来之后这一段被占掉（起床、洗漱、吃点东西）。相对醒来的分钟数，
+#: 因为她的起床时刻是浮动的（07:40 ± 35 + 晚醒最多 100 分钟）。
+#:
+#: ⚠ 必须 ≥ `life.WAKE_ROUTINE_MINUTES`。life 那边把这段时间写成了
+#:   有顺序的三步（洗漱 → 弄点吃的 → 收拾出门），而且**优先于日程**；
+#:   这里如果更小，就会排出"她还在洗漱、日程说她在超市"。
+WAKE_BLOCK_MINUTES = 55
+
+#: 绝对时刻的固定块。都是"人不会挪"的事。
+FIXED_BLOCKS = (
+    (11, 40, 12, 30),   # 午饭
+    (17, 40, 18, 40),   # 晚饭
+    (21, 40, 22, 10),   # 洗漱
+)
+
+#: 时段 → 一天中的分钟窗口。模型只给这六个词，具体落点在这里算。
+WHEN_WINDOWS = {
+    "早上": (7 * 60, 9 * 60 + 30),
+    "上午": (9 * 60, 11 * 60 + 40),
+    "中午": (11 * 60 + 40, 13 * 60),
+    "下午": (13 * 60, 17 * 60),
+    "傍晚": (17 * 60, 19 * 60),
+    "晚上": (19 * 60, 22 * 60),
+}
+WHEN_ORDER = {"早上": 0, "上午": 1, "中午": 2, "下午": 3, "傍晚": 4, "晚上": 5}
+
+#: 两件事之间留的走动/收尾时间（分钟）。
+#:
+#: 没有这个，她就会"11:10 刚从超市回来、11:10 已经在做饭"。
+#: 人是要走路的。
+TRAVEL_MINUTES = 10
+
+#: 一件事大概要多久。按关键词最长匹配，越具体的越优先。
+#: 排不下就不排 —— 她的一天不是待办清单，塞不进去就说明今天没空做。
+DURATION_RULES = (
+    (("买菜", "超市", "菜市场", "逛"), 50),
+    (("取快递", "快递"), 25),
+    (("做饭", "煮", "炒", "热一热", "热一下", "下面"), 40),
+    (("收拾", "整理", "归置", "洗衣服", "晾", "扫地", "拖地", "擦"), 35),
+    (("看书", "翻", "写", "读书"), 45),
+    (("散步", "下楼", "走一圈", "遛"), 30),
+    (("洗澡", "洗头", "洗漱"), 30),
+    (("晒太阳", "发呆", "坐着", "躺着"), 30),
+)
+DEFAULT_DURATION = 30
+
+#: 这件事会"用掉"什么 / "留下"什么。目前只用来补前置 ——
+#: 排了"做饭"却没有"买菜"，就在上午补一条"下楼买点菜"。
+#:
+#: 为什么只做这一条链：真正的因果图会很复杂，而这一条是唯一
+#: 任何家庭每天都发生的因果（没有菜做不了饭）。够用，且不会乱。
+COOK_MARKS = ("做饭", "做顿", "下厨", "弄点吃", "煮", "炒", "热一热", "热一下", "烧")
+SHOP_MARKS = ("买菜", "买点菜", "超市", "菜市场", "买菜")
+SHOP_FILLER = "下楼买点菜"
 
 
 def _clip(text: Any, limit: int) -> str:
@@ -92,9 +161,44 @@ def _clip(text: Any, limit: int) -> str:
     return s[:limit]
 
 
+def self_material(*, body: str = "", met: Sequence[str] = (),
+                  weather: str = "", trace: Sequence[str] = ()) -> List[str]:
+    """她自己会想到的事 —— 材料全部来自**她的处境**，不来自对话。
+
+    这是"只跟她自己有关的动机"的入口。
+
+    为什么需要：日程的素材以前只有 yesterday / fact / self，而 fact 全部
+    来自对话 —— 于是她做的每件事最终都能追溯到你。一个人如果所有动机
+    都要经过另一个人，那她不是独立的，是被驱动的。
+
+    这里给的是：身上那点不舒服、最近碰见的人、天气、她反复在做的事。
+    这些都跟"他说了什么"无关，但她会因此想做点什么。
+    """
+    out: List[str] = []
+    b = str(body or "").strip()
+    if b:
+        out.append(f"身上{('' if b.startswith('身上') else '：')}{b}"
+                   "（不用硬撑，该歇就歇）")
+    for line in [str(x).strip() for x in (met or ()) if str(x).strip()][:2]:
+        out.append(f"最近碰见：{line}")
+    w = str(weather or "")
+    if w and any(k in w for k in ("晴", "雨", "雪", "阴", "降温", "冷")):
+        out.append(f"天气：{w}")
+    # 她这一两天反复在做的那件事 —— 同一条 doing 出现两次以上，
+    # 说明她手上有件没弄完的活，不是随手做的。
+    seen: Dict[str, int] = {}
+    for t in [str(x).strip() for x in (trace or ()) if str(x).strip()]:
+        seen[t] = seen.get(t, 0) + 1
+    heavy = [k for k, n in seen.items() if n >= 2]
+    if heavy:
+        out.append(f"这段时间一直在：{heavy[0]}")
+    return out
+
+
 def build_request(*, day: str, weekday: str, yesterday: List[str],
                   facts: List[str], recent: List[str],
-                  weather: str = "") -> Tuple[str, str]:
+                  weather: str = "",
+                  self_lines: Sequence[str] = ()) -> Tuple[str, str]:
     """拼一次日程请求。返回 (system, user)。
 
     `yesterday` 放最前：它对"连续性"的权重最高，模型对开头更敏感。
@@ -116,6 +220,13 @@ def build_request(*, day: str, weekday: str, yesterday: List[str],
     if r:
         parts.append("## 最近的对话\n" + "\n".join(
             _clip(x, 60) for x in r[-10:]))
+
+    # 她自己会想到的：身上、碰见的人、天气、一直在做的事。
+    # 放在对话前面 —— 这一天的底色是她的处境，不是他昨天说了什么。
+    sl = [str(x).strip() for x in (self_lines or ()) if str(x).strip()]
+    if sl:
+        parts.append("## 你自己会想到的\n" + "\n".join(
+            f"- {_clip(x, 60)}" for x in sl[:4]))
 
     f = [x for x in (facts or []) if str(x).strip()]
     if f:
@@ -185,11 +296,38 @@ def _norm_time(value: Any) -> str:
     return f"{hh:02d}:{mm:02d}"
 
 
+_WHEN_ALIAS = {
+    "早上": "早上", "清晨": "早上", "一早": "早上", "早起": "早上",
+    "上午": "上午",
+    "中午": "中午", "午饭": "中午", "午间": "中午",
+    "下午": "下午", "午后": "下午",
+    "傍晚": "傍晚", "黄昏": "傍晚", "晚饭": "傍晚", "天黑": "傍晚",
+    "晚上": "晚上", "夜里": "晚上", "今晚": "晚上", "睡前": "晚上",
+}
+
+
+def _norm_when(value: Any) -> str:
+    """把各种写法收成六个时段之一。收不了返回空串。"""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if s in _WHEN_ALIAS:
+        return _WHEN_ALIAS[s]
+    for key, label in _WHEN_ALIAS.items():
+        if key in s:
+            return label
+    return ""
+
+
 def parse_plan(raw: str) -> Tuple[List[Dict[str, Any]], str]:
     """把模型输出解析成日程项。返回 (items, error)。
 
     宽松解析 + 严格校验：模型经常多写一句话、少一个引号。
     宁可少一条，也不要一条时间错乱的日程 —— 那会让她在半夜说"我在买菜"。
+
+    **接受两种写法**：新的 `when`（早上/上午/…）和旧的 `at`（09:30）。
+    旧写法仍然认，但只在没有 when 时才用 —— 时刻是模型最不擅长的东西，
+    让它猜等于默认她会"09:30 在超市、09:40 在做饭"。
     """
     obj = _first_object(raw or "")
     if not obj:
@@ -210,8 +348,11 @@ def parse_plan(raw: str) -> Tuple[List[Dict[str, Any]], str]:
         if not isinstance(row, dict):
             continue
         at = _norm_time(row.get("at"))
+        when = _norm_when(row.get("when"))
         what = " ".join(str(row.get("what") or "").split())[:40]
-        if not at or not what:
+        if not what:
+            continue
+        if not when and not at:
             continue
         if what in seen:
             continue
@@ -220,7 +361,8 @@ def parse_plan(raw: str) -> Tuple[List[Dict[str, Any]], str]:
         if src not in ("yesterday", "fact", "self"):
             src = "self"
         out.append({
-            "at": at,
+            "at": at,                     # 可能为空：layout 会按 when 算出来
+            "when": when,
             "what": what,
             "done": False,
             "shareable": row.get("shareable") is not False,
@@ -229,9 +371,201 @@ def parse_plan(raw: str) -> Tuple[List[Dict[str, Any]], str]:
         if len(out) >= PLAN_MAX:
             break
 
+    # 让顺序有意义：先按时段，再按模型给的先后（同时段内保持原序）
+    out.sort(key=lambda x: WHEN_ORDER.get(x.get("when") or "", 9))
+
     if len(out) < PLAN_MIN:
         return out, f"只排了 {len(out)} 条（至少要 {PLAN_MIN}）"
     return out, ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 把「时段 + 做什么」展开成「一段一段的时间」
+# ══════════════════════════════════════════════════════════════════════
+#
+# 为什么排程不交给模型：
+#
+#   模型排时刻是瞎猜 —— 它会给出 09:30 去超市、09:40 在做饭，两条重叠；
+#   也不会想"来回要一个多小时"。而它一旦排错，她就得在 09:35 同时出现在
+#   两个地方，或者 11:10 刚从超市回来、11:10 已经在炒菜。
+#
+#   所以分工是：**模型只判断"大致什么时段做什么"（它擅长的粗判断），
+#   具体落点、时长、间隙全部由代码算**（它不擅长的算术）。
+#   这样时间永远自洽，用户问"你现在在干嘛"三次也不会前后矛盾。
+
+def _minute_of(hhmm: str) -> int:
+    try:
+        hh, mm = str(hhmm).split(":")
+        return int(hh) * 60 + int(mm)
+    except Exception:
+        return -1
+
+
+def _hhmm(minutes: float) -> str:
+    m = int(round(minutes)) % (24 * 60)
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def duration_of(what: str) -> int:
+    """这件事大概要多久（分钟）。"""
+    text = str(what or "")
+    for marks, minutes in DURATION_RULES:
+        if any(m in text for m in marks):
+            return minutes
+    return DEFAULT_DURATION
+
+
+def _free_slots(start_ts: float, end_ts: float) -> List[List[float]]:
+    """[醒来, 该睡] 之间，挖掉固定块和起床段之后剩下的空档。
+
+    返回 [[起, 止], ...]（epoch 秒），按时间升序。
+    """
+    if end_ts <= start_ts:
+        return []
+    lo = start_ts + WAKE_BLOCK_MINUTES * 60
+    slots: List[List[float]] = []
+    for h1, m1, h2, m2 in FIXED_BLOCKS:
+        b0 = _anchor(start_ts, h1 * 60 + m1)
+        b1 = _anchor(start_ts, h2 * 60 + m2)
+        if b1 <= lo:
+            continue
+        if b0 >= end_ts:
+            break
+        if b0 > lo:
+            slots.append([lo, min(b0, end_ts)])
+        lo = max(lo, b1)
+    if lo < end_ts:
+        slots.append([lo, end_ts])
+    return [s for s in slots if s[1] - s[0] >= 20 * 60]
+
+
+def _anchor(ts: float, minutes: int) -> float:
+    """把"一天中的第 N 分钟"落到 ts 所在的那一天。"""
+    import datetime as _dt
+
+    base = _dt.datetime.fromtimestamp(ts).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return (base + _dt.timedelta(minutes=float(minutes))).timestamp()
+
+
+def _place(slots: List[List[float]], lo_limit: float, hi_limit: float,
+           need: float) -> Optional[float]:
+    """在空档里找一个装得下 need 秒的位置，找到就把它消耗掉。"""
+    for i, (a, b) in enumerate(slots):
+        lo = max(a, lo_limit)
+        hi = min(b, hi_limit)
+        if hi - lo < need:
+            continue
+        start = lo
+        rest = start + need + TRAVEL_MINUTES * 60
+        if rest < b:
+            slots[i] = [rest, b]
+        else:
+            slots.pop(i)
+        return start
+    return None
+
+
+def with_prerequisites(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """补前置：排了「做饭」却没有「买菜」，就在上午补一条。
+
+    没有这一步，她的日程就是三件互不相干的事 —— 买菜和做饭没关系，
+    做饭和洗碗没关系。加上它，"因为"才开始存在：**因为**昨天买了菜，
+    **所以**今天能做饭。
+
+    只在真的缺的时候补，且只补一条。补的是"下楼买点菜"这种最小动作，
+    不是超市大采购 —— 那会反过来把一天塞满。
+    """
+    if not items:
+        return items
+    text = " ".join(str(x.get("what") or "") for x in items)
+    has_cook = any(m in text for m in COOK_MARKS)
+    has_shop = any(m in text for m in SHOP_MARKS)
+    if not (has_cook and not has_shop):
+        return items
+    if any(str(x.get("what") or "") == SHOP_FILLER for x in items):
+        return items
+    items.insert(0, {
+        "at": "",
+        "when": "上午",
+        "what": SHOP_FILLER,
+        "done": False,
+        "shareable": True,
+        "from": "self",
+    })
+    return items
+
+
+def layout(items: List[Dict[str, Any]], *, wake_at: float,
+           bedtime: float) -> List[Dict[str, Any]]:
+    """把时段展开成带起止的区间。返回新列表（不改入参）。
+
+    `wake_at`：她今天几点醒的。空档从这里开始算，不从 08:00 开始 ——
+    她 09:47 才醒，就不该有一条排在 09:00。
+    """
+    if not items:
+        return items
+    start_ts = float(wake_at or 0) or (float(bedtime or 0) - 9 * 3600)
+    end_ts = float(bedtime or 0)
+    if end_ts <= start_ts:
+        return items
+
+    slots = _free_slots(start_ts, end_ts)
+    out: List[Dict[str, Any]] = []
+
+    for item in items:
+        try:
+            row = dict(item)
+        except Exception:
+            continue
+        when = str(row.get("when") or "")
+        what = str(row.get("what") or "")
+
+        # 模型给过时刻就用它（旧格式），否则按时段算
+        fixed = _minute_of(str(row.get("at") or ""))
+        dur = duration_of(what) * 60
+
+        if 0 <= fixed:
+            at = _anchor(start_ts, fixed)
+            placed = _place(slots, at, at + dur, dur)
+            if placed is None:
+                placed = _place(slots, 0, end_ts, dur)   # 被占了就往后找
+        else:
+            win = WHEN_WINDOWS.get(when)
+            if win:
+                lo = _anchor(start_ts, win[0])
+                hi = _anchor(start_ts, win[1])
+                # 窗口已经过去（她醒得晚）→ 从"现在能排"的地方开始
+                lo = max(lo, start_ts + WAKE_BLOCK_MINUTES * 60)
+                placed = _place(slots, lo, hi, dur)
+                if placed is None:
+                    # 偏好窗口塞不下（比如「中午」被午饭块占掉大半）：
+                    # **往后放**，不要塞回更早的时段 —— 那会让她 10:00 吃午饭。
+                    placed = _place(slots, max(lo, hi), end_ts, dur)
+            else:
+                placed = None
+            if placed is None:
+                placed = _place(slots, start_ts, end_ts, dur)
+
+        if placed is None:
+            # 排不下就不排。她的一天不是待办清单，塞不进去就是今天没空。
+            continue
+
+        row["start"] = _hhmm(_minutes_local(placed))
+        row["end"] = _hhmm(_minutes_local(placed + dur))
+        row["at"] = row["start"]        # 兼容：UI 和旧代码只看 at
+        row["dur"] = int(dur // 60)
+        out.append(row)
+
+    out.sort(key=lambda x: str(x.get("start") or ""))
+    return out
+
+
+def _minutes_local(ts: float) -> float:
+    import datetime as _dt
+
+    d = _dt.datetime.fromtimestamp(ts)
+    return d.hour * 60 + d.minute + d.second / 60.0
 
 
 def ensure_yesterday(items: List[Dict[str, Any]],

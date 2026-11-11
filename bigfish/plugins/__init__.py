@@ -665,6 +665,11 @@ def _load_builtins() -> None:
 
     想加一个插件：在 bigfish/plugins/ 下新建一个文件，末尾调 register()，
     再在这里加一行 import。别的地方都不用动。
+
+    ⚠ 这九行看起来"导入了但没用"，其实是**整个插件系统的注册机制** ——
+      删掉它们，`register()` 一次都不会跑，所有内置插件消失。
+      静态检查会把它们报成 F401，所以每一行都带 `# noqa`。
+      （2026-11-10 被一个不看 noqa 的清理脚本误删过，三个接线测试同时红。）
     """
     from . import afterglow  # noqa: F401
     from . import guard  # noqa: F401

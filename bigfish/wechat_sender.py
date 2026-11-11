@@ -896,7 +896,9 @@ class UiaSender:
         它不预设"草稿长什么样"，所以不会被别的彩色骗。
         """
         try:
-            from wechatauto.guia import WeChatGUI
+            # 只探测它能不能加载（拿不到就抛一个说人话的错），
+            # 不导入名字 —— 真正要用的类在下面的函数里按需取。
+            import wechatauto.guia  # noqa: F401
         except Exception as exc:
             raise SendError(f"加载粘贴工具失败: {exc}", kind="import") from exc
 
@@ -1646,32 +1648,6 @@ class UiaSender:
 
 
 class ILinkSender:
-    """iLink 通道的适配器（可选，锁屏时用）。
-
-    限制：只能回给扫码授权的那个用户，且需要 context_token。
-    """
-
-    def __init__(self, bot=None, last_message=None):
-        self.bot = bot
-        self.last_message = last_message
-
-    @property
-    def ready(self) -> bool:
-        return bool(self.bot and self.bot.cred.valid)
-
-    def send(self, who: str, text: str) -> SendResult:
-        if not self.ready:
-            raise SendError("iLink 未登录", kind="auth")
-        if self.last_message is None:
-            raise SendError(
-                "iLink 需要先收到一条消息才能回复（context_token）",
-                kind="context")
-        try:
-            res = self.bot.send_text(self.last_message, text)
-            return SendResult(ok=True, who=who, text=text,
-                              detail=str(res[:1]) if res else "")
-        except Exception as exc:
-            raise SendError(f"iLink 发送失败: {exc}", kind="send") from exc
     """iLink 通道的适配器（可选，锁屏时用）。
 
     限制：只能回给扫码授权的那个用户，且需要 context_token。

@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from bigfish.vault import (
     MOOD_DIMS_ALL,
@@ -427,7 +427,63 @@ def read_mood_state_now() -> Optional[Dict[str, Any]]:
 # 独立衰减（v0.9）
 # ══════════════════════════════════════════════════════════════════════
 
-def decay_only(seed: str = "dafeiyu", now_ms: Optional[int] = None) -> bool:
+def baseline_of(*, sleep_debt: Any = 0.0, energy: Any = 70.0,
+                discomfort: str = "", weather: str = "") -> float:
+    """今天的情绪**底子**。
+
+    为什么需要这个：心情以前永远往 `moodBase`（70）衰减 —— 也就是说
+    睡差了、身上难受、连着阴三天、冻得手僵，底子都是 70。
+    于是"实时心情"在多数时候显示的是**衰减后的余数**，不是"她今天
+    本来是什么底子"。
+
+    人不是这样：底子低的时候一件小事就够烦，底子高的时候同样的事
+    笑笑就过去了。事件仍然由 `judge_mood` 加在上面，这里只决定地基。
+
+    参数全是"今天的状态"，不是"刚才发生了什么"：睡眠债、精力、
+    身上那点不舒服、天气。任何一项取不到都用中性值 —— 底子算错
+    比没有底子更糟。
+    """
+    base = 70.0
+    try:
+        debt = max(0.0, float(sleep_debt or 0.0))
+    except (TypeError, ValueError):
+        debt = 0.0
+    # 欠觉：每小时 -3，封顶 -12。
+    # 系数按 DEBT_CAP_MINUTES=240 反推：欠满 4 小时就是 -12，
+    # 再欠也只是"低"，不该一路掉到底。
+    base -= min(12.0, debt / 60.0 * 3.0)
+
+    try:
+        e = float(energy)
+    except (TypeError, ValueError):
+        e = 70.0
+    if e < 25:
+        base -= 8.0
+    elif e < 40:
+        base -= 5.0
+    elif e < 55:
+        base -= 2.0
+    elif e > 85:
+        base += 3.0
+
+    # 身上那点不舒服（眼睛干、腰酸、头沉）每天都有一点，
+    # 它压的是底子，不是"这一轮的心情"。
+    if str(discomfort or "").strip():
+        base -= 4.0
+
+    w = str(weather or "")
+    if any(k in w for k in ("雨", "雪", "阴", "雾", "霾")):
+        base -= 3.0
+    elif any(k in w for k in ("晴", "阳光")):
+        base += 2.0
+
+    # 下界 25：底子再低也不该让她"永远在低情绪"——那会变成演。
+    # 上界 92：留一点余地给事件，不然一件好事直接顶满，之后全是回落。
+    return max(25.0, min(92.0, base))
+
+
+def decay_only(seed: str = "dafeiyu", now_ms: Optional[int] = None,
+               baseline: Optional[float] = None) -> bool:
     """只做自然衰减，不应用任何判定。**不调模型。**
 
     存在的理由很具体：衰减以前只写在 `judge_and_apply` 里 ——
@@ -472,6 +528,13 @@ def decay_only(seed: str = "dafeiyu", now_ms: Optional[int] = None) -> bool:
 
     cfg = read_mood_config()
     base = float(_clamp(int(cfg["moodBase"]), 0, 100))
+    # 有身体/睡眠/天气推出来的底子就用它，没有就退回配置里的常数。
+    # 这是"心情有基线"唯一的落点 —— 事件加在上面，衰减往这里靠。
+    if baseline is not None:
+        try:
+            base = float(_clamp(int(round(float(baseline))), 0, 100))
+        except (TypeError, ValueError):
+            pass
     half = _clamp(int(cfg.get("decayHalfHours") or 12), 1, 168)
 
     last_decay = int(s.get("lastDecayAt") or now)

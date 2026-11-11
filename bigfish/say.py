@@ -42,13 +42,12 @@ from __future__ import annotations
 
 import difflib
 import hashlib
-import math
 import re
 import time
 from dataclasses import dataclass, field
 
 from bigfish import sending
-from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 # ══════════════════════════════════════════════════════════════════════
 # 一、分条
@@ -463,6 +462,94 @@ def _msg_field(msg: Any, name: str, default: Any = None) -> Any:
     return getattr(msg, name, default)
 
 
+#: 统计口头禅时跳过的词 —— 人称、语气、功能词。
+#: 不跳的话每轮都会抽出"就是""然后""这个"，那不是口头禅，是中文。
+_TIC_STOP = frozenset("""
+我们 你们 他们 她们 什么 这个 那个 就是 可以 没有 一个 自己 现在 知道
+不是 还是 但是 因为 所以 然后 真的 有点 已经 觉得 时候 这样 那种 这种
+如果 不过 其实 一下 一样 一起 出来 起来 下来 上来 过来 回去 进去 出去
+今天 明天 昨天 早上 晚上 下午 中午 一点 一些 很多 特别 反正 而且 或者
+应该 可能 大概 好像 感觉 东西 事情 地方 以后 以前 刚才 马上 一直 总是
+""".split())
+
+
+#: 2-gram 里只要有一个字是这些虚字，就跳过。
+#:
+#: 为什么需要：中文没有空格，滑窗切出来的 2-gram 大量跨词边界 ——
+#: "这个东西就是这样" 会切出「西就」「个东」这种根本不存在的词。
+#: 光靠停用词表挡不住（词表追不上），但虚字表很稳定：
+#: 一个真词里几乎不会同时出现"就/是/的/了/个"这种字。
+_TIC_VOID = frozenset(
+    "的了是在不有个就都而及等被把让给向从对为以于之与或但所以因这那"
+    "什么很太更最又再还也才只着过来去点些样候事宜吧呢啊呀哦嗯"
+)
+
+
+def recent_tics(rows, *, min_msgs: int = 3, top: int = 1) -> list:
+    """她自己最近老爱说的词。返回 [(词, 出现在几条消息里), ...]。
+
+    ⚠ 这是「语言会漂」的最小实现。以前她的用词是固定的 ——
+      `soul.py` 的 "render, don't hold" 只从人格数据渲染，不学习，
+      于是八个月后她说话和今天一模一样，只有长短会变。
+      人不是这样：某一阵子会老爱说某个词，过阵子又换一个。
+
+    只统计 **2 字词**（中文的"用词"基本是双音节），
+    而且数的是**出现在多少条不同的消息里**，不是出现多少次 ——
+    一条消息里重复十遍不算"老爱说"，那是复读。
+    """
+    from collections import Counter
+
+    cnt: Counter = Counter()
+    for row in rows or []:
+        try:
+            who, text = row[0], row[1]
+        except Exception:
+            continue
+        if str(who) != "我":
+            continue
+        # 只留汉字：标点、数字、表情都不算用词
+        s = "".join(ch for ch in str(text or "")
+                    if "\u4e00" <= ch <= "\u9fff")
+        if len(s) < 4:
+            continue
+        seen = set()
+        for i in range(len(s) - 1):
+            w = s[i:i + 2]
+            if w in _TIC_STOP:
+                continue
+            # 跨词边界的垃圾（"西就""个东"）靠虚字表挡掉
+            if w[0] in _TIC_VOID or w[1] in _TIC_VOID:
+                continue
+            seen.add(w)
+        cnt.update(seen)
+    return [(w, n) for w, n in cnt.most_common() if n >= int(min_msgs)][:max(1, int(top))]
+
+
+def _peer_spoke(chat: str, read_recent, since_id: int) -> bool:
+    """发这几条的间隙里，对方有没有插话。
+
+    只在**确实看到**对方的新消息时返回 True；任何异常一律 False。
+    判断偏保守是有意的：误判会让她的话永远断在莫名其妙的地方，
+    而漏判只是少了一次"停下来"，还在可接受的范围里。
+    """
+    if since_id <= 0:
+        return False
+    try:
+        for msg in read_recent(chat, 6):
+            try:
+                lid = int(_msg_field(msg, "local_id", 0) or 0)
+            except Exception:
+                continue
+            if lid <= since_id:
+                continue
+            if bool(_msg_field(msg, "is_self", False)):
+                continue
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def send_parts(
     send: Callable[[str, str], Any],
     read_recent: Callable[[str, int], Sequence[Any]],
@@ -499,11 +586,30 @@ def send_parts(
     unconfirmed: List[int] = []
     last_level = "L1"
     last_confirmed = ""
+    #: 分条发送前最后一条消息的 id。之后出现任何非自己的新消息 = 对方插话。
+    first_base_id = 0
 
     for index, part in enumerate(parts):
+        # 被打断：对方在我们发这几条之间插话了，剩下的就不发。
+        #
+        # 以前她说到第 2 条、对方插一句，她照样把第 3、4 条发完 ——
+        # 那不是"把话说完整"，那是没在听。真人被打断就是会停下来，
+        # 甚至忘了刚才想说什么。这是她的话第一次真的可能被截断。
+        #
+        # 第一条不检查：那是对这句话的回应，必须发出去。
+        # 判据用第一条发送前的 local_id 基线 —— 之后任何一条非自己的
+        # 新消息都算插话。
+        if index > 0 and _peer_spoke(chat, read_recent, first_base_id):
+            say(f"say: 被插话，剩下 {len(parts) - index} 条不发")
+            return SendOutcome(True, last_level, sent, index,
+                               "interrupted by peer", last_confirmed,
+                               mismatches, unconfirmed)
+
         # 基线必须在发送前取：发送后再取，自己这条已经在里面了
         base_msgs = list(read_recent(chat, 1))
         base_id = max((int(_msg_field(m, "local_id", 0) or 0) for m in base_msgs), default=0)
+        if index == 0:
+            first_base_id = base_id
 
         # 记账必须在 send 之前（11-04 的教训：记账晚于写库就漏窗口）
         receipt = ledger.note_sent(chat, part) if ledger is not None else None

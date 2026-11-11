@@ -28,18 +28,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from . import paths
 from . import voice_audio as A
 from . import voice_director as D
-
-try:
-    from .voice_text import clean_for_tts
-except ImportError:  # pragma: no cover
-    from voice_text import clean_for_tts  # type: ignore
 
 #: Breeze 文本上限（默认 1000；申请后最高 2000）。大肥鱼正文上限 300，够用。
 MAX_CHARS = 1000

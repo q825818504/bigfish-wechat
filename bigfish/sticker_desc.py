@@ -51,7 +51,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 #: 送进模型的图最大边长。再大对判断没帮助，只是让请求变慢
 VISION_MAX = 512

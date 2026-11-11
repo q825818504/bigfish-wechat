@@ -20,7 +20,6 @@ import ctypes
 import time
 import wave
 from ctypes import wintypes
-from pathlib import Path
 from typing import Callable, List, Optional
 
 _winmm = ctypes.WinDLL("winmm", use_last_error=True)

@@ -16,7 +16,7 @@ import math
 import wave
 from array import array
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 TARGET_SR = 24000
 TARGET_PEAK = 0.89

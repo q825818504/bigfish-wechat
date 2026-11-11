@@ -490,10 +490,6 @@ def _recent_lines(chat_id: str, limit: int = 12) -> List[Tuple[str, str]]:
         return []
 
 
-def _peer_lines(lines: List[Tuple[str, str]], me: str) -> List[Tuple[str, str]]:
-    return [(w, t) for w, t in lines if w and w != me]
-
-
 def _hours_since(ts: float, now: float) -> float:
     if not ts:
         return 1e9

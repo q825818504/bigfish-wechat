@@ -44,8 +44,8 @@ Ollama、LM Studio……）都是 OpenAI 兼容，归第一类。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 #: 支持的协议。顺序 = 界面上下拉框的顺序。
 PROTOCOLS: Tuple[str, ...] = ("openai", "anthropic", "gemini")

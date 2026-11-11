@@ -52,7 +52,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # 版本号写入 PRAGMA user_version。
 #   1  原文四表（MemoryStore 兼容）
@@ -1175,17 +1175,36 @@ _NOW_MS_SQL = "CAST(ROUND((julianday('now') - 2440587.5) * 86400000.0) AS INTEGE
 #:
 #: 分数 = 置信度 × 衰减 + 使用加成
 #:
-#:   衰减  0.5 ** (距上次使用天数 / 90)     三个月没用 → 减半
-#:   加成  use_count × 0.03                 用得多的浮上来，但有上限
+#:   衰减  0.5 ** (距**上一次被用到**的天数 / 90)     三个月没碰 → 减半
+#:   加成  use_count × 0.03                          用得多的浮上来，但有上限
 #:
-#: ⚠ 两项都用 COALESCE 兜住：老库迁移后这两列是 0，0 的衰减算作 1（全新鲜），
-#:   不会因为"从没用过"而全体沉底。这一条很重要 —— 否则升级当天所有老条目
-#:   会一起掉到最后，用户会以为记忆全丢了。
+#: ⚠ 基准是 `last_used_at`，没有就退到 `created_at`。
+#:
+#:   以前这里写的是 `CASE WHEN last_used_at = 0 THEN 1.0` —— 也就是
+#:   **从没被用过的事实永远算新鲜**。后果是：三年前那句"你拔过智齿"
+#:   和昨天刚聊的事一样新，真正被压下去的只有"用过一次就再没人提"的那批。
+#:   可"很久没想起过的一件事"恰恰是最该沉的 —— 人就是这样忘东西的。
+#:
+#:   衰减有**地板** 0.08：再久没想起的事也不是零。
+#:
+#:   没有地板的话，三年前那条"你拔过智齿"会算成 0.0002 —— 于是它连
+#:   候选池都进不去，而"我牙疼"恰恰最需要它。人是这样忘事的：
+#:   旧的会变模糊、排到后面，但**不会被抹平**。
+FACT_DECAY_FLOOR = 0.08
+
+#: 同一个谓词在注入段里最多留几条（见 facts_for_prompt）
+PER_PREDICATE_MAX = 3
+
+#: use_count 的饱和上限。见 _fact_score：不封顶的话，被注入过的每轮 +1，
+#: 几十轮后排序完全由它决定，时间衰减再也压不下去。
+USE_COUNT_CAP = 20
+
 _FRESH_ORDER = (
     "(COALESCE(confidence, 0.5) * "
-    "CASE WHEN COALESCE(last_used_at,0) = 0 THEN 1.0 ELSE "
-    f"POWER(0.5, (({_NOW_MS_SQL} - last_used_at) / 86400000.0) / {FACT_HALF_LIFE_DAYS}) END "
-    "+ COALESCE(use_count,0) * 0.03) DESC"
+    f"MAX({FACT_DECAY_FLOOR}, POWER(0.5, (MAX(0, "
+    f"  ({_NOW_MS_SQL} - COALESCE(NULLIF(last_used_at,0), NULLIF(created_at,0), {_NOW_MS_SQL}))"
+    f"  ) / 86400000.0) / {FACT_HALF_LIFE_DAYS})) "
+    "+ MIN(COALESCE(use_count,0), 20) * 0.03) DESC"
 )
 
 
@@ -1966,7 +1985,32 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
     extra.sort(key=lambda x: -float(x.get("confidence") or 0))
     extra = extra[:4]          # 开放信息是补充，不该挤掉"我自己的事"
 
+    # ⑤ 时间线：这条事实之前是什么样。
+    #
+    #    只在**被选中的前几条**上做，且最多查 4 条 —— 每条要多开一次
+    #    只读连接，不值得为整个候选池付这个钱。渲染成
+    #    「以前：天天生气 → 提了离职」，她才第一次有"变化"而不只是"状态"、
+    #    才可能在很久以后说一句"你以前不是这样的"。
+    past: Dict[int, List[str]] = {}
+    try:
+        # 只看**非置顶**的前 4 条。置顶通常就是 4 条上限，把它们全占掉
+        # 等于普通事实永远拿不到时间线 —— 而"关系变化"恰恰不在置顶里。
+        for item in [i for i in picked if not i.get("pinned")][:4]:
+            _ln = lineage(path, bank, int(item.get("id") or 0), limit=3,
+                          current=str(item.get("object") or ""))
+            if _ln:
+                past[int(item["id"])] = _ln
+    except Exception:
+        past = {}
+
     seen, lines = set(), []
+    # 同一个谓词最多留几条。
+    #
+    # 日记回流之后，"那天"每天涨一条 —— 一年 365 条，候选池（24~48）
+    # 会被它占满，把"关于他的事"挤出去。这不是理论风险：只要用满一年
+    # 就必然发生。同理"工作""称呼"这类也会攒成一片。
+    # 三条够她"记得最近怎么过的"，又不至于淹掉别的事实。
+    _per_pred: Dict[str, int] = {}
     for item in picked + extra:
         fid = item.get("id")
         if fid in seen:
@@ -1974,6 +2018,10 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
         seen.add(fid)
         if len(lines) >= limit + pinned_limit + len(extra):
             break
+        _pred = str(item.get("predicate") or "")
+        if _per_pred.get(_pred, 0) >= PER_PREDICATE_MAX:
+            continue
+        _per_pred[_pred] = _per_pred.get(_pred, 0) + 1
         # "我"= 这个人自己的（任何一个平台账号），"别人"= 别的 owner 分享出来的
         who = item["anchor"] or ("我" if item["owner"] in mine else "别人")
         conf = item["confidence"]
@@ -1991,7 +2039,7 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
         if item["owner"] not in mine and item.get("visibility") in (VIS_SHARED, VIS_PUBLIC):
             shared_mark = "（可以告诉别人）"
         lines.append(f"- {star}{who}｜{item['predicate']}：{item['object']}"
-                     f"{mark}{where}{shared_mark}")
+                     f"{_past_tail(past, fid)}{mark}{where}{shared_mark}")
 
     # ⑤ 记一次"用上了"。
     #    注意记的是**真的进了提示词**的那几条，不是候选池 ——
@@ -2004,20 +2052,154 @@ def facts_for_prompt(path: str, bank: str, *, owner: str, tier: str,
     return "\n".join(lines)
 
 
+def _past_tail(past: Dict[int, List[str]], fid: Any) -> str:
+    """把时间线渲染成一个括号尾巴。没有就空串。"""
+    if not past or fid is None:
+        return ""
+    try:
+        chain = past.get(int(fid))
+    except (TypeError, ValueError):
+        return ""
+    if not chain:
+        return ""
+    return "（以前：" + " → ".join(chain) + "）"
+
+
+def _worth_showing(old: str, new: str) -> bool:
+    """这一环「以前」值不值得显示。
+
+    supersede 只在 object 不同时触发，但模型常把**同一件事换个说法**：
+        「她称呼对方为爸」 → 「她称呼对方为「爸」」
+        「是她的爸爸，她称呼对方为「爸」」 → 「爸」
+
+    这种在时间线里毫无信息量（读者看不出发生过什么），
+    还占掉本可以放别的的 token。真实库里第一条就撞上了。
+
+    判据：去标点后一个是另一个的子串 → 没变；
+    字符集重合度很高 → 同义改写。
+    """
+    a = re.sub(r"[^\w\u4e00-\u9fff]", "", str(old or ""))
+    b = re.sub(r"[^\w\u4e00-\u9fff]", "", str(new or ""))
+    if not a or not b:
+        return False
+
+    # ── 先判"一定值得看"的三种，再看措辞 ──
+    # 字符集 Jaccard 丢掉顺序和重复，所以它精确地吞掉"高重合但语义全变"
+    # 的那一类 —— 而那恰恰是最该出现在时间线里的：
+    #   数字变了（分数/日期/时间被改对）  → 620 → 602
+    #   否定翻转                           → 喜欢他 → 不喜欢他
+    #   同样的字换了顺序                   → 猫咬狗 → 狗咬猫
+    if re.findall(r"\d+", str(old)) != re.findall(r"\d+", str(new)):
+        return True
+    _neg = ("不", "没", "别", "无", "未")
+    if any(n in str(old) for n in _neg) != any(n in str(new) for n in _neg):
+        return True
+    if set(a) == set(b) and a != b:
+        return True
+
+    if a in b or b in a:
+        return False
+    sa, sb = set(a), set(b)
+    common = len(sa & sb) / max(1, len(sa | sb))
+    # 长度相近 + 字面高度重合 → 同义改写（"她称呼对方为爸" vs "她称呼对方为「爸」"）。
+    # 只靠 Jaccard 的话，8 字以上的句子骨架一样就普遍 >0.75，长句几乎一律被吞；
+    # 加上长度这一维，短句也能挡。
+    if abs(len(a) - len(b)) <= 2 and common > 0.6:
+        return False
+    return common <= 0.75
+
+
+def lineage(path: str, bank: str, fact_id: int,
+            limit: int = 2, current: str = "") -> List[str]:
+    """这条事实**之前的样子**（被它取代的那些），从旧到新排列。
+
+    supersede 链本身就是时间线：同一个人、同一个谓词，改一次关系就多一环。
+    把它渲染出来之后，她第一次有「那年冬天」这种东西 ——
+    不是一条静态的事实（"他在准备离职"），而是一个**变化**
+    （"以前天天生气 → 后来提了离职 → 现在在交接"）。
+
+    只往回走 `limit` 环。再长的话提示词里全是考古，
+    而人回忆时也只记得"以前不是这样"，不记得每一版。
+
+    失败一律返回空 —— 时间线是锦上添花，不能让它拖垮注入。
+    """
+    out: List[str] = []
+    try:
+        cur = int(fact_id)
+    except (TypeError, ValueError):
+        return out
+    if cur <= 0:
+        return out
+    try:
+        conn = connect(path, read_only=True)
+    except Exception:
+        return out
+    seen = {cur}
+    prev_obj = str(current or "")
+    try:
+        # 用 limit*3 次机会：中间如果夹着被遗忘的环，跳过它还要继续往上，
+        # 只给 limit 次的话一跳就没了。
+        for _ in range(max(1, min(4, int(limit))) * 3):
+            row = conn.execute(
+                "SELECT id, object, status FROM facts "
+                "WHERE bank=? AND superseded_by=? "
+                "ORDER BY updated_at DESC LIMIT 1", (bank, cur)).fetchone()
+            if not row:
+                break
+            nid = int(row["id"])
+            if nid in seen:
+                break
+            seen.add(nid)
+            if str(row["status"] or "") == "forgotten":
+                # 中间那一环被忘了：**跳过它继续往上**，别让整条链断在这儿。
+                # 以前 WHERE 里带 status != 'forgotten' + LIMIT 1，于是
+                # 返回空 → break，更早的环全部不可见（"一断全断"）。
+                cur = nid
+                continue
+            obj = str(row["object"] or "").strip()
+            # 只收"真的变了"的那一环；同义改写跳过，但继续往上找 ——
+            # 改了三版、前两版都是措辞差别时，第三版才是真正的转折。
+            if obj and _worth_showing(obj, prev_obj):
+                out.append(obj[:40])
+            if obj:
+                prev_obj = obj
+            cur = nid
+    except Exception:
+        out = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    out.reverse()          # 旧 → 新
+    return out
+
+
 def _fact_score(item: Dict[str, Any], now: int) -> float:
     """一条事实的「取用分数」。与 SQL 里的 _FRESH_ORDER 同一套公式。
 
     ⚠ 两处必须一致。改一处不改另一处，界面看到的顺序会和注入用的顺序对不上 ——
       那种不一致最难查，因为两边看起来都"正常"。
     """
-    conf = float(item.get("confidence") or 0.5)
+    # ⚠ 不能把 0.0 当成"没给"：confidence=0.0 是合法值（模型给过 0）。
+    #   写成 `x or 0.5` 的话 0.0 会变成 0.5，一条 0 分的事实直接跳到最前面，
+    #   而 SQL 侧用的是真值 0.0 —— 两边顺序反转。
+    _conf = item.get("confidence")
+    conf = 0.5 if _conf is None else float(_conf)
     used = int(item.get("lastUsedAt") or 0)
-    if used <= 0:
-        decay = 1.0                      # 从没用过 = 不算陈旧（见 _FRESH_ORDER 注释）
-    else:
-        days = max(0.0, (now - used) / 86_400_000.0)
-        decay = 0.5 ** (days / FACT_HALF_DAYS_EFFECTIVE)
-    return conf * decay + int(item.get("useCount") or 0) * 0.03
+    born = int(item.get("createdAt") or 0)
+    # 基准 = 上次被用到，没有就退到创建时间；两个都没有（老库）就当现在。
+    # 见 _FRESH_ORDER 的注释：以前 used<=0 直接 decay=1.0，
+    # 于是"从没被用过"等于"永不变旧"。
+    base = used or born or now
+    days = max(0.0, (now - base) / 86_400_000.0)
+    # 地板见 _FRESH_ORDER 的注释：旧的会变模糊、排到后面，但不会被抹平。
+    decay = max(FACT_DECAY_FLOOR, 0.5 ** (days / FACT_HALF_DAYS_EFFECTIVE))
+    # use_count 有饱和上限，和 SQL 的 MIN(...,USE_COUNT_CAP) 对齐。
+    # 没上限的话，被注入过的每轮 +1，几十轮后排序完全由它决定，
+    # 时间衰减再也压不下去 —— "三年前的进不来"换个形式回来。
+    used_n = min(USE_COUNT_CAP, int(item.get("useCount") or 0))
+    return conf * decay + used_n * 0.03
 
 
 #: _fact_score 里的半衰期。与 SQL 常数同一来源，只是这边要 float。
@@ -3482,7 +3664,6 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
 # 检索逻辑只有这一份：Node 侧不再有第二套排序，两边不会再漂。
 
 def _cli(argv: Sequence[str]) -> int:
-    import sys
 
     args = list(argv)
     cmd = ""

@@ -55,7 +55,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 KIND_ADDRESS = "address"     # 称呼
 KIND_UNSAID = "unsaid"       # 未说出口的话

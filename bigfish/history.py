@@ -66,17 +66,41 @@ def path_for(chat_id: str, root: Optional[str] = None) -> str:
     return os.path.join(_dir(root), f"{key}.jsonl")
 
 
+def _tail_lines(path: str, n: int) -> List[str]:
+    """只读文件最后 n 行。
+
+    为什么不 readlines()：这个文件会一直长（一天几十上百行），
+    一年后是几 MB。而调用方要的永远是"最近几条"——
+    每次把整个文件读进内存再切片，是纯粹的浪费。
+    （2026-11-10：`_tics_block` 每轮都读一次，把它暴露出来了。）
+
+    从尾部按块往回读，找到够 n 行就停。切到多字节字符中间时
+    那一行会解码成乱码 —— json 解析失败会被跳过，只丢一行，可接受。
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            block = min(size, 32 * 1024)
+            while True:
+                f.seek(max(0, size - block))
+                data = f.read()
+                text = data.decode("utf-8", "replace")
+                lines = text.splitlines()
+                if len(lines) > n or block >= size:
+                    return lines[-max(1, int(n)):]
+                block = min(size, block * 2)
+    except Exception:
+        return []
+
+
 def load(chat_id: str, *, limit: int = DEFAULT_LOAD,
          root: Optional[str] = None) -> List[Tuple[str, str]]:
     """读回最近 limit 条 (who, text)。任何失败都返回空列表。"""
     path = path_for(chat_id, root)
     if not os.path.isfile(path):
         return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception:
-        return []
+    lines = _tail_lines(path, int(limit) + 2)   # 多读两行兜住空行/坏行
     out: List[Tuple[str, str]] = []
     for raw in lines[-max(1, int(limit)):]:
         raw = raw.strip()

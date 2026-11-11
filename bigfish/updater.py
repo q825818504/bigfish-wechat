@@ -27,10 +27,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import ssl
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error

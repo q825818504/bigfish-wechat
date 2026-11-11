@@ -18,7 +18,6 @@ import json
 import os
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
@@ -63,17 +62,6 @@ class Incoming:
     def preview(self, width: int = 60) -> str:
         c = (self.text or "").replace("\n", " ")
         return c if len(c) <= width else c[:width] + "…"
-
-
-def _load_watermarks() -> Dict[str, int]:
-    if os.path.isfile(WATERMARK_FILE):
-        try:
-            with open(WATERMARK_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            return {k: int(v) for k, v in d.items() if str(v).isdigit()}
-        except Exception:
-            pass
-    return {}
 
 
 def _save_watermarks(wm: Dict[str, int]) -> None:

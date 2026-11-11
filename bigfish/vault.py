@@ -30,7 +30,6 @@
 """
 from __future__ import annotations
 
-import glob
 import hashlib
 import json
 import os
@@ -170,10 +169,6 @@ def set_data_root(path: str) -> Tuple[bool, str]:
     except Exception as exc:
         return False, str(exc)
 
-
-def resolve_data_root() -> str:
-    """历史名字，等价于 install_root()。调用点很多，保留别名。"""
-    return install_root()
 
 
 def normalize_root(path: str) -> str:

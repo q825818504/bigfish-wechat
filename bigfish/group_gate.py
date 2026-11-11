@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import Set
 
 # 微信在正文里用 \x01 标记 @ 的边界，读取时常见会被剥掉或不显示
 AT_MARK = "\x01"

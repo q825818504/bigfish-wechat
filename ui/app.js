@@ -286,18 +286,34 @@ function renderTodayPlan(d) {
   const now = new Date();
   const minute = now.getHours() * 60 + now.getMinutes();
   const mins = plan.map((x) => {
-    const m = /^(\\d{1,2}):(\\d{2})$/.exec(String(x.at || ''));
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(x.at || ''));
+    return m ? Number(m[1]) * 60 + Number(m[2]) : -1;
+  });
+  const ends = plan.map((x) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(x.end || ''));
     return m ? Number(m[1]) * 60 + Number(m[2]) : -1;
   });
   let nowIdx = -1;
-  plan.forEach((x, i) => { if (!x.done && mins[i] >= 0 && mins[i] <= minute) nowIdx = i; });
+  plan.forEach((x, i) => {
+    if (x.done || mins[i] < 0) return;
+    // 有区间就按区间（start ≤ now < end），没有就退回"已经开始过"。
+    // ⚠ 这里的正则以前写成 \d（双重转义），匹配的是字面反斜杠 ——
+    //   于是 mins 全是 -1，"现在在做"这个标记从上线起就没亮过。
+    const hit = ends[i] > mins[i]
+      ? (minute >= mins[i] && minute < ends[i])
+      : (mins[i] <= minute);
+    if (hit) nowIdx = i;
+  });
   box.innerHTML = plan.map((x, i) => {
     // 睡着了就不存在“现在在做”这件事；手头的事由 life.doing 单独说。
     const isNow = !asleep && i === nowIdx;
     const state = x.done ? (x.done_by === 'elapsed' ? '已过去' : '做完了') : (isNow ? '现在在做' : '');
     const from = x.from === 'yesterday' ? '接着昨天' : x.from === 'fact' ? '来自记得的事' : '她自己排的';
+    // 有区间就显示 "09:00–09:50"：一天里每件事有起止，才看得出她不是
+    // 同时在做三件事。旧数据没 end，就只显示开始时刻。
+    const when = x.end ? `${x.at}–${x.end}` : (x.at || '—');
     return `<div class="plan-item ${x.done ? 'is-done' : ''} ${isNow ? 'is-now' : ''}">
-      <span class="plan-time">${esc(x.at || '—')}</span>
+      <span class="plan-time">${esc(when)}</span>
       <span class="plan-dot"></span>
       <div class="plan-copy"><div class="plan-title">${esc(x.what)}</div><div class="plan-meta">${from}</div></div>
       <span class="plan-state">${state}</span>
@@ -324,7 +340,11 @@ function renderToday(d) {
     : `${greeting}，她正在过自己的今天。`);
   setText('#ovCondition', conditionShort);
   setText('#ovEnergy', life.energy != null ? `精力 ${life.energy}` : '精力 —');
-  setText('#ovWake', asleep ? `约 ${life.wake_at || '—'} 醒` : (life.wake_at ? `醒来 ${life.wake_at}` : '睡眠 —'));
+  setText('#ovWake', asleep
+    ? (life.wake_at ? `约 ${life.wake_at} 醒` : '睡眠 —')
+    // 醒着时报「今天几点醒的」。不能用 wake_at —— 它在醒来后已经被
+    // 重算成明早，显示出来会变成"她明早 09:47 醒的"，读着完全不通。
+    : (life.just_woke_at ? `${life.just_woke_at} 醒` : (life.wake_at ? `醒来 ${life.wake_at}` : '睡眠 —')));
   S.todayAsleep = asleep;
   setText('#ovDoingLabel', asleep ? '此刻' : '此刻在做');
   setText('#ovDoing', asleep ? '她已经睡了' : (life.doing || '还没有写下手头的事'));
@@ -333,6 +353,9 @@ function renderToday(d) {
     : (life.doing ? '来自生活状态' : '—'));
   setText('#ovTodayLabel', `${d.day || '—'} · 周${d.weekday || '—'}`);
   setText('#ovMoodScore', mood.value != null ? `${mood.value} · ${mood.label || ''}` : '—');
+  // 「为什么」这一行是这张卡最关键的一格：只有分数是仪表盘，
+  // 有原因才是有人在里面。reason 由 mood_judge 在每次判定后写。
+  setText('#ovMoodWhy', mood.reason ? String(mood.reason).slice(0, 30) : '—');
   setText('#ovMoodLabel', mood.value != null ? `心情 ${mood.value} · ${mood.label || ''}` : '心情 —');
   setText('#ovAfterglowCount', afterglow.count ? `${afterglow.count} 条` : '无');
   // 两处都取 afterglow.text 会同一段话出现两次；右侧只给“有没有余韵”的
@@ -3912,7 +3935,20 @@ async function onBridgeReady(b) {
   // 必须在首屏渲染之前跑完，否则会先闪一下再消失。
   if (typeof syncPluginNav === 'function') await syncPluginNav();
 
-  setInterval(refreshStatus, 2000);
+  // 状态轮询：可见时 3 秒，最小化/切走时 15 秒。
+  //
+  // 以前是一律 2 秒。挂机三小时 = 5400 次跨进程调用，每次都在
+  // Chromium 里留一点对象 —— 2026-11-11 那次 0xc0000005 闪退，
+  // 跑了 3 小时 48 分，时间对得上。
+  // 最小化时谁也不需要看状态，那段压根没必要 2 秒问一次。
+  let _statusTimer = null;
+  function scheduleStatus() {
+    const ms = document.hidden ? 15000 : 3000;
+    if (_statusTimer) clearInterval(_statusTimer);
+    _statusTimer = setInterval(refreshStatus, ms);
+  }
+  document.addEventListener('visibilitychange', scheduleStatus);
+  scheduleStatus();
   setInterval(loadToday, 60000);
   setInterval(tickClock, 1000);
 

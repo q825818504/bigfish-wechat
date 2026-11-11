@@ -33,7 +33,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 #: 判"纯图片/表情"用的类型名。与 `wechat.py` 的 `msg_type` 对齐。
 MEDIA_TYPES = frozenset({"图片", "表情", "语音", "视频", "文件", "动画表情"})

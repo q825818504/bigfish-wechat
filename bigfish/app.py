@@ -770,7 +770,13 @@ class BigFishApp:
 
 # ----------------------------------------------------------------------
 def _facts_block(limit: int = 12) -> str:
-    """从记忆库取「她认定的事」渲染成注入段。失败返回空串，绝不中断对话。"""
+    """从记忆库取「她认定的事」渲染成注入段。失败返回空串，绝不中断对话。
+
+    这里**故意不传 owner**：app.py 是命令行入口，一次只跟一个
+    `--who` 会话说话，库里就只有主人一个人。传 owner 反而要先知道
+    主人是谁 —— 那是 desktop 的绑定流程，CLI 没有。
+    （desktop 的两处必须传，见 `world._gather_day_materials` 的注释。）
+    """
     try:
         from bigfish import memory as M, vault as V
 
