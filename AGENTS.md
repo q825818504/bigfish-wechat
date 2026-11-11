@@ -47,6 +47,15 @@ python tools/setup-git-token.py
 
 ## 改代码的习惯
 
+- **改完源码必须打包**：`python tools/deploy.py`。
+
+  源码改了不打包，用户跑的永远是旧 exe。2026-11-10 晚上就栽在这里：
+  `catch_up` 修好后没重新打包，用户第二天跑的仍是前一天的版本，
+  「启动后才睡」这个 bug 看起来完全没修，白费一整天。
+
+  判断方法：`ls -la dist/BigFish/BigFish.exe` 的时间要**晚于**最后改的 `.py`。
+  自检全绿、测试全过、端到端跑通，都抵不过一句「exe 没换」。
+
 - **注释写"为什么"，不写"做了什么"**。这个项目里最贵的注释是
   「以前这里是 X，因为 Y 会出问题，所以改成 Z」。
 - **拿不准就闭嘴**。宁可少说一句，不要说错。
@@ -55,7 +64,8 @@ python tools/setup-git-token.py
 - **改完跑自检**：
 
 ```bash
-python tools/selftest.py                        # 源码全套（23 项）
+python tools/selftest.py                        # 源码全套（18 项）
+for f in tools/selftest_*.py; do python "$f"; done   # 42 个，只跑第一个会漏
 dist/BigFish/BigFish.exe --selftest             # 打包版（要管理员）
 ```
 
