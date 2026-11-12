@@ -2865,3 +2865,50 @@ handshake`），直连和代理都失败，而百度正常、代理访问 codelo
 ### 验证
 
 51 个 `selftest_*.py` 全绿；`check.py` 版本 0.13.4；打包版自检 20/1/1。
+
+---
+
+## 2026-11-12 18:29–19:00 — v0.13.5：闪退定位到"原地 reload"
+
+### 用户报告
+
+「今天大肥鱼又闪退了，中途」。
+
+### 证据链
+
+Windows 事件日志，两次**完全一致**：
+
+```
+2026-11-11 15:07:08  Qt6WebEngineCore.dll 6.9.3.0  0xc0000005  偏移 0xf722d3
+2026-11-12 12:45:59  Qt6WebEngineCore.dll 6.9.3.0  0xc0000005  偏移 0xf722d3
+```
+
+- 同一偏移 = 同一处指令，不是随机踩踏。
+- `crash.log` 不存在 → 不是 Python 异常（系统直接杀进程，钩子轮不到）。
+- 12:45:59 = 11:05:59（窗口创建）+ 5 × 20 分钟 → **正好第 5 次内存看门狗 tick**。
+- 那一刻唯一的动作：`view.load()` 原地重载。
+- 顺带发现：`_watch_memory` 里的 `self.backend._log(...)` 一直是错的
+  （`Backend` 没有 `_log`，它在 `EngineWorker` 上），所以内存读数
+  **从来没被记录过** —— 这就是为什么两次都没法回答"崩之前多少 MB"。
+
+### 修了什么
+
+| # | 改动 | 文件 |
+|---|---|---|
+| 1 | `_rebuild_view()`：换新 page 代替原地 reload | `desktop.py` |
+| 2 | 看门狗 20min/750MB → **10min/550MB**，每次记一行内存 | `desktop.py` |
+| 3 | 日志落盘 `<数据根>/logs/app.log`（滚动 5MB） | `desktop.py` |
+| 4 | `_ui_log()` 取代错误的 `self.backend._log()` | `desktop.py` |
+| 5 | 顺带：`due_line` 按日历日差（动态检查撞出的 bug） | `future.py` |
+
+### 验证
+
+- 52 个 `selftest_*.py` 全绿（新增 `selftest_crashlog.py` 16 条）
+- **GUI 冒烟**：真窗口 + 真实 WebEngine，连续换页两次，`loadFinished` 全 True
+- `selftest_future` 33 → 38（补了两条"下午之后"的用例）
+
+### 诚实说明
+
+换页不能 100% 保证不再崩 —— 它拆掉的是"已知的触发路径"，不是
+Qt WebEngine 的所有可能。但**从这一版开始有现场**：
+`D:\大肥鱼\logs\app.log` 会有崩前 10 分钟的内存曲线与最后一次动作。

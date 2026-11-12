@@ -183,7 +183,14 @@ def resolve(db: str, event_id: int, *, status: str = "resolved") -> bool:
 
 
 def due_line(event: Dict[str, Any], *, now: Optional[float] = None) -> str:
-    """把一条到期约定渲染成一句人话（给主动开口用）。"""
+    """把一条到期约定渲染成一句人话（给主动开口用）。
+
+    ⚠ 按**日历日差**算，不是"到期时刻距今天 0 点多少小时"。
+    以前用的是后者，于是：19:00 说"明天 10 点体检"（24 小时后）时，
+    差值是 1.79 天 → 被说成"后天"；而今天 23:00 的事 → 0.96 天 →
+    被说成"明天"。两句话都是错的，而且只在**下午之后**才错，
+    上午跑测试永远发现不了（2026-11-12 动态检查撞出来的）。
+    """
     now = float(now if now is not None else time.time())
     what = " ".join(str(event.get("what") or "").split())[:40]
     try:
@@ -194,12 +201,16 @@ def due_line(event: Dict[str, Any], *, now: Optional[float] = None) -> str:
         return ""
     if not due:
         return what
-    days = (due - _day_start(now).timestamp()) / 86400.0
-    if days < 0.5:
+    try:
+        days = int(round(
+            (_day_start(due).timestamp() - _day_start(now).timestamp()) / 86400.0))
+    except Exception:
+        days = 0
+    if days <= 0:
         when = "今天"
-    elif days < 1.5:
+    elif days == 1:
         when = "明天"
-    elif days < 2.5:
+    elif days == 2:
         when = "后天"
     else:
         when = _dt.datetime.fromtimestamp(due).strftime("%m-%d")

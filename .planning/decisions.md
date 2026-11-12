@@ -4124,3 +4124,40 @@ list_days 把所有 .md 都算日记
 `README.md` 又会复现。
 
 **代价**：`list_days` 不再返回非日期文件（这正是目的）。
+
+## D-133 换页重建，不在原地 reload
+
+**决定**：内存看门狗与"渲染进程退出"都不再 `view.load()`，改走
+`_rebuild_view()`（`stop` → 断桥 → 新建 `QWebEnginePage` → 接桥 → load，
+旧 page `deleteLater`）；阈值 750→550MB，周期 20→10 分钟。
+
+**为什么**：两次闪退是**同一处指令**：
+
+```
+2026-11-11 15:07:08  Qt6WebEngineCore.dll  0xc0000005  偏移 0xf722d3
+2026-11-12 12:45:59  Qt6WebEngineCore.dll  0xc0000005  偏移 0xf722d3   ← 第 5 次 tick
+```
+
+第二次的时刻恰好是窗口启动后第 5 次看门狗 tick（20 分钟一次），
+那一刻真正的动作只有 `view.load()`。旧文档的 `setInterval` 还在通过
+WebChannel 调 C++，同时 Qt 在销毁旧文档的 V8 上下文 —— use-after-free。
+
+**代价**：换页会丢页面内状态（滚动位置、输入框草稿）。这是可接受的：
+白屏/闪退丢的是整段对话。
+
+## D-134 日志必须落盘
+
+**决定**：`Backend._log()` 除 `self.log.emit()` 外，同时写
+`<数据根>/logs/app.log`（滚动一份 `.1`，单文件 5MB）。
+
+**为什么**：两次闪退程序自己一个字都没留下 —— 日志只在 UI 面板（内存里），
+进程被系统杀掉时面板随窗口消失。事后只能翻 Windows 事件日志，
+看不到"崩之前她在干什么、内存涨到多少"。
+
+顺便修掉一个一直静默失效的调用：`_watch_memory` 里写的是
+`self.backend._log(...)`，而 `Backend` 没有这个方法（`_log` 在
+`EngineWorker` 上），所以每次都落进 `except: pass` ——
+**看门狗的内存读数从来没被记录过**。现在统一走 `_ui_log()`。
+
+**代价**：每行日志一次 `open/write/close`。日志量是事件级的，
+不在热路径上，可以接受。

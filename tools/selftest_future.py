@@ -150,6 +150,20 @@ def main() -> int:
     line_today = F.due_line({"what": "体检", "due_at": int(now * 1000)}, now=now)
     check("今天：...", line_today.startswith("今天"), line_today)
 
+    # 下午之后最容易错：按"距今天 0 点的差值"算，19:00 看"明天 10 点"
+    # 得到 1.79 天 → 说成"后天"；而今晚 23:00 → 0.96 天 → 说成"明天"。
+    # 2026-11-12 动态检查在 18:5x 撞出来的，上午跑永远发现不了。
+    evening = _dt.datetime(2026, 11, 11, 19, 0, 0).timestamp()
+    tomorrow10 = _dt.datetime(2026, 11, 12, 10, 0, 0).timestamp()
+    line_tmr = F.due_line({"what": "体检", "due_at": int(tomorrow10 * 1000)},
+                          now=evening)
+    check("19:00 看明天 10 点 → 「明天」", line_tmr.startswith("明天"), line_tmr)
+
+    today23 = _dt.datetime(2026, 11, 11, 23, 0, 0).timestamp()
+    line_23 = F.due_line({"what": "关电脑", "due_at": int(today23 * 1000)},
+                         now=evening)
+    check("19:00 看今晚 23 点 → 「今天」", line_23.startswith("今天"), line_23)
+
     check("空 what → 空串", F.due_line({"what": "", "due_at": 0}, now=now) == "")
 
     # ── 7. 兑现 ──

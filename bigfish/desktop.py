@@ -23,6 +23,7 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 def _safe_reconfigure_stdout() -> None:
@@ -287,10 +288,73 @@ from PySide6.QtCore import (QObject, QThread, QTimer, QUrl, Signal,  # noqa: E40
                             Slot, Qt)
 from PySide6.QtGui import QIcon                                       # noqa: E402
 from PySide6.QtWebChannel import QWebChannel                         # noqa: E402
+from PySide6.QtWebEngineCore import QWebEnginePage                    # noqa: E402
 from PySide6.QtWebEngineWidgets import QWebEngineView                # noqa: E402
 from PySide6.QtWidgets import QApplication, QMainWindow               # noqa: E402
 
+def _ui_log(win: Any, text: str, kind: str = "") -> None:
+    """界面层日志：落盘 + 尽力送进面板。
+
+    为什么不直接 `self.backend._log()`：**Backend 没有这个方法**
+    （`_log` 在 `EngineWorker` 上）。以前 `_watch_memory` 里就是这么写的，
+    每次都在 `except: pass` 里静默丢掉 —— 也就是说看门狗的内存读数
+    从来没有被记录过，两次闪退都没法回答"崩之前是多少 MB"。
+    """
+    _append_log(text, kind)
+    try:
+        sig = getattr(getattr(win, "backend", None), "log", None)
+        if sig is not None:
+            sig.emit(text, kind)
+    except Exception:
+        pass
+
+
 UI_DIR = os.path.join(_ROOT, "ui")
+
+# ══════════════════════════════════════════════════════════════════
+#  日志落盘
+# ══════════════════════════════════════════════════════════════════
+#: 日志文件（<数据根>/logs/app.log）。滚动一份 .1，单文件 5MB。
+_LOG_LOCK = threading.Lock()
+_LOG_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _append_log(text: str, kind: str = "") -> None:
+    """把一行日志也写进磁盘。
+
+    为什么必须落盘：2026-11-11 15:07 和 11-12 12:45 两次闪退，进程被系统
+    直接终止（Qt6WebEngineCore.dll / 0xc0000005），UI 的日志面板随窗口一起
+    消失 —— 事后只能翻 Windows 事件日志，崩溃前那几分钟**一个字都没有**。
+    有了这个文件，下次至少能看到"崩之前她在干什么、内存涨到多少"。
+
+    失败绝不抛：日志是旁路，不能因为它影响主流程。
+    """
+    try:
+        from bigfish.vault import resolve_data_root
+
+        d = os.path.join(resolve_data_root(), "logs")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "app.log")
+        line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"[{kind or 'info'}] {text}\n")
+        with _LOG_LOCK:
+            try:
+                if os.path.exists(p) and os.path.getsize(p) > _LOG_MAX_BYTES:
+                    bak = p + ".1"
+                    try:
+                        if os.path.exists(bak):
+                            os.remove(bak)
+                        os.replace(p, bak)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
 # ⚠ 别在这里再写一次 CONFIG_PATH。
 #   这里曾经有一行 `CONFIG_PATH = os.path.join(_ROOT, "config.json")`，
 #   静默覆盖了上面那个指向 exe 目录的定义 —— 于是「保存成功但界面刷新
@@ -900,6 +964,8 @@ class EngineWorker(QThread):
     # ------------------------------------------------------------------
     def _log(self, text: str, kind: str = "") -> None:
         self.log.emit(text, kind)
+        # 面板 + 磁盘。两次闪退的教训：面板随窗口一起消失，磁盘不会。
+        _append_log(text, kind)
 
     def _learn_sticker(self, msg, body: str) -> None:
         """主人纠正表情用法时，改那张表情的备注。
@@ -7556,9 +7622,67 @@ class MainWindow(QMainWindow):
             self._mem_history = []          # [(时刻, MB)]，出问题看趋势
             self._mem_timer = QTimer(self)
             self._mem_timer.timeout.connect(self._watch_memory)
-            self._mem_timer.start(20 * 60 * 1000)      # 每 20 分钟看一眼
+            self._mem_timer.start(10 * 60 * 1000)      # 每 10 分钟看一眼
         except Exception:
             self._mem_timer = None
+
+    def _rebuild_view(self, why: str) -> None:
+        """换一个全新的 page，而不是在原地 `load()` 重载。
+
+        为什么不能原地 reload（这是两次闪退的根因）：
+
+        崩溃记录（Windows 事件日志，两次完全一样）：
+
+            2026-11-11 15:07:08  Qt6WebEngineCore.dll 0xc0000005 偏移 0xf722d3
+            2026-11-12 12:45:59  Qt6WebEngineCore.dll 0xc0000005 偏移 0xf722d3
+
+        **同一偏移 = 同一处指令**，不是随机内存踩踏。而 12:45:59 正好是
+        窗口启动（11:05:59）之后第 5 次内存看门狗 tick（每 20 分钟一次），
+        那一刻唯一的动作就是 `view.load()` 重载。
+
+        机制：旧文档里的 `setInterval` 还在跑，它通过 WebChannel 调 C++；
+        同时 Qt 正在销毁旧文档的 V8 上下文 —— 两边撞上就是 use-after-free。
+
+        换 page 相当于把旧的整套（V8 / 渲染进程 / 桥接）一起退役：
+        先 stop、断桥，再新建 page 接上新桥，旧 page 交给事件循环 `deleteLater`
+        ——**不在加载过程中拆旧对象**。
+        """
+        try:
+            view = self.view
+            old_page = view.page()
+            try:
+                view.stop()
+            except Exception:
+                pass
+            try:
+                old_page.setWebChannel(None)
+            except Exception:
+                pass
+            try:
+                old_page.renderProcessTerminated.disconnect()
+            except Exception:
+                pass
+
+            new_page = QWebEnginePage(view)
+            self.channel = QWebChannel(new_page)
+            self.channel.registerObject("backend", self.backend)
+            new_page.setWebChannel(self.channel)
+            try:
+                new_page.renderProcessTerminated.connect(
+                    self._on_render_terminated)
+            except Exception:
+                pass
+            view.setPage(new_page)
+            # setPage 之后旧 page 往往已经被 Qt 释放（PySide 会报
+            # "Internal C++ object already deleted"），所以这里只能尽力而为。
+            try:
+                old_page.deleteLater()
+            except RuntimeError:
+                pass
+            view.load(QUrl.fromLocalFile(os.path.join(UI_DIR, "index.html")))
+            _ui_log(self, f"[界面] 换页重建（{why}）", "err")
+        except Exception as exc:
+            _ui_log(self, f"[界面] 换页失败：{exc}", "err")
 
     def _watch_memory(self) -> None:
         """分段处理内存：轻度回收 → 重度重载。
@@ -7577,10 +7701,16 @@ class MainWindow(QMainWindow):
         if mb is None:
             return
 
-        # 记一行趋势，出问题时能看出"多久涨多少"
+        # 记一行趋势，出问题时能看出"多久涨多少"。
+        # 也写进磁盘：崩溃时内存里这份 `_mem_history` 会一起消失，
+        # 而两次闪退最需要回答的正是"崩之前内存是多少"。
         self._mem_history.append((time.time(), mb))
-        if len(self._mem_history) > 48:          # 48 × 20 分钟 = 16 小时
+        if len(self._mem_history) > 96:          # 96 × 10 分钟 = 16 小时
             self._mem_history.pop(0)
+        try:
+            _ui_log(self, f"[内存] 工作集 {mb:.0f}MB", "think")
+        except Exception:
+            pass
 
         if mb < 400:
             return
@@ -7590,8 +7720,8 @@ class MainWindow(QMainWindow):
 
             # ① 轻度：先把 Python 侧的循环垃圾收掉（便宜，不打断界面）
             _freed = gc.collect()
-            if mb < 750:
-                self.backend._log(
+            if mb < 550:
+                _ui_log(self, 
                     f"[内存] {mb:.0f}MB，回收了 {_freed} 个循环引用", "think")
                 return
             # ② 重度：重载页面。Chromium 的堆、渲染进程、WebChannel
@@ -7603,10 +7733,11 @@ class MainWindow(QMainWindow):
                 _up = int((time.time() - _st0) / 60) if _st0 else 0
             except Exception:
                 _up = 0
-            self.backend._log(
-                f"[内存] {mb:.0f}MB 超阈值，重载界面回收"
+            _ui_log(self, 
+                f"[内存] {mb:.0f}MB 超阈值，换页回收"
                 f"（引擎已跑 {_up} 分钟）", "err")
-            self.view.load(QUrl.fromLocalFile(os.path.join(UI_DIR, "index.html")))
+            # 不再原地 view.load()：那正是两次 0xc0000005 的发生点。
+            self._rebuild_view(f"{mb:.0f}MB 超阈值")
         except Exception:
             pass
 
@@ -7653,15 +7784,14 @@ class MainWindow(QMainWindow):
         Python 侧，重载后 setInterval 继续跑，不影响收发）。
         """
         try:
-            self.backend._log(
+            _ui_log(self, 
                 f"[界面] 渲染进程异常退出（status={status} code={code}），"
                 "800ms 后自动重载", "err")
         except Exception:
             pass
         try:
             QTimer.singleShot(
-                800, lambda: self.view.load(
-                    QUrl.fromLocalFile(os.path.join(UI_DIR, "index.html"))))
+                800, lambda: self._rebuild_view("渲染进程退出"))
         except Exception:
             pass
 
