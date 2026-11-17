@@ -2912,3 +2912,63 @@ Windows 事件日志，两次**完全一致**：
 换页不能 100% 保证不再崩 —— 它拆掉的是"已知的触发路径"，不是
 Qt WebEngine 的所有可能。但**从这一版开始有现场**：
 `D:\大肥鱼\logs\app.log` 会有崩前 10 分钟的内存曲线与最后一次动作。
+
+---
+
+## 2026-11-17 09:30 —— 同步到 GitHub + 发 0.13.5
+
+用户准备重装系统，要求把仓库同步上去。令牌在 `D:\可可助手\令牌.txt`
+（`ghp_` 开头，写在「github：ghp_xxx」里）。
+
+### 网络实况（和 11-12 一样）
+
+| 域名 | 状态 |
+|---|---|
+| `github.com` | **000（不通）** ← git push 走这里 |
+| `api.github.com` | 200 |
+| `codeload.github.com` | 301 |
+
+所以 `tools/push.py` 依然失败，但 **API 通**。
+
+### 怎么推的
+
+用 Git Data API **逐字节重建**本地 commit：
+
+```
+blob（内容 sha 天然一致）
+  → tree（base_tree = 父 commit 的 tree）
+  → commit（原 author / committer / message / 时间戳）
+  → PATCH refs/heads/main
+```
+
+4 个提交（0.13.4、0.13.5、补提交 `selftest_weekly.py`、4 份 UI 文档）
+的 tree 与 commit sha **全部与本地完全一致** —— 所以远端不是
+"内容一样、历史不同"，而是真的一样。
+
+已固化为 **`tools/push_api.py`**（`--dry-run` 可预演）：以后
+`github.com` 不通时用它，`tools/push.py` 仍留给网络正常时。
+
+`tools/make_release.py` 同时加了 `BIGFISH_GITHUB_TOKEN` 环境变量入口
+（原来只读 `.secrets/github_token.txt`，而那里面还是旧的 `gho_` 令牌）。
+
+### 补提交的两个缺口
+
+| 文件 | 情况 |
+|---|---|
+| `tools/selftest_weekly.py` | 0.13.3 那次 `git add` 漏了，`git ls-files` 里一直没有 —— 52 个测试有一个不在仓库 |
+| `PRODUCT.md` / `findings.md` / `progress.md` / `task_plan.md` | UI 重设计会话的产物，只在磁盘上。重装前收进仓库保底（与 `.planning/` 无关） |
+
+### Release
+
+- 地址：https://github.com/q825818504/bigfish-wechat/releases/tag/v0.13.5
+- Release ID：`447913637`（draft=false / prerelease=false）
+- 便携包：`BigFish-0.13.5-portable.zip` 200.6 MB（341 文件）
+  SHA-256 `71024ad80cda9adf8ea6da9636150f9bd9715f0371e97a7cc0931e44fe31c947`
+- 清单：`BigFish-0.13.5-manifest.json` 643 B
+- tag `v0.13.5` → `e620033`（= 发布时 main HEAD）
+
+### 没做的
+
+- `.github/workflows/ci.yml` 仍未提交：API 推 workflow 文件需要令牌带
+  `workflow` 权限，这次没试（怕整批被拒）。要提交时单独处理。
+- 真实数据（`D:\大肥鱼`）不在仓库里，重装前需要用户自己拷走。

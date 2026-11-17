@@ -73,6 +73,16 @@ for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
 
 
 def token() -> str:
+    """令牌：环境变量优先，其次 `.secrets/github_token.txt`。
+
+    为什么加环境变量：换令牌时不必把新的写进仓库目录里的文件；
+    也和 `tools/push.py` 用同一套（它早就支持 `BIGFISH_GITHUB_TOKEN`）。
+    2026-11-17 换令牌时，`.secrets/github_token.txt` 里还是旧的 `gho_` 令牌，
+    而新令牌在仓库外 —— 有这个入口就不用动那个文件。
+    """
+    env = os.environ.get("BIGFISH_GITHUB_TOKEN", "").strip()
+    if env:
+        return env
     with open(TOKEN_FILE, "r", encoding="utf-8") as f:
         return f.read().strip()
 
